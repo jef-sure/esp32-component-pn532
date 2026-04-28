@@ -125,11 +125,11 @@ bool pn532_mifare_value_write(pn532_t *pn532, uint8_t blockno, int32_t value, ui
 static bool pn532_mifare_value_op(pn532_t *pn532, uint8_t cmd, uint8_t blockno, uint32_t delta)
 {
     /*
-     * Increment / Decrement / Restore are 2-step MIFARE Classic operations:
-     * the host issues the value command (and a 4-byte argument for INC/DEC)
-     * which the card ACKs, then the host issues TRANSFER to commit the
-     * internal accumulator to the destination block. PN532 InDataExchange
-     * does not chain these automatically — we do it explicitly.
+     * Increment / Decrement / Restore stage the internal transfer buffer first,
+     * then TRANSFER commits that buffer to a destination block. INC/DEC carry a
+     * 4-byte operand; RESTORE carries the mandatory 4-byte dummy operand.
+     * This helper performs only the first stage. Call pn532_mifare_transfer()
+     * separately to commit the result.
      */
     uint8_t op[6];
     size_t op_len;
@@ -142,13 +142,15 @@ static bool pn532_mifare_value_op(pn532_t *pn532, uint8_t cmd, uint8_t blockno, 
         op[4] = (uint8_t)((delta >> 16) & 0xFF);
         op[5] = (uint8_t)((delta >> 24) & 0xFF);
         op_len = 6;
-    } else {
+    } else if (cmd == MIFARE_CMD_RESTORE) {
         /* RESTORE requires a 4-byte dummy operand. */
         op[2] = 0;
         op[3] = 0;
         op[4] = 0;
         op[5] = 0;
         op_len = 6;
+    } else {
+        return false;
     }
 
     size_t response_len = 0;
@@ -167,7 +169,7 @@ bool pn532_mifare_decrement(pn532_t *pn532, uint8_t blockno, uint32_t delta)
 
 bool pn532_mifare_restore(pn532_t *pn532, uint8_t blockno)
 {
-    return pn532_mifare_value_op(pn532, MIFARE_CMD_STORE, blockno, 0);
+    return pn532_mifare_value_op(pn532, MIFARE_CMD_RESTORE, blockno, 0);
 }
 
 bool pn532_mifare_transfer(pn532_t *pn532, uint8_t blockno)

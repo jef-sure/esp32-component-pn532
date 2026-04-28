@@ -27,6 +27,34 @@ static const char *TAG = "main";
 #define PN532_SAMPLE_ENABLE_DUMP 1
 #define PN532_SAMPLE_ENABLE_NDEF 1
 
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+static const uint8_t mifare_keys[][6] = {
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+    {0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0},
+    {0xA1, 0xB1, 0xC1, 0xD1, 0xE1, 0xF1},
+    {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5},
+    {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5},
+    {0x4D, 0x3A, 0x99, 0xC3, 0x51, 0xDD},
+    {0x1A, 0x98, 0x2C, 0x7E, 0x45, 0x9A},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
+    {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7},
+    {0x71, 0x4C, 0x5C, 0x88, 0x6E, 0x97},
+    {0x58, 0x7E, 0xE5, 0xF9, 0x35, 0x0F},
+    {0xA0, 0x47, 0x8C, 0xC3, 0x90, 0x91},
+    {0x53, 0x3C, 0xB6, 0xC7, 0x23, 0xF6},
+    {0x8F, 0xD0, 0xA4, 0xF2, 0x56, 0xE9},
+};
+static const uint8_t mifare_key_types[] = {MIFARE_CMD_AUTH_A, MIFARE_CMD_AUTH_B};
+
+typedef enum
+{
+    AUTH_RESULT_OK,
+    AUTH_RESULT_FAIL,
+    AUTH_RESULT_NO_CARD,
+} auth_result_t;
+
 static void pn532_format_uid(const pn532_uid_t *uid, char *buffer, size_t buffer_len)
 {
     size_t offset = 0;
@@ -141,19 +169,61 @@ static void pn532_log_block(int blockno, const uint8_t *data, size_t len)
     ESP_LOGI(TAG, "  blk %3d: %s", blockno, line);
 }
 
+static int pn532_classic_sector_from_block(const pn532_uid_t *uid, int block)
+{
+    if (uid->subtype == PN532_MIFARE_CLASSIC_4K && block >= 128) {
+        return 32 + (block - 128) / 16;
+    }
+    return block / 4;
+}
+
+static auth_result_t pn532_authenticate_sector_with_key(  //
+    pn532_t           *pn532,                             //
+    const pn532_uid_t *uid,                               //
+    int                sector_block,                      //
+    const uint8_t     *key,                               //
+    uint8_t            key_type                           //
+)
+{
+    if (pn532 == NULL || uid == NULL || key == NULL) {
+        return AUTH_RESULT_FAIL;
+    }
+
+    if (pn532_14443_authenticate(pn532, key, key_type, uid, sector_block)) {
+        return AUTH_RESULT_OK;
+    }
+
+    if (!pn532_14443_select_by_uid(pn532, uid)) {
+        return AUTH_RESULT_NO_CARD;
+    }
+
+    return pn532_14443_authenticate(pn532, key, key_type, uid, sector_block) ? AUTH_RESULT_OK : AUTH_RESULT_FAIL;
+}
+
+static bool pn532_authenticate_sector(pn532_t *pn532, const pn532_uid_t *uid, int sector_block)
+{
+    int sector = pn532_classic_sector_from_block(uid, sector_block);
+
+    for (size_t key_index = 0; key_index < ARRAY_SIZE(mifare_keys); key_index++) {
+        for (size_t type_index = 0; type_index < ARRAY_SIZE(mifare_key_types); type_index++) {
+            auth_result_t result = pn532_authenticate_sector_with_key(pn532, uid, sector_block, mifare_keys[key_index],
+                                                                      mifare_key_types[type_index]);
+            if (result == AUTH_RESULT_OK) {
+                ESP_LOGI(TAG, "  sector %2d authenticated with key %zu (%s)", sector, key_index,
+                         (mifare_key_types[type_index] == MIFARE_CMD_AUTH_A) ? "KeyA" : "KeyB");
+                return true;
+            }
+            if (result == AUTH_RESULT_NO_CARD) {
+                return false;
+            }
+        }
+    }
+
+    return false;
+}
+
 static void pn532_dump_mifare_classic(pn532_t *pn532, const pn532_uid_t *uid)
 {
-    static const uint8_t key_factory[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    static const uint8_t key_ndef[6]    = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
-    static const uint8_t key_mad[6]     = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
-    static const struct {
-        const uint8_t *key;
-        const char    *name;
-    } key_set[] = {
-        {key_factory, "FFFFFFFFFFFF"},
-        {key_ndef,    "D3F7D3F7D3F7"},
-        {key_mad,     "A0A1A2A3A4A5"},
-    };
     uint8_t block[16];
 
     if (uid->blocks_count == 0 || uid->block_size != 16) {
@@ -165,7 +235,7 @@ static void pn532_dump_mifare_classic(pn532_t *pn532, const pn532_uid_t *uid)
         return;
     }
 
-    ESP_LOGI(TAG, "Dumping %u blocks (try keys FF.., D3F7.., A0A1..)", (unsigned)uid->blocks_count);
+    ESP_LOGI(TAG, "Dumping %u blocks (pn5180-style Classic auth)", (unsigned)uid->blocks_count);
     for (uint16_t blk = 0; blk < uid->blocks_count; blk++) {
         bool     first_in_sector;
         uint16_t sector_size;
@@ -178,29 +248,12 @@ static void pn532_dump_mifare_classic(pn532_t *pn532, const pn532_uid_t *uid)
         }
 
         if (first_in_sector) {
-            bool authed = false;
             if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, uid)) {
                 ESP_LOGW(TAG, "  select failed at blk %u; skipping sector", (unsigned)blk);
                 blk += sector_size - 1;
                 continue;
             }
-            for (size_t k = 0; k < sizeof(key_set) / sizeof(key_set[0]); k++) {
-                if (pn532_14443_authenticate(pn532, key_set[k].key, MIFARE_CMD_AUTH_A, uid, (int)blk)) {
-                    authed = true;
-                    if (k != 0) {
-                        ESP_LOGI(TAG, "  sector @blk %u authed with key A %s", (unsigned)blk, key_set[k].name);
-                    }
-                    break;
-                }
-                if (pn532->inListedTag == 0) {
-                    break;
-                }
-                /* PN532 halts the card on auth failure; re-select before next attempt. */
-                if (!pn532_14443_select_by_uid(pn532, uid)) {
-                    break;
-                }
-            }
-            if (!authed) {
+            if (!pn532_authenticate_sector(pn532, uid, (int)blk)) {
                 ESP_LOGW(TAG, "  auth failed at blk %u; skipping sector", (unsigned)blk);
                 blk += sector_size - 1;
                 continue;
@@ -342,7 +395,7 @@ static void pn532_log_record(int index, const ndef_record_t *rec)
     case NDEF_RECORD_TYPE_TEXT: {
         const uint8_t *txt    = NULL;
         size_t         tx_len = 0;
-        char           lang[8] = {0};
+        char           lang[64] = {0};
         bool           utf16  = false;
         if (ndef_extract_text(rec, &txt, &tx_len, lang, &utf16)) {
             char preview[128];

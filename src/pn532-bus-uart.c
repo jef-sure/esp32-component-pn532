@@ -11,6 +11,7 @@
 static const char *TAG = "PN532-UART";
 
 #define PN532_ACK_FRAME_LEN 6
+#define PN532_UART_MIN_READY_BYTES PN532_ACK_FRAME_LEN
 #define PN532_UART_IO_TIMEOUT_MS 100
 #define PN532_UART_READ_IDLE_MS 20
 #define PN532_UART_RX_BUFFER_SIZE (PN532_MAX_BUF_SIZE * 2)
@@ -111,7 +112,7 @@ static bool pn532_uart_bus_is_ready(pn532_bus_t *bus)
         return false;
     }
 
-    return buffered_len > 0;
+    return buffered_len >= PN532_UART_MIN_READY_BYTES;
 }
 
 static void pn532_uart_bus_destroy(pn532_bus_t *bus)

@@ -23,7 +23,9 @@
 /** @brief MIFARE Classic INCREMENT value command. */
 #define MIFARE_CMD_INCREMENT        (0xC1)
 /** @brief MIFARE Classic RESTORE value command. */
-#define MIFARE_CMD_STORE            (0xC2)
+#define MIFARE_CMD_RESTORE          (0xC2)
+/** @brief Backward-compatible alias for the RESTORE value command. */
+#define MIFARE_CMD_STORE            MIFARE_CMD_RESTORE
 /** @brief Ultralight 4-byte page WRITE command. */
 #define MIFARE_ULTRALIGHT_CMD_WRITE (0xA2)
 
@@ -42,6 +44,9 @@ int16_t pn532_mifare_authenticate(pn532_t *pn532, uint8_t blockno, const uint8_t
 /**
  * @brief Read a MIFARE Classic block or an Ultralight/NTAG READ window.
  *
+ * Most callers that already operate on a selected ISO14443A target should
+ * prefer pn532_14443_block_read().
+ *
  * For Classic, blockno addresses one 16-byte block. For Type 2 tags, READ from
  * one page returns 16 bytes covering four consecutive pages, so callers should
  * typically provide a 16-byte buffer there as well.
@@ -50,6 +55,9 @@ bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_
 
 /**
  * @brief Write one MIFARE Classic block or one Ultralight page.
+ *
+ * Most callers that already operate on a selected ISO14443A target should
+ * prefer pn532_14443_block_write().
  *
  * buffer_len >= 16 issues the Classic 16-byte WRITE command. buffer_len >= 4
  * issues the Ultralight 4-byte page write.
@@ -64,14 +72,14 @@ bool pn532_mifare_value_read(pn532_t *pn532, uint8_t blockno, int32_t *value);
 /** @brief Encode and write a MIFARE Classic value block. */
 bool pn532_mifare_value_write(pn532_t *pn532, uint8_t blockno, int32_t value, uint8_t addr);
 
-/** @brief Issue a MIFARE Classic INCREMENT value operation. */
+/** @brief Stage a MIFARE Classic INCREMENT operation in the transfer buffer. */
 bool pn532_mifare_increment(pn532_t *pn532, uint8_t blockno, uint32_t delta);
 
-/** @brief Issue a MIFARE Classic DECREMENT value operation. */
+/** @brief Stage a MIFARE Classic DECREMENT operation in the transfer buffer. */
 bool pn532_mifare_decrement(pn532_t *pn532, uint8_t blockno, uint32_t delta);
 
-/** @brief Issue a MIFARE Classic RESTORE value operation. */
+/** @brief Stage a MIFARE Classic RESTORE operation in the transfer buffer. */
 bool pn532_mifare_restore(pn532_t *pn532, uint8_t blockno);
 
-/** @brief Issue a MIFARE Classic TRANSFER value operation. */
+/** @brief Commit the current transfer buffer to a MIFARE Classic value block. */
 bool pn532_mifare_transfer(pn532_t *pn532, uint8_t blockno);

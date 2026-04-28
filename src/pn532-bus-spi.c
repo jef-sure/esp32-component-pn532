@@ -53,18 +53,11 @@ static bool pn532_spi_bus_write_command(pn532_bus_t *bus, const uint8_t *buffer,
         return false;
     }
 
-    if (buffer[0] == 0x00 && len > 1) {
-        buffer++;
-        len--;
-    }
-
-    spi_bus->tx_buffer[0] = 0x00;
-    memcpy(spi_bus->tx_buffer + 1, buffer, len);
-    spi_bus->tx_buffer[len + 1u] = 0x00;
+    memcpy(spi_bus->tx_buffer, buffer, len);
 
     memset(spi_bus->trans, 0, sizeof(*spi_bus->trans));
     spi_bus->trans->cmd       = PN532_SPI_DATAWRITE;
-    spi_bus->trans->length    = (len + 2u) * 8u;
+    spi_bus->trans->length    = len * 8u;
     spi_bus->trans->tx_buffer = spi_bus->tx_buffer;
     spi_bus->trans->user      = spi_bus;
 

@@ -44,7 +44,7 @@ static bool pn532_status_requires_reselect(uint8_t status)
     }
 }
 
-static bool inline pn532_gpio_is_valid(gpio_num_t gpio)
+static inline bool pn532_gpio_is_valid(gpio_num_t gpio)
 {
     return gpio >= 0;
 }
@@ -512,9 +512,9 @@ bool pn532_set_rf_field(pn532_t *pn532, bool enabled)
 {
     const uint8_t params[]     = {0x01, enabled ? 0x03 : 0x02};
     size_t        response_len = 0;
-    bool ok = pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, params, sizeof(params), NULL, &response_len,
-                                    (uint16_t)pn532->timeout_ms);
-    if (ok) {
+    bool          ok           = pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, params, sizeof(params), NULL,
+                                                       &response_len, (uint16_t)pn532->timeout_ms);
+    if (ok && response_len == 0) {
         pn532->is_rf_on = enabled;
     }
     return ok && response_len == 0;
@@ -569,6 +569,10 @@ static bool pn532_sam_configuration(pn532_t *pn532, uint8_t mode, uint8_t timeou
 
 bool pn532_release_target(pn532_t *pn532)
 {
+    if (pn532 == NULL) {
+        return false;
+    }
+
     if (pn532->inListedTag == 0) {
         return true;
     }
@@ -657,7 +661,12 @@ bool pn532_in_select(pn532_t *pn532, uint8_t target_number)
         pn532->session_opened = false;
         return false;
     }
-    if (status_len >= 1 && status[0] != PN532_STATUS_OK && status[0] != PN532_STATUS_ALREADY_SELECTED) {
+    if (status_len == 0) {
+        ESP_LOGE(TAG, "pn532_in_select: empty response");
+        pn532->session_opened = false;
+        return false;
+    }
+    if (status[0] != PN532_STATUS_OK && status[0] != PN532_STATUS_ALREADY_SELECTED) {
         ESP_LOGE(TAG, "pn532_in_select: status 0x%02X", status[0]);
         pn532->session_opened = false;
         return false;

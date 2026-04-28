@@ -238,10 +238,31 @@ bool                pn532_14443_authenticate(   //
 );
 
 /**
+ * @brief Read one block or page window from the currently selected memory-mapped ISO14443A tag.
+ *
+ * This mirrors the pn5180 14443 surface for selected Classic and Type 2 style
+ * cards. For Classic, blockno addresses one 16-byte block. For Type 2 tags,
+ * READ from one page returns 16 bytes covering four consecutive pages.
+ */
+bool pn532_14443_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_t buffer_len);
+
+/**
+ * @brief Write one block or page on the currently selected memory-mapped ISO14443A tag.
+ *
+ * buffer_len >= 16 issues the Classic 16-byte WRITE command. buffer_len >= 4
+ * issues the Type 2 / Ultralight 4-byte page write.
+ *
+ * @return 0 on success, -1 on invalid arguments, -2 on exchange failure.
+ */
+int pn532_14443_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, size_t buffer_len);
+
+/**
  * @brief Infer card subtype, block count, and block size from ATQA/SAK.
  *
  * The helper updates uid->subtype, uid->blocks_count, and uid->block_size in
- * place and also returns the same values through the out parameters.
+ * place and also returns the same values through the out parameters. When the
+ * SAK is not recognised, subtype is left as PN532_MIFARE_UNKNOWN and the
+ * geometry outputs are set to 0.
  */
 bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *blocks_count, uint16_t *block_size);
 

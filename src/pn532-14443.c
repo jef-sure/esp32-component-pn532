@@ -37,6 +37,10 @@ bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *block
         return false;
     }
 
+    uid->subtype  = PN532_MIFARE_UNKNOWN;
+    *blocks_count = 0;
+    *block_size   = 0;
+
     switch (uid->sak & 0x7F) {
     case 0x00:
         uid->subtype  = PN532_MIFARE_ULTRALIGHT;
@@ -77,9 +81,6 @@ bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *block
         *block_size   = 16;
         break;
     default:
-        uid->subtype  = PN532_MIFARE_CLASSIC_1K;
-        *blocks_count = 64;
-        *block_size   = 16;
         break;
     }
 
@@ -104,6 +105,16 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
 
     *needs_reselect = false;
     return pn532_14443_detect_card_type_and_capacity(uid, blocks_count, block_size);
+}
+
+bool pn532_14443_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_t buffer_len)
+{
+    return pn532_mifare_block_read(pn532, blockno, buffer, buffer_len);
+}
+
+int pn532_14443_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, size_t buffer_len)
+{
+    return pn532_mifare_block_write(pn532, blockno, buffer, buffer_len);
 }
 
 static bool pn532_target_has_ats(uint8_t sak)
