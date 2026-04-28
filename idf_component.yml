@@ -1,0 +1,43 @@
+## IDF Component Manager Manifest File
+version: "0.0.1"
+description: "ESP-IDF component for PN532 NFC/RFID controller, supporting UART, I2C, and SPI interfaces."
+url: https://github.com/jef-sure/esp32-component-pn532
+repository: https://github.com/jef-sure/esp32-component-pn532.git
+documentation: https://github.com/jef-sure/esp32-component-pn532/blob/main/README.md
+issues: https://github.com/jef-sure/esp32-component-pn532/issues
+
+dependencies:
+  idf:
+    version: ">=5.2.0"
+
+tags:
+  - nfc
+  - spi
+  - uart
+  - i2c
+  - rfid
+  - pn532
+  - iso14443a
+  - ndef
+
+maintainers:
+  - "Anton Petrusevich <anton.petrusevich.mobile@gmail.com>"
+
+license: MIT
+
+files:
+  include:
+    - "src/**/*.c"
+    - "include/**/*.h"
+    - "CMakeLists.txt"
+    - "examples/**/*.c"
+    - "examples/**/*.h"
+    - "examples/CMakeLists.txt"
+    - "README.md"
+    - "LICENSE"
+  exclude:
+    - "build/**"
+    - "dist/**"
+    - ".git/**"
+    - ".vscode/**"
+    - "**/*.old"
