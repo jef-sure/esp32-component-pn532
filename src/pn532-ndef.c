@@ -212,22 +212,22 @@ static const uri_encode_order_entry_t uri_encode_order[] = {
     {0x02, 12},
     {0x16, 11},
     {0x01, 11},
-    {0x08,  9},
-    {0x1A,  8},
-    {0x1B,  8},
-    {0x14,  8},
-    {0x04,  8},
-    {0x09,  7},
-    {0x0A,  7},
-    {0x06,  7},
-    {0x03,  7},
-    {0x0B,  6},
-    {0x0E,  6},
-    {0x05,  4},
-    {0x0C,  4},
-    {0x0D,  4},
-    {0x13,  4},
-    {0x15,  4},
+    {0x08, 9 },
+    {0x1A, 8 },
+    {0x1B, 8 },
+    {0x14, 8 },
+    {0x04, 8 },
+    {0x09, 7 },
+    {0x0A, 7 },
+    {0x06, 7 },
+    {0x03, 7 },
+    {0x0B, 6 },
+    {0x0E, 6 },
+    {0x05, 4 },
+    {0x0C, 4 },
+    {0x0D, 4 },
+    {0x13, 4 },
+    {0x15, 4 },
 };
 #define URI_ENCODE_ORDER_COUNT (sizeof(uri_encode_order) / sizeof(uri_encode_order[0]))
 
@@ -473,8 +473,8 @@ static bool ndef_record_encoded_size(const ndef_record_t *rec, size_t *size_out)
         return false;
     }
 
-    bool short_record = rec->payload_len <= 255;
-    size_t size       = 1;
+    bool   short_record = rec->payload_len <= 255;
+    size_t size         = 1;
     if (!ndef_size_add(size, 1, &size)) {
         return false;
     }
@@ -524,7 +524,8 @@ size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_l
     size_t required = 0;
     for (size_t i = 0; i < msg->record_count; i++) {
         size_t record_size = 0;
-        if (!ndef_record_encoded_size(&msg->records[i], &record_size) || !ndef_size_add(required, record_size, &required)) {
+        if (!ndef_record_encoded_size(&msg->records[i], &record_size) ||
+            !ndef_size_add(required, record_size, &required)) {
             return 0;
         }
     }
@@ -537,10 +538,10 @@ size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_l
 
     uint8_t *cursor = out;
     for (size_t i = 0; i < msg->record_count; i++) {
-        const ndef_record_t *rec = &msg->records[i];
-        bool is_begin            = (i == 0);
-        bool is_end              = (i == (msg->record_count - 1));
-        bool short_record        = rec->payload_len <= 255;
+        const ndef_record_t *rec          = &msg->records[i];
+        bool                 is_begin     = (i == 0);
+        bool                 is_end       = (i == (msg->record_count - 1));
+        bool                 short_record = rec->payload_len <= 255;
 
         if (!ndef_record_has_consistent_storage(rec)) {
             return 0;
@@ -597,8 +598,8 @@ static uint8_t ndef_uri_prefix_code(const char *uri, size_t *prefix_len)
     return 0x00;
 }
 
-bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len,
-                           bool utf16, uint8_t *payload_buf, size_t payload_buf_len)
+bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len, bool utf16,
+                           uint8_t *payload_buf, size_t payload_buf_len)
 {
     if (rec == NULL || text == NULL || payload_buf == NULL) {
         return false;
@@ -646,8 +647,7 @@ bool ndef_make_uri_record(ndef_record_t *rec, const char *uri, bool abbreviate, 
     payload_buf[0] = prefix_code;
     memcpy(&payload_buf[1], uri + prefix_len, remaining_len);
 
-    ndef_record_init(rec, NDEF_TNF_WELL_KNOWN, NDEF_RTD_URI, NDEF_RTD_URI_LEN, NULL, 0, payload_buf,
-                     (uint32_t)needed);
+    ndef_record_init(rec, NDEF_TNF_WELL_KNOWN, NDEF_RTD_URI, NDEF_RTD_URI_LEN, NULL, 0, payload_buf, (uint32_t)needed);
     return true;
 }
 
@@ -884,7 +884,7 @@ ndef_result_t ndef_write_to_selected_card(pn532_t *pn532, const ndef_message_t *
 
     for (size_t block = 1; block < blocks_needed; block++) {
         if (pn532_14443_block_write(pn532, start_block + (int)block, buf + block * (size_t)block_size,
-                        (size_t)block_size) < 0) {
+                                    (size_t)block_size) < 0) {
             free(buf);
             return NDEF_ERR_WRITE_FAILED;
         }
@@ -1257,8 +1257,7 @@ static ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn532_uid_
 
     switch (uid->subtype) {
     case PN532_MIFARE_CLASSIC_MINI:
-        if (!classic_collect_ndef_sectors(mad1, sizeof(mad1), 1, 4, sectors, CLASSIC_MAX_NDEF_SECTORS,
-                                          &sector_count)) {
+        if (!classic_collect_ndef_sectors(mad1, sizeof(mad1), 1, 4, sectors, CLASSIC_MAX_NDEF_SECTORS, &sector_count)) {
             return NDEF_ERR_NO_NDEF;
         }
         break;

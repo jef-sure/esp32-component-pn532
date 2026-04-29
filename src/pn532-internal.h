@@ -17,10 +17,10 @@ struct pn532_bus_t
     pn532_bus_destroy_t       destroy;
 };
 
-#define PN532_PREAMBLE  (0x00)
+#define PN532_PREAMBLE   (0x00)
 #define PN532_STARTCODE1 (0x00)
 #define PN532_STARTCODE2 (0xFF)
-#define PN532_POSTAMBLE (0x00)
+#define PN532_POSTAMBLE  (0x00)
 
 #define PN532_HOSTTOPN532 (0xD4)
 #define PN532_PN532TOHOST (0xD5)
@@ -40,8 +40,9 @@ struct pn532_bus_t
 
 #define PN532_MIFARE_ISO14443A (0x00)
 
-bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len, uint8_t *response, size_t *response_len,
-                           uint16_t timeout);
+bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len, uint8_t *response,
+                           size_t *response_len, uint16_t timeout);
 bool pn532_release_target(pn532_t *pn532);
-bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response, size_t *response_len, uint16_t timeout);
+bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
+                            size_t *response_len, uint16_t timeout);
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number);

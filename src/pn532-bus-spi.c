@@ -3,11 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
-#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -102,10 +102,10 @@ static bool pn532_spi_bus_is_ready(pn532_bus_t *bus)
     }
 
     memset(spi_bus->trans, 0, sizeof(*spi_bus->trans));
-    spi_bus->trans->cmd         = PN532_SPI_STATREAD;
-    spi_bus->trans->rxlength    = 8;
-    spi_bus->trans->flags       = SPI_TRANS_USE_RXDATA;
-    spi_bus->trans->user        = spi_bus;
+    spi_bus->trans->cmd      = PN532_SPI_STATREAD;
+    spi_bus->trans->rxlength = 8;
+    spi_bus->trans->flags    = SPI_TRANS_USE_RXDATA;
+    spi_bus->trans->user     = spi_bus;
 
     esp_err_t err = spi_device_transmit(spi_bus->spi_handle, spi_bus->trans);
     if (err != ESP_OK) {
@@ -157,15 +157,15 @@ static void pn532_spi_bus_destroy(pn532_bus_t *bus)
 static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi)
 {
     spi_bus_config_t bus_config = {
-        .mosi_io_num = mosi,
-        .miso_io_num = miso,
-        .sclk_io_num = sck,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .data4_io_num = -1,
-        .data5_io_num = -1,
-        .data6_io_num = -1,
-        .data7_io_num = -1,
+        .mosi_io_num     = mosi,
+        .miso_io_num     = miso,
+        .sclk_io_num     = sck,
+        .quadwp_io_num   = -1,
+        .quadhd_io_num   = -1,
+        .data4_io_num    = -1,
+        .data5_io_num    = -1,
+        .data6_io_num    = -1,
+        .data7_io_num    = -1,
         .max_transfer_sz = PN532_MAX_BUF_SIZE + 2,
     };
 
@@ -250,7 +250,8 @@ static pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, 
     return &spi_bus->base;
 }
 
-pn532_bus_t *pn532_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi, gpio_num_t nss, int clock_speed_hz)
+pn532_bus_t *pn532_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi, gpio_num_t nss,
+                            int clock_speed_hz)
 {
     if (!pn532_spi_bus_init(host_id, sck, miso, mosi)) {
         return NULL;

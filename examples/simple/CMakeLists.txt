@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main/main.c"
     REQUIRES pn532
     INCLUDE_DIRS "."
 )

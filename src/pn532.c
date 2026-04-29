@@ -3,13 +3,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 static const char *TAG = "PN532";
+
+#define PN532_IRQ_QUEUE_DEPTH 4
+
+static void IRAM_ATTR pn532_irq_isr_handler(void *arg)
+{
+    pn532_t *pn532 = (pn532_t *)arg;
+    if (pn532 == NULL || pn532->irq_queue == NULL) {
+        return;
+    }
+    uint8_t    evt      = 1;
+    BaseType_t hp_woken = pdFALSE;
+    (void)xQueueSendFromISR(pn532->irq_queue, &evt, &hp_woken);
+    if (hp_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 static const uint8_t pn532_ack[]         = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
 static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 0x81, 0x00};
@@ -27,9 +46,6 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 
 static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8_t *config_data,
                                    size_t config_data_len);
-static bool pn532_set_passive_activation_retries(pn532_t *pn532, uint8_t max_retries);
-static bool pn532_set_retries(pn532_t *pn532, uint8_t max_rty_atr, uint8_t max_rty_psl,
-                              uint8_t max_rty_passive_activation);
 static bool pn532_sam_configuration(pn532_t *pn532, uint8_t mode, uint8_t timeout, uint8_t irq_enable);
 
 static bool pn532_status_requires_reselect(uint8_t status)
@@ -180,6 +196,25 @@ static bool pn532_is_ready(pn532_t *pn532)
 
 static bool pn532_wait_ready(pn532_t *pn532, uint16_t timeout)
 {
+    if (pn532 != NULL && pn532->isr_installed && pn532->irq_queue != NULL) {
+        /* Check the bus first: the IRQ line may already be asserted from
+         * before this call (e.g. SAM "ready" persisting after a previous
+         * command, or a level-low signal we never re-armed an edge for). In
+         * that case xQueueReceive would block until timeout — which, with
+         * timeout=0, means forever. */
+        if (pn532_is_ready(pn532)) {
+            return true;
+        }
+        uint8_t    evt;
+        TickType_t ticks = (timeout == 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout);
+        if (xQueueReceive(pn532->irq_queue, &evt, ticks) == pdTRUE) {
+            return true;
+        }
+        /* Final bus poll: covers the race where the edge fired between our
+         * pre-check and the queue wait but was consumed elsewhere. */
+        return pn532_is_ready(pn532);
+    }
+
     uint16_t waited = 0;
     while (!pn532_is_ready(pn532)) {
         if (timeout != 0) {
@@ -336,6 +371,12 @@ bool pn532_execute_command(      //
         return false;
     }
 
+    /* Drain any stale IRQ events queued from a previous command before issuing
+     * a new one, so the upcoming wait_ready() blocks on the new edge. */
+    if (pn532 != NULL && pn532->isr_installed && pn532->irq_queue != NULL) {
+        xQueueReset(pn532->irq_queue);
+    }
+
     if (!pn532_write_frame(pn532, command, params, params_len)) {
         return false;
     }
@@ -450,6 +491,28 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
     }
     if (pn532_gpio_is_valid(irq)) {
         gpio_set_direction(irq, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(irq, GPIO_PULLUP_ONLY);
+        pn532->irq_queue = xQueueCreate(PN532_IRQ_QUEUE_DEPTH, sizeof(uint8_t));
+        if (pn532->irq_queue == NULL) {
+            ESP_LOGE(TAG, "pn532: failed to allocate IRQ queue");
+        } else {
+            esp_err_t isr_err = gpio_install_isr_service(0);
+            if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
+                ESP_LOGE(TAG, "pn532: gpio_install_isr_service failed (%s)", esp_err_to_name(isr_err));
+            } else {
+                gpio_set_intr_type(irq, GPIO_INTR_NEGEDGE);
+                esp_err_t add_err = gpio_isr_handler_add(irq, pn532_irq_isr_handler, pn532);
+                if (add_err != ESP_OK) {
+                    ESP_LOGE(TAG, "pn532: gpio_isr_handler_add failed (%s)", esp_err_to_name(add_err));
+                } else {
+                    pn532->isr_installed = true;
+                }
+            }
+            if (!pn532->isr_installed) {
+                vQueueDelete(pn532->irq_queue);
+                pn532->irq_queue = NULL;
+            }
+        }
     }
 
     if (!pn532_reset(pn532)) {
@@ -498,6 +561,15 @@ void pn532_deinit(pn532_t *pn532, bool free_bus)
         return;
     }
 
+    if (pn532->isr_installed && pn532_gpio_is_valid(pn532->irq)) {
+        gpio_isr_handler_remove(pn532->irq);
+        pn532->isr_installed = false;
+    }
+    if (pn532->irq_queue != NULL) {
+        vQueueDelete(pn532->irq_queue);
+        pn532->irq_queue = NULL;
+    }
+
     pn532_bus_t *bus = pn532->bus;
     free(pn532->send_buf);
     free(pn532->recv_buf);
@@ -512,8 +584,8 @@ bool pn532_set_rf_field(pn532_t *pn532, bool enabled)
 {
     const uint8_t params[]     = {0x01, enabled ? 0x03 : 0x02};
     size_t        response_len = 0;
-    bool          ok           = pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, params, sizeof(params), NULL,
-                                                       &response_len, (uint16_t)pn532->timeout_ms);
+    bool ok = pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, params, sizeof(params), NULL, &response_len,
+                                    (uint16_t)pn532->timeout_ms);
     if (ok && response_len == 0) {
         pn532->is_rf_on = enabled;
     }
@@ -546,16 +618,18 @@ static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8
            response_len == 0;
 }
 
-static bool pn532_set_passive_activation_retries(pn532_t *pn532, uint8_t max_retries)
+bool pn532_set_max_retries(pn532_t *pn532, uint8_t max_rty_atr, uint8_t max_rty_psl, uint8_t max_rty_passive_activation)
 {
-    return pn532_set_retries(pn532, 0xFF, 0x01, max_retries);
-}
-
-static bool pn532_set_retries(pn532_t *pn532, uint8_t max_rty_atr, uint8_t max_rty_psl,
-                              uint8_t max_rty_passive_activation)
-{
+    if (pn532 == NULL) {
+        return false;
+    }
     const uint8_t cfg[] = {max_rty_atr, max_rty_psl, max_rty_passive_activation};
     return pn532_rf_configuration(pn532, 0x05, cfg, sizeof(cfg));
+}
+
+bool pn532_set_passive_activation_retries(pn532_t *pn532, uint8_t max_retries)
+{
+    return pn532_set_max_retries(pn532, 0xFF, 0x01, max_retries);
 }
 
 static bool pn532_sam_configuration(pn532_t *pn532, uint8_t mode, uint8_t timeout, uint8_t irq_enable)

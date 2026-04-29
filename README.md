@@ -4,7 +4,7 @@ ESP-IDF component for the PN532 NFC reader over SPI, I2C, or UART/HSU.
 
 The driver is focused on reader mode for ISO14443A cards and is split into three public headers:
 
-- `include/pn532.h`: transport creation, device lifetime, ISO14443A polling/select, and ISO-DEP helpers
+- `include/pn532.h`: transport creation, device lifetime, retry tuning, raw command access, ISO14443A polling/select, and ISO-DEP helpers
 - `include/pn532-mifare.h`: low-level MIFARE Classic and Ultralight read/write primitives
 - `include/pn532-ndef.h`: NDEF parsing, encoding, and card read/write helpers
 
@@ -13,11 +13,14 @@ Most applications only need `pn532.h` plus `pn532-ndef.h`.
 ## Features
 
 - SPI, I2C, and UART/HSU transport backends
+- Optional IRQ-driven ready notifications when `pn532_init()` receives a wired IRQ GPIO
 - ISO14443A polling with support for up to two cards per scan
 - Card selection and MIFARE Classic authentication helpers
 - Raw block access for MIFARE Classic, Ultralight, and NTAG tags
 - 14443 block read/write compatibility helpers in `pn532.h`
 - ISO-DEP helpers for Type 4 style APDU exchange
+- Retry tuning helpers for ATR, PSL, and passive activation
+- Raw PN532 command access for commands that do not have a dedicated helper yet
 - NDEF reading from Type 2 tags such as Ultralight and NTAG
 - NDEF reading from MIFARE Classic Mini, 1K, and 4K with MAD1-based NDEF sector discovery (and MAD2 on 4K cards that advertise it)
 - NDEF reading from Type 4 cards exposed through the PN532 ISO-DEP path
@@ -50,28 +53,22 @@ The example app component in this repository uses `REQUIRES pn532`, so the local
 ### Managed component metadata
 
 This repository also includes an `idf_component.yml` manifest for ESP-IDF Component Manager metadata.
+See `CHANGES.md` for release notes.
 
 ## Sample App
 
-`examples/simple/main.c` is a sample application source file that:
+The maintained SPI demo lives in [`examples/simple`](examples/simple/README.md).
 
-- initializes the PN532 over SPI
-- reads and logs the PN532 firmware identifier
-- polls for ISO14443A cards every 250 ms
-- prints discovered UIDs
-- attempts an NDEF read first
-- falls back to raw block dumps by card family
+It shows how to:
 
-The bundled sample uses this ESP32 SPI wiring:
+- initialize the PN532 over SPI
+- read and log the PN532 firmware identifier
+- poll for ISO14443A cards every 250 ms
+- print discovered UIDs
+- attempt an NDEF read first
+- fall back to raw block dumps by card family
 
-- `SCK`: GPIO 18
-- `MISO`: GPIO 19
-- `MOSI`: GPIO 23
-- `NSS`: GPIO 5
-- `IRQ`: not used
-- `RST`: not used
-
-`examples/simple` is an app-component fragment, not a full standalone `idf.py create-project` tree. Copy the source into an ESP-IDF application or adapt it inside your own project.
+The example README covers wiring, folder layout, and integration into an ESP-IDF application.
 
 ## Minimal Setup
 
@@ -108,6 +105,8 @@ Alternative transport constructors:
 - `pn532_uart_init(uart_num, tx, rx, baud_rate)`
 
 For I2C, pass `0` as the address to use `PN532_I2C_DEFAULT_ADDRESS`. For UART, pass a non-positive baud rate to use `PN532_UART_DEFAULT_BAUD_RATE`.
+
+`pn532_init(bus, irq, rst)` also accepts an optional IRQ GPIO. When the PN532 IRQ line is wired and passed here, the driver can use IRQ-ready notifications while waiting for ACK and response frames. Pass `GPIO_NUM_NC` when IRQ is not connected.
 
 ## Poll, Select, And Inspect Cards
 
@@ -210,6 +209,14 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - `pn532_mifare_block_read()` reads one 16-byte MIFARE Classic block, or 16 bytes spanning four Type 2 pages.
 - Value-block helpers (`pn532_mifare_increment()`, `pn532_mifare_decrement()`, `pn532_mifare_restore()`, `pn532_mifare_transfer()`) stage the operation in the PN532 transfer buffer; `pn532_mifare_transfer()` commits it. `MIFARE_CMD_RESTORE` is preferred; `MIFARE_CMD_STORE` remains as a backward-compatible alias.
 
+## Advanced Driver Control
+
+`pn532.h` also exposes lower-level control helpers:
+
+- `pn532_set_max_retries()` updates RFConfiguration item `0x05` for ATR, PSL, and passive activation retries.
+- `pn532_set_passive_activation_retries()` changes only the passive activation retry count while leaving ATR and PSL retries at their defaults.
+- `pn532_execute_command()` sends a raw PN532 command and returns the response payload without the PN532 frame wrapper, TFI byte, or response-code byte. Use it for commands that are not covered by a dedicated helper.
+
 ## Ownership And Lifetime
 
 - `pn532_spi_init()`, `pn532_i2c_init()`, and `pn532_uart_init()` return heap-allocated `pn532_bus_t *` handles.
@@ -225,6 +232,7 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 
 - Transport and device lifecycle: `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_init()`, `pn532_deinit()`
 - RF field control: `pn532_set_rf_field()`, `pn532_set_rf_on()`, `pn532_set_rf_off()`
+- Retry tuning and raw commands: `pn532_set_max_retries()`, `pn532_set_passive_activation_retries()`, `pn532_execute_command()`
 - Poll, select, and auth: `pn532_14443_get_all_uids()`, `pn532_14443_select_by_uid()`, `pn532_14443_authenticate()`
 - Selected-tag block access: `pn532_14443_block_read()`, `pn532_14443_block_write()`
 - Card metadata: `pn532_14443_detect_card_type_and_capacity()`, `pn532_14443_detect_selected_card_type_and_capacity()`

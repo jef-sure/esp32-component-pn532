@@ -124,8 +124,8 @@ void ndef_record_init(ndef_record_t *rec, ndef_tnf_t tnf, const uint8_t *type, u
 size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_len);
 
 /** @brief Build a Well-known Text record whose payload is stored in payload_buf. */
-bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len,
-                           bool utf16, uint8_t *payload_buf, size_t payload_buf_len);
+bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len, bool utf16,
+                           uint8_t *payload_buf, size_t payload_buf_len);
 
 /** @brief Build a Well-known URI record whose payload is stored in payload_buf. */
 bool ndef_make_uri_record(ndef_record_t *rec, const char *uri, bool abbreviate, uint8_t *payload_buf,
@@ -191,13 +191,13 @@ size_t ndef_extract_uri(const ndef_record_t *rec, char *uri_buf, size_t uri_buf_
 ndef_record_type_t ndef_get_record_type(const ndef_record_t *rec);
 
 /** @brief Return true when rec is a Well-known Text record. */
-bool               ndef_record_is_text(const ndef_record_t *rec);
+bool ndef_record_is_text(const ndef_record_t *rec);
 
 /** @brief Return true when rec is a Well-known URI record. */
-bool               ndef_record_is_uri(const ndef_record_t *rec);
+bool ndef_record_is_uri(const ndef_record_t *rec);
 
 /** @brief Return true when rec is a Well-known Smart Poster record. */
-bool               ndef_record_is_smartposter(const ndef_record_t *rec);
+bool ndef_record_is_smartposter(const ndef_record_t *rec);
 
 /**
  * @brief Decode nested records stored inside a Smart Poster payload.

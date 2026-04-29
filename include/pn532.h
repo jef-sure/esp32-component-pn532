@@ -14,6 +14,8 @@
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 /** @brief Default 7-bit PN532 I2C address in ESP-IDF's left-shifted form. */
 #define PN532_I2C_DEFAULT_ADDRESS    (0x24)
@@ -97,6 +99,8 @@ typedef struct _pn532_t
     uint8_t      inListedTag;
     bool         session_opened;
     bool         recovery_in_progress;
+    QueueHandle_t irq_queue;     /**< Set when IRQ ISR is installed; NULL otherwise. */
+    bool          isr_installed; /**< True when this device owns a GPIO ISR handler on irq. */
 } pn532_t;
 
 /** @brief Sleep helper used by the driver and available to callers building retry loops. */
@@ -203,6 +207,60 @@ bool pn532_set_rf_on(pn532_t *pn532);
 
 /** @brief Convenience wrapper for pn532_set_rf_field(pn532, false). */
 bool pn532_set_rf_off(pn532_t *pn532);
+
+/**
+ * @brief Configure the PN532 retry counters for ATR, PSL, and passive activation.
+ *
+ * Wraps RFConfiguration item 0x05 (MaxRetries). Use 0x00 to disable retries
+ * (single attempt) and 0xFF for unlimited retries. Default values applied at
+ * pn532_init() time are 0xFF / 0x01 / 0x05.
+ */
+bool pn532_set_max_retries(pn532_t *pn532, uint8_t max_rty_atr, uint8_t max_rty_psl,
+                           uint8_t max_rty_passive_activation);
+
+/**
+ * @brief Set the passive-activation retry count (RFConfiguration item 5, third byte).
+ *
+ * 0x00 means "try once" (fastest probe), 0xFF means "retry forever", and any
+ * value in between sets a finite retry count. ATR and PSL retries are left at
+ * their defaults (0xFF and 0x01).
+ */
+bool pn532_set_passive_activation_retries(pn532_t *pn532, uint8_t max_retries);
+
+/**
+ * @brief Issue a raw PN532 command and read the matching response frame.
+ *
+ * This is the low-level escape hatch behind every higher-level helper in the
+ * driver. The host->PN532 framing (preamble, length, TFI, DCS, postamble) is
+ * built internally; callers supply only the command code and its parameter
+ * bytes. The response payload returned here strips the TFI and the response
+ * code byte, so the first byte is the command-specific status / first data
+ * byte as documented in UM0701-02.
+ *
+ * Use this for PN532 commands not exposed by a dedicated helper (e.g.
+ * WriteRegister, ReadRegister, RFRegulationTest, GetGeneralStatus,
+ * Diagnose, GPIO control). For ISO14443A polling and ISO14443-4 transceive,
+ * prefer the typed helpers in this header.
+ *
+ * @param pn532 Device context.
+ * @param command PN532 command code (0x02 for GetFirmwareVersion, etc.).
+ * @param params Command parameter bytes, or NULL when @p params_len is 0.
+ * @param params_len Length of @p params in bytes.
+ * @param response Optional output buffer for the response payload.
+ * @param response_len In: capacity of @p response. Out: bytes written.
+ *                    Required when @p response is non-NULL. May be NULL when
+ *                    the caller does not need the payload (the command must
+ *                    still produce a valid response frame for this to return
+ *                    true).
+ * @param timeout_ms Per-phase timeout in milliseconds (used for both ACK and
+ *                   response waits). 0 means wait indefinitely.
+ *
+ * @return true on success. On false, the response buffer contents are
+ *         undefined; @p *response_len is set to the required size if the
+ *         buffer was too small.
+ */
+bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len,
+                           uint8_t *response, size_t *response_len, uint16_t timeout_ms);
 
 /**
  * @brief Poll for ISO14443A targets and return their UIDs.

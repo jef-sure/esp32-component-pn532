@@ -1,5 +1,5 @@
 ## IDF Component Manager Manifest File
-version: "0.0.1"
+version: "0.0.2"
 description: "ESP-IDF component for the PN532 NFC reader over SPI, I2C, or UART/HSU"
 url: https://github.com/jef-sure/esp32-component-pn532
 repository: https://github.com/jef-sure/esp32-component-pn532.git
@@ -35,7 +35,9 @@ files:
     - "examples/**/*.c"
     - "examples/**/*.h"
     - "examples/**/CMakeLists.txt"
+    - "examples/**/*.md"
     - "README.md"
+    - "CHANGES.md"
     - "LICENSE"
   exclude:
     - "build/**"

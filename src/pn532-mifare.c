@@ -1,5 +1,5 @@
-#include "pn532-internal.h"
 #include "pn532-mifare.h"
+#include "pn532-internal.h"
 
 #include <string.h>
 
@@ -9,20 +9,19 @@ static const char *TAG = "PN532-MIFARE";
 
 #define PN532_MIFARE_AUTH_TIMEOUT_MS 1500
 
-int16_t pn532_mifare_authenticate(pn532_t *pn532, uint8_t blockno, const uint8_t *key, uint8_t key_type, const uint8_t uid[4])
+int16_t pn532_mifare_authenticate(pn532_t *pn532, uint8_t blockno, const uint8_t *key, uint8_t key_type,
+                                  const uint8_t uid[4])
 {
     if (key == NULL || uid == NULL) {
         return -1;
     }
 
     uint8_t data[] = {
-        key_type,
-        blockno,
-        key[0], key[1], key[2], key[3], key[4], key[5],
-        uid[0], uid[1], uid[2], uid[3],
+        key_type, blockno, key[0], key[1], key[2], key[3], key[4], key[5], uid[0], uid[1], uid[2], uid[3],
     };
     size_t response_len = 0;
-    return pn532_in_data_exchange(pn532, data, sizeof(data), NULL, &response_len, PN532_MIFARE_AUTH_TIMEOUT_MS) ? 0 : -2;
+    return pn532_in_data_exchange(pn532, data, sizeof(data), NULL, &response_len, PN532_MIFARE_AUTH_TIMEOUT_MS) ? 0
+                                                                                                                : -2;
 }
 
 bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_t buffer_len)
@@ -31,8 +30,8 @@ bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_
         return false;
     }
 
-    uint8_t cmd[] = {MIFARE_CMD_READ, (uint8_t)blockno};
-    size_t response_len = buffer_len;
+    uint8_t cmd[]        = {MIFARE_CMD_READ, (uint8_t)blockno};
+    size_t  response_len = buffer_len;
     if (!pn532_in_data_exchange(pn532, cmd, sizeof(cmd), buffer, &response_len, (uint16_t)pn532->timeout_ms)) {
         return false;
     }
@@ -46,7 +45,7 @@ int pn532_mifare_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer,
     }
 
     uint8_t cmd[18];
-    size_t cmd_len;
+    size_t  cmd_len;
     if (buffer_len >= 16) {
         cmd[0] = MIFARE_CMD_WRITE;
         cmd[1] = (uint8_t)blockno;
@@ -81,8 +80,8 @@ bool pn532_mifare_value_read(pn532_t *pn532, uint8_t blockno, int32_t *value)
      *   byte  14     : addr
      *   byte  15     : ~addr
      */
-    uint32_t v0 = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
-    uint32_t v2 = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) | ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
+    uint32_t v0  = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+    uint32_t v2  = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) | ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
     uint32_t inv = ~((uint32_t)buf[4] | ((uint32_t)buf[5] << 8) | ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24));
     if (v0 != v2 || v0 != inv) {
         ESP_LOGE(TAG, "pn532_mifare_value_read: invalid value block format");
@@ -98,7 +97,7 @@ bool pn532_mifare_value_read(pn532_t *pn532, uint8_t blockno, int32_t *value)
 
 bool pn532_mifare_value_write(pn532_t *pn532, uint8_t blockno, int32_t value, uint8_t addr)
 {
-    uint8_t buf[16];
+    uint8_t  buf[16];
     uint32_t v = (uint32_t)value;
     uint32_t i = ~v;
 
@@ -132,22 +131,22 @@ static bool pn532_mifare_value_op(pn532_t *pn532, uint8_t cmd, uint8_t blockno, 
      * separately to commit the result.
      */
     uint8_t op[6];
-    size_t op_len;
+    size_t  op_len;
 
     op[0] = cmd;
     op[1] = blockno;
     if (cmd == MIFARE_CMD_INCREMENT || cmd == MIFARE_CMD_DECREMENT) {
-        op[2] = (uint8_t)(delta & 0xFF);
-        op[3] = (uint8_t)((delta >> 8) & 0xFF);
-        op[4] = (uint8_t)((delta >> 16) & 0xFF);
-        op[5] = (uint8_t)((delta >> 24) & 0xFF);
+        op[2]  = (uint8_t)(delta & 0xFF);
+        op[3]  = (uint8_t)((delta >> 8) & 0xFF);
+        op[4]  = (uint8_t)((delta >> 16) & 0xFF);
+        op[5]  = (uint8_t)((delta >> 24) & 0xFF);
         op_len = 6;
     } else if (cmd == MIFARE_CMD_RESTORE) {
         /* RESTORE requires a 4-byte dummy operand. */
-        op[2] = 0;
-        op[3] = 0;
-        op[4] = 0;
-        op[5] = 0;
+        op[2]  = 0;
+        op[3]  = 0;
+        op[4]  = 0;
+        op[5]  = 0;
         op_len = 6;
     } else {
         return false;
@@ -174,7 +173,7 @@ bool pn532_mifare_restore(pn532_t *pn532, uint8_t blockno)
 
 bool pn532_mifare_transfer(pn532_t *pn532, uint8_t blockno)
 {
-    uint8_t op[2] = {MIFARE_CMD_TRANSFER, blockno};
-    size_t response_len = 0;
+    uint8_t op[2]        = {MIFARE_CMD_TRANSFER, blockno};
+    size_t  response_len = 0;
     return pn532_in_data_exchange(pn532, op, sizeof(op), NULL, &response_len, (uint16_t)pn532->timeout_ms);
 }

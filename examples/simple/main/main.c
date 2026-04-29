@@ -5,27 +5,25 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "pn532.h"
 #include "pn532-mifare.h"
 #include "pn532-ndef.h"
+#include "pn532.h"
 
 static const char *TAG = "main";
 
-#define PN532_SPI_HOST_ID  SPI3_HOST
-#define PN532_SPI_CLOCK_HZ 1000000
-
-#define PN532_PIN_SCK  GPIO_NUM_18
-#define PN532_PIN_MISO GPIO_NUM_19
-#define PN532_PIN_MOSI GPIO_NUM_23
-#define PN532_PIN_NSS  GPIO_NUM_5
-#define PN532_PIN_IRQ  GPIO_NUM_NC
-#define PN532_PIN_RST  GPIO_NUM_NC
-
-#define PN532_SAMPLE_MAX_UIDS 2
-#define PN532_SAMPLE_POLL_MS  250
-
-#define PN532_SAMPLE_ENABLE_DUMP 1
-#define PN532_SAMPLE_ENABLE_NDEF 1
+enum
+{
+    PN532_SPI_HOST_ID     = SPI3_HOST,
+    PN532_SPI_CLOCK_HZ    = 1000000,
+    PN532_PIN_SCK         = GPIO_NUM_18,
+    PN532_PIN_MISO        = GPIO_NUM_19,
+    PN532_PIN_MOSI        = GPIO_NUM_23,
+    PN532_PIN_NSS         = GPIO_NUM_5,
+    PN532_PIN_IRQ         = GPIO_NUM_NC,
+    PN532_PIN_RST         = GPIO_NUM_NC,
+    PN532_SAMPLE_MAX_UIDS = 2,
+    PN532_SAMPLE_POLL_MS  = 250,
+};
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
@@ -155,7 +153,7 @@ static void pn532_log_detected_cards(const pn532_uids_array_t *uids)
 
 static void pn532_log_block(int blockno, const uint8_t *data, size_t len)
 {
-    char line[3 * 16 + 1];
+    char   line[3 * 16 + 1];
     size_t offset = 0;
 
     line[0] = '\0';
@@ -177,12 +175,12 @@ static int pn532_classic_sector_from_block(const pn532_uid_t *uid, int block)
     return block / 4;
 }
 
-static auth_result_t pn532_authenticate_sector_with_key(  //
-    pn532_t           *pn532,                             //
-    const pn532_uid_t *uid,                               //
-    int                sector_block,                      //
-    const uint8_t     *key,                               //
-    uint8_t            key_type                           //
+static auth_result_t pn532_authenticate_sector_with_key( //
+    pn532_t           *pn532,                            //
+    const pn532_uid_t *uid,                              //
+    int                sector_block,                     //
+    const uint8_t     *key,                              //
+    uint8_t            key_type                          //
 )
 {
     if (pn532 == NULL || uid == NULL || key == NULL) {
@@ -319,11 +317,11 @@ static void pn532_dump_desfire(pn532_t *pn532, const pn532_uid_t *uid)
         return;
     }
     pn532_log_block(-1, cc, cc_got); /* CC */
-    uint16_t mle           = ((uint16_t)cc[3] << 8) | cc[4];
+    uint16_t mle            = ((uint16_t)cc[3] << 8) | cc[4];
     uint8_t  ndef_fid_be[2] = {cc[9], cc[10]};
-    uint16_t max_ndef_size = ((uint16_t)cc[11] << 8) | cc[12];
-    ESP_LOGI(TAG, "  CC: ver=0x%02X MLe=%u MLc=%u NDEF FID=%02X%02X max=%u r/w=%02X/%02X",
-             cc[2], mle, ((uint16_t)cc[5] << 8) | cc[6], ndef_fid_be[0], ndef_fid_be[1], max_ndef_size, cc[13], cc[14]);
+    uint16_t max_ndef_size  = ((uint16_t)cc[11] << 8) | cc[12];
+    ESP_LOGI(TAG, "  CC: ver=0x%02X MLe=%u MLc=%u NDEF FID=%02X%02X max=%u r/w=%02X/%02X", cc[2], mle,
+             ((uint16_t)cc[5] << 8) | cc[6], ndef_fid_be[0], ndef_fid_be[1], max_ndef_size, cc[13], cc[14]);
 
     if (!pn532_14443_4_select_file(pn532, ndef_fid_be, sizeof(ndef_fid_be))) {
         ESP_LOGW(TAG, "  SELECT NDEF file failed");
@@ -357,7 +355,7 @@ static void pn532_dump_desfire(pn532_t *pn532, const pn532_uid_t *uid)
             size_t line = (got - i > 16) ? 16 : (got - i);
             pn532_log_block((int)(off + i), buf + i, line);
         }
-        off       += want;
+        off += want;
         remaining -= want;
     }
 }
@@ -393,12 +391,12 @@ static void pn532_log_record(int index, const ndef_record_t *rec)
 
     switch (type) {
     case NDEF_RECORD_TYPE_TEXT: {
-        const uint8_t *txt    = NULL;
-        size_t         tx_len = 0;
+        const uint8_t *txt      = NULL;
+        size_t         tx_len   = 0;
         char           lang[64] = {0};
-        bool           utf16  = false;
+        bool           utf16    = false;
         if (ndef_extract_text(rec, &txt, &tx_len, lang, &utf16)) {
-            char preview[128];
+            char   preview[128];
             size_t copy = (tx_len < sizeof(preview) - 1) ? tx_len : sizeof(preview) - 1;
             memcpy(preview, txt, copy);
             preview[copy] = '\0';
@@ -474,7 +472,8 @@ static void pn532_process_card(pn532_t *pn532, const pn532_uid_t *uid, int index
         return;
     }
 
-    if (!pn532_14443_detect_selected_card_type_and_capacity(pn532, &working_uid, &blocks_count, &block_size, &needs_reselect)) {
+    if (!pn532_14443_detect_selected_card_type_and_capacity(pn532, &working_uid, &blocks_count, &block_size,
+                                                            &needs_reselect)) {
         ESP_LOGW(TAG, "detect_card_type_and_capacity failed; skipping card %d", index + 1);
         return;
     }
@@ -484,21 +483,15 @@ static void pn532_process_card(pn532_t *pn532, const pn532_uid_t *uid, int index
         return;
     }
 
-#if PN532_SAMPLE_ENABLE_NDEF
     ESP_LOGI(TAG, "--- Card %d NDEF ---", index + 1);
     ndef_result_t ndef_res = pn532_read_ndef(pn532, &working_uid);
-#else
-    ndef_result_t ndef_res = NDEF_ERR_UNSUPPORTED;
-#endif
 
-#if PN532_SAMPLE_ENABLE_DUMP
-    if (!PN532_SAMPLE_ENABLE_NDEF || (ndef_res != NDEF_OK && ndef_res != NDEF_ERR_READ_FAILED)) {
+    if (ndef_res != NDEF_OK && ndef_res != NDEF_ERR_READ_FAILED) {
         ESP_LOGI(TAG, "--- Card %d block dump ---", index + 1);
         pn532_dump_card(pn532, &working_uid);
     } else if (ndef_res == NDEF_ERR_READ_FAILED) {
         ESP_LOGI(TAG, "Skipping block dump after read failure");
     }
-#endif
 }
 
 static void pn532_process_all_cards(pn532_t *pn532, const pn532_uids_array_t *uids)

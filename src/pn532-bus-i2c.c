@@ -10,9 +10,9 @@
 
 static const char *TAG = "PN532-I2C";
 
-#define PN532_I2C_READY 0x01
-#define PN532_I2C_TRANSFER_TIMEOUT_MS 100
-#define PN532_I2C_READY_RETRY_COUNT 8
+#define PN532_I2C_READY                0x01
+#define PN532_I2C_TRANSFER_TIMEOUT_MS  100
+#define PN532_I2C_READY_RETRY_COUNT    8
 #define PN532_I2C_READY_RETRY_DELAY_MS 5
 
 typedef struct
@@ -54,7 +54,8 @@ static bool pn532_i2c_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t le
     }
 
     for (int attempt = 0; attempt < PN532_I2C_READY_RETRY_COUNT; attempt++) {
-        esp_err_t err = i2c_master_receive(i2c_bus->dev_handle, i2c_bus->buffer, len + 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
+        esp_err_t err =
+            i2c_master_receive(i2c_bus->dev_handle, i2c_bus->buffer, len + 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "pn532_i2c_bus_read_data: i2c_master_receive failed (%s)", esp_err_to_name(err));
             return false;
@@ -75,7 +76,7 @@ static bool pn532_i2c_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t le
 static bool pn532_i2c_bus_is_ready(pn532_bus_t *bus)
 {
     pn532_i2c_bus_t *i2c_bus = pn532_i2c_bus(bus);
-    uint8_t status = 0;
+    uint8_t          status  = 0;
 
     if (i2c_bus == NULL) {
         return false;
@@ -115,7 +116,8 @@ static void pn532_i2c_bus_destroy(pn532_bus_t *bus)
     free(i2c_bus);
 }
 
-pn532_bus_t *pn532_i2c_init(i2c_port_num_t port, gpio_num_t scl, gpio_num_t sda, uint16_t device_address, uint32_t clock_speed_hz)
+pn532_bus_t *pn532_i2c_init(i2c_port_num_t port, gpio_num_t scl, gpio_num_t sda, uint16_t device_address,
+                            uint32_t clock_speed_hz)
 {
     pn532_i2c_bus_t *i2c_bus = calloc(1, sizeof(*i2c_bus));
     if (i2c_bus == NULL) {
@@ -133,20 +135,20 @@ pn532_bus_t *pn532_i2c_init(i2c_port_num_t port, gpio_num_t scl, gpio_num_t sda,
     }
 
     i2c_master_bus_config_t bus_config = {
-        .i2c_port = port,
-        .sda_io_num = sda,
-        .scl_io_num = scl,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .intr_priority = 0,
-        .trans_queue_depth = 1,
+        .i2c_port                     = port,
+        .sda_io_num                   = sda,
+        .scl_io_num                   = scl,
+        .clk_source                   = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt            = 7,
+        .intr_priority                = 0,
+        .trans_queue_depth            = 1,
         .flags.enable_internal_pullup = 1,
     };
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = device_address,
-        .scl_speed_hz = clock_speed_hz,
-        .scl_wait_us = 0,
+        .device_address  = device_address,
+        .scl_speed_hz    = clock_speed_hz,
+        .scl_wait_us     = 0,
     };
 
     esp_err_t err = i2c_new_master_bus(&bus_config, &i2c_bus->bus_handle);
@@ -167,8 +169,8 @@ pn532_bus_t *pn532_i2c_init(i2c_port_num_t port, gpio_num_t scl, gpio_num_t sda,
     }
 
     i2c_bus->base.write_command = pn532_i2c_bus_write_command;
-    i2c_bus->base.read_data = pn532_i2c_bus_read_data;
-    i2c_bus->base.is_ready = pn532_i2c_bus_is_ready;
-    i2c_bus->base.destroy = pn532_i2c_bus_destroy;
+    i2c_bus->base.read_data     = pn532_i2c_bus_read_data;
+    i2c_bus->base.is_ready      = pn532_i2c_bus_is_ready;
+    i2c_bus->base.destroy       = pn532_i2c_bus_destroy;
     return &i2c_bus->base;
 }
