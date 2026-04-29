@@ -1,6 +1,6 @@
 # Simple Example
 
-`examples/simple` is a PN532 SPI demo component for an existing ESP-IDF application. It reads the PN532 firmware ID, polls for ISO14443A cards, prints UIDs, tries NDEF parsing first, and falls back to raw dumps when needed.
+`examples/simple` is a PN532 SPI demo laid out as an ESP-IDF example project. It reads the PN532 firmware ID, polls for ISO14443A cards, prints UIDs, tries NDEF parsing first, and falls back to raw dumps when needed.
 
 ## Folder Layout
 
@@ -8,21 +8,21 @@
 examples/simple/
 |- CMakeLists.txt
 \- main/
+   |- CMakeLists.txt
    \- main.c
 ```
 
-This folder is an app-component fragment, not a full `idf.py create-project` tree.
+This folder now uses the standard ESP-IDF project layout: a project-level `CMakeLists.txt` plus a `main` component.
 
-## Integrate It Into An App
+## Make pn532 Available
 
-Add this repository to your application as the `pn532` component, either locally under `components/pn532` or through ESP-IDF Component Manager.
+Before building the example directly from `examples/simple`, make the `pn532` component available to the project in one of these ways:
 
-Use the sample in one of these ways:
+1. Add an example-local `idf_component.yml` that depends on `jef-sure/pn532` and uses `override_path: ../../` while developing inside this repository.
+2. Build the example in an ESP-IDF workspace where `pn532` is already available as a local component, for example under `components/pn532`.
+3. Copy `main/main.c` and `main/CMakeLists.txt` into another ESP-IDF application.
 
-1. Copy `examples/simple` into a separate component directory in your application, for example `components/pn532_simple`, and build it unchanged.
-2. Copy `main/main.c` into your application's `main` component and adapt the source path in your own `CMakeLists.txt`.
-
-If you reuse the sample `CMakeLists.txt`, keep `REQUIRES pn532` so the component links against this driver.
+If you reuse the sample `main/CMakeLists.txt`, keep `REQUIRES pn532` so the example links against this driver.
 
 ## Default SPI Wiring
 
@@ -55,9 +55,10 @@ The sample always runs the NDEF read path first and falls back to a raw dump whe
 
 ## Build And Run
 
-Once the example is inside an ESP-IDF application, use the normal workflow:
+Once the `pn532` component is available to the example project, use the normal workflow:
 
 ```sh
+cd examples/simple
 idf.py build
 idf.py flash monitor
 ```

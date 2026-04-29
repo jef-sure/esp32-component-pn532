@@ -1,5 +1,15 @@
 # Changelog
 
+## v 0.0.3 - 2026-04-29
+
+### Convert examples/simple to ESP-IDF project layout
+
+Replaced the old example-component `CMakeLists.txt` with a project-level `CMakeLists.txt` and added `examples/simple/main/CMakeLists.txt`.
+
+### Refresh documentation for the new example structure
+
+Updated the root README and `examples/simple/README.md` to describe the project layout and direct-build dependency setup.
+
 ## v 0.0.2 - 2026-04-29
 
 ### Add optional IRQ-backed ready notifications

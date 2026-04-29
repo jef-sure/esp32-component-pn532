@@ -48,7 +48,7 @@ my_app/
 \- main/
 ```
 
-The example app component in this repository uses `REQUIRES pn532`, so the local component folder should be named `pn532`. If you keep a different folder name, update your consuming component's `REQUIRES` list to match.
+The example project in this repository uses `REQUIRES pn532`, so the local component folder should be named `pn532`. If you keep a different folder name, update your consuming component's `REQUIRES` list to match.
 
 ### Managed component metadata
 
@@ -59,6 +59,8 @@ See `CHANGES.md` for release notes.
 
 The maintained SPI demo lives in [`examples/simple`](examples/simple/README.md).
 
+It is now laid out as an ESP-IDF example project, with a project-level `CMakeLists.txt` and a separate `main` component under `examples/simple/main`.
+
 It shows how to:
 
 - initialize the PN532 over SPI
@@ -68,7 +70,7 @@ It shows how to:
 - attempt an NDEF read first
 - fall back to raw block dumps by card family
 
-The example README covers wiring, folder layout, and integration into an ESP-IDF application.
+The example README covers wiring, project layout, and how to make the `pn532` component available when building the example directly.
 
 ## Minimal Setup
 
