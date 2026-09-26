@@ -49,7 +49,7 @@ If you wire the PN532 IRQ line, set `PN532_PIN_IRQ` to a valid GPIO so the drive
 - falls back to raw dumps by card family when NDEF is unavailable
 
 The sample always runs the NDEF read path first and falls back to a raw dump when that read reports no NDEF data.
-Each loop explicitly follows `poll -> release -> RF off`, so it can be adapted to alternate between multiple readers without leaving the previous reader's field active. See the root README for a two-PN532 shared-SPI example using distinct NSS pins.
+Because it reads cards, each loop follows `poll -> select/read -> release -> RF off`. UID-only polling needs only `poll -> RF off`. See the root README for a two-PN532 shared-SPI example using distinct NSS pins.
 
 ## Build And Run
 

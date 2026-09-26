@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.1.1 - 2026-09-26
+
+- Made UID polling return listed targets without automatically issuing `InSelect`; callers explicitly select a target before reading it.
+- Preserved each listed target's `Tg` so explicit selection can issue `InSelect` without repeating `InListPassiveTarget`.
+- Avoided repeated `spi_bus_initialize()` calls when attaching PN532 devices with separate NSS pins to an existing SPI master bus.
+- Documented separate `poll -> RF off` and `poll -> select/read -> release -> RF off` lifecycles.
+
 ## v 0.1.0 - 2026-09-26
 
 - Added `pn532_14443_get_all_uids_ex()` with an optional polling-status output while preserving `pn532_14443_get_all_uids()`.

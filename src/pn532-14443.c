@@ -126,13 +126,12 @@ static bool pn532_parse_iso14443a_target( //
     const uint8_t *response,              //
     size_t         response_len,          //
     size_t        *offset,                //
-    uint8_t       *target_number,         //
     pn532_uid_t   *uid                    //
 )
 {
     size_t entry_len;
 
-    if (response == NULL || offset == NULL || target_number == NULL || uid == NULL) {
+    if (response == NULL || offset == NULL || uid == NULL) {
         return false;
     }
     if (*offset + 5 > response_len) {
@@ -140,7 +139,7 @@ static bool pn532_parse_iso14443a_target( //
     }
 
     memset(uid, 0, sizeof(*uid));
-    *target_number  = response[*offset];
+    uid->tg         = response[*offset];
     uid->atqa       = (uint16_t)response[*offset + 1] | ((uint16_t)response[*offset + 2] << 8);
     uid->sak        = response[*offset + 3];
     uid->uid_length = (int8_t)response[*offset + 4];
@@ -192,15 +191,14 @@ static bool pn532_find_listed_target_by_uid( //
 
     for (uint8_t index = 0; index < targets_found; index++) {
         pn532_uid_t parsed_uid;
-        uint8_t     parsed_target_number = 0;
 
-        if (!pn532_parse_iso14443a_target(response, response_len, &offset, &parsed_target_number, &parsed_uid)) {
+        if (!pn532_parse_iso14443a_target(response, response_len, &offset, &parsed_uid)) {
             return false;
         }
 
         if ((uint8_t)parsed_uid.uid_length == (uint8_t)wanted_uid->uid_length &&
             memcmp(parsed_uid.uid, wanted_uid->uid, (size_t)parsed_uid.uid_length) == 0) {
-            *target_number = parsed_target_number;
+            *target_number = parsed_uid.tg;
             return true;
         }
     }
@@ -252,7 +250,6 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
     uint8_t     targets_found;
     size_t      alloc_size;
     size_t      offset;
-    uint8_t     first_target_number = 0;
     pn532_uid_t parsed_uid;
 
     if (status != NULL) {
@@ -315,11 +312,10 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
     offset           = 1;
     uids->uids_count = 0;
     for (uint8_t index = 0; index < targets_found; index++) {
-        uint16_t blocks_count  = 0;
-        uint16_t block_size    = 0;
-        uint8_t  target_number = 0;
+        uint16_t blocks_count = 0;
+        uint16_t block_size   = 0;
 
-        if (!pn532_parse_iso14443a_target(response, response_len, &offset, &target_number, &parsed_uid)) {
+        if (!pn532_parse_iso14443a_target(response, response_len, &offset, &parsed_uid)) {
             free(uids);
             if (status != NULL) {
                 *status = PN532_POLL_PROTOCOL_ERROR;
@@ -329,18 +325,6 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
 
         uids->uids[uids->uids_count] = parsed_uid;
         pn532_14443_detect_card_type_and_capacity(&uids->uids[uids->uids_count], &blocks_count, &block_size);
-        if (uids->uids_count == 0) {
-            first_target_number = target_number;
-            if (!pn532_in_select(pn532, target_number)) {
-                pn532_poll_status_t select_error = pn532_poll_command_error(pn532);
-                free(uids);
-                (void)pn532_set_rf_off(pn532);
-                if (status != NULL) {
-                    *status = select_error;
-                }
-                return NULL;
-            }
-        }
         uids->uids_count++;
     }
 
@@ -350,11 +334,6 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
             *status = PN532_POLL_PROTOCOL_ERROR;
         }
         return NULL;
-    }
-
-    if (first_target_number == 0) {
-        pn532->inListedTag    = 0;
-        pn532->session_opened = false;
     }
 
     if (status != NULL) {
@@ -378,6 +357,10 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
     }
     if (uid->uid_length != 4 && uid->uid_length != 7 && uid->uid_length != 10) {
         return false;
+    }
+
+    if (uid->tg != 0 && pn532->is_rf_on) {
+        return pn532_in_select(pn532, uid->tg);
     }
 
     /*

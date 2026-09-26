@@ -50,7 +50,9 @@ typedef enum _pn532_nfc_subtype_t
 /**
  * @brief ISO14443A target description returned by polling helpers.
  *
- * The UID, ATQA, and SAK come directly from PN532 polling/select responses.
+ * The UID, target number (Tg), ATQA, and SAK come directly from PN532 polling
+ * responses. Tg is valid while the current RF/list context remains active and
+ * lets pn532_14443_select_by_uid() issue InSelect without polling again.
  * subtype, block_size, and blocks_count are filled by the card-type detection
  * helpers.
  */
@@ -60,7 +62,7 @@ typedef struct
     int8_t           uid_length;
     uint8_t          sak;
     pn532_nfc_type_t subtype;
-    uint8_t          _pad;
+    uint8_t          tg; /**< PN532 logical target number from InListPassiveTarget. */
     uint16_t         atqa;
     uint16_t         block_size;
     uint16_t         blocks_count;
@@ -291,7 +293,8 @@ bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *param
  *
  * Before each InListPassiveTarget this ends a previously active target session
  * with InRelease and switches the RF field off, matching the NXP polling
- * sequence. The list command restarts the field.
+ * sequence. The list command restarts the field but does not open a target
+ * session. Call pn532_14443_select_by_uid() before reading a discovered card.
  *
  * @param status Optional output status. May be NULL when the caller only needs
  *               the legacy nullable result.
@@ -302,9 +305,8 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
 /**
  * @brief Poll for ISO14443A targets and return their UIDs.
  *
- * The returned array is heap-allocated and must be released with free(). When
- * one or more targets are found, the first target is also opened with InSelect
- * and becomes the active PN532 target session.
+ * The returned array is heap-allocated and must be released with free(). This
+ * function does not select a target or open a target session.
  *
  * This compatibility wrapper calls pn532_14443_get_all_uids_ex() without a
  * status output. New code should use that function to distinguish no card,
@@ -317,8 +319,9 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532);
 /**
  * @brief Select a specific ISO14443A target by UID and open a PN532 session for it.
  *
- * The helper first tries a targeted passive-list command and falls back to an
- * untargeted scan plus UID match when necessary.
+ * When the UID came from the current poll and its Tg is still valid, the helper
+ * selects that target directly. Otherwise it performs a targeted passive-list
+ * command and falls back to an untargeted scan plus UID match when necessary.
  */
 bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid);
 

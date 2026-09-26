@@ -508,10 +508,8 @@ static void pn532_process_all_cards(pn532_t *pn532, const pn532_uids_array_t *ui
     }
 
     for (int i = 0; i < count; i++) {
-        /* get_all_uids leaves only the first card selected on PN532. Reselect
-         * additional cards on demand, mirroring the PN5180 example's
-         * select-if-needed flow. */
-        pn532_process_card(pn532, &uids->uids[i], i, i != 0);
+        pn532_process_card(pn532, &uids->uids[i], i, true);
+        (void)pn532_release_target(pn532);
     }
 }
 
@@ -562,7 +560,6 @@ void app_main(void)
             } else if (status != PN532_POLL_NO_TARGET) {
                 ESP_LOGE(TAG, "PN532 poll failed (status %d)", (int)status);
             }
-            (void)pn532_release_target(pn532);
             (void)pn532_set_rf_off(pn532);
             pn532_delay_ms(PN532_SAMPLE_POLL_MS);
             continue;
@@ -576,7 +573,6 @@ void app_main(void)
         }
 
         free(uids);
-        (void)pn532_release_target(pn532);
         (void)pn532_set_rf_off(pn532);
         pn532_delay_ms(PN532_SAMPLE_POLL_MS);
     }

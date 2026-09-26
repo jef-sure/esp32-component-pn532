@@ -120,10 +120,12 @@ For I2C, pass `0` as the address to use `PN532_I2C_DEFAULT_ADDRESS`. For UART, p
 pn532_poll_status_t status;
 pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(pn532, &status);
 if (status == PN532_POLL_NO_TARGET) {
+    pn532_set_rf_off(pn532);
     return;
 }
 if (status != PN532_POLL_FOUND) {
     /* Handle PN532_POLL_TIMEOUT or PN532_POLL_TRANSPORT_ERROR. */
+    pn532_set_rf_off(pn532);
     return;
 }
 
@@ -131,19 +133,20 @@ for (uint8_t i = 0; i < uids->uids_count; i++) {
     pn532_uid_t *uid = &uids->uids[i];
     uint16_t blocks = 0;
     uint16_t block_size = 0;
-    bool needs_reselect = false;
 
-    if (!pn532_14443_detect_selected_card_type_and_capacity(pn532, uid, &blocks, &block_size, &needs_reselect)) {
+    if (!pn532_14443_detect_card_type_and_capacity(uid, &blocks, &block_size)) {
         continue;
     }
 
-    if (needs_reselect) {
-        pn532_14443_select_by_uid(pn532, uid);
+    if (!pn532_14443_select_by_uid(pn532, uid)) {
+        continue;
     }
+
+    /* Read the selected card here. */
+    pn532_release_target(pn532);
 }
 
 free(uids);
-pn532_release_target(pn532);
 pn532_set_rf_off(pn532);
 ```
 
@@ -151,7 +154,9 @@ Notes:
 
 - `pn532_14443_get_all_uids_ex()` distinguishes a successful discovery, no target, command timeout, transport failure, malformed response, invalid arguments, and allocation failure through its status output. Its returned array is owned by the caller only for `PN532_POLL_FOUND`.
 - `pn532_14443_get_all_uids()` remains available as a compatibility wrapper, but still returns `NULL` for every non-success status.
-- Successful polling leaves the first discovered target selected. End the session with `pn532_release_target()` before switching the RF field off.
+- Each returned UID includes its PN532 target number in `uid->tg`. While the current RF field remains active, `pn532_14443_select_by_uid()` uses it for a direct `InSelect` without polling again.
+- Polling does not select a target or open a target session. For UID-only polling, finish with `pn532_set_rf_off()`; no release is needed.
+- Before reading a discovered card, select it with `pn532_14443_select_by_uid()`. After a selected-card operation, finish with `pn532_release_target()` followed by `pn532_set_rf_off()`.
 - `pn532_14443_select_by_uid()` is the right way to reacquire a card after an auth or read failure.
 - `pn532_14443_detect_card_type_and_capacity()` is a metadata helper that updates `uid->subtype`, `uid->blocks_count`, and `uid->block_size` in place.
 - `pn532_14443_detect_selected_card_type_and_capacity()` currently mirrors the same local detection and always sets `needs_reselect` to `false`.
@@ -173,19 +178,17 @@ for (;;) {
     pn532_uids_array_t *uids_a = pn532_14443_get_all_uids_ex(reader_a, &status_a);
     /* Consume uids_a when status_a == PN532_POLL_FOUND. */
     free(uids_a);
-    pn532_release_target(reader_a);
     pn532_set_rf_off(reader_a);
 
     pn532_poll_status_t status_b;
     pn532_uids_array_t *uids_b = pn532_14443_get_all_uids_ex(reader_b, &status_b);
     /* Consume uids_b when status_b == PN532_POLL_FOUND. */
     free(uids_b);
-    pn532_release_target(reader_b);
     pn532_set_rf_off(reader_b);
 }
 ```
 
-The intended lifecycle is `poll -> use card -> release -> RF off`. Turning RF off successfully invalidates the local target and session state, so a later `pn532_release_target()` is a no-op and does not send stale `InRelease`.
+For UID-only discovery the lifecycle is `poll -> RF off`. When card data is read, use `poll -> select/read -> release -> RF off`. Turning RF off successfully invalidates the local target and session state, so a later `pn532_release_target()` is a no-op and does not send stale `InRelease`.
 
 ## Read NDEF
 

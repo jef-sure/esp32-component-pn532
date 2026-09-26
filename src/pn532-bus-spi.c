@@ -156,6 +156,11 @@ static void pn532_spi_bus_destroy(pn532_bus_t *bus)
 
 static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi)
 {
+    size_t max_transaction_len;
+    if (spi_bus_get_max_transaction_len(host_id, &max_transaction_len) == ESP_OK) {
+        return true;
+    }
+
     spi_bus_config_t bus_config = {
         .mosi_io_num     = mosi,
         .miso_io_num     = miso,
@@ -170,9 +175,6 @@ static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_n
     };
 
     esp_err_t err = spi_bus_initialize(host_id, &bus_config, SPI_DMA_CH_AUTO);
-    if (err == ESP_ERR_INVALID_STATE) {
-        return true;
-    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "pn532_spi_bus_init: spi_bus_initialize failed (%s)", esp_err_to_name(err));
         return false;

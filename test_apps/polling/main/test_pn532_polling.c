@@ -135,7 +135,7 @@ static void assert_commands(const mock_bus_t *mock, const uint8_t *expected, siz
     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, mock->commands, count);
 }
 
-TEST_CASE("poll ends previous session before RF off and list", "[pn532][polling]")
+TEST_CASE("poll ends previous session and does not select a target", "[pn532][polling]")
 {
     mock_bus_t mock;
     pn532_t    pn532;
@@ -148,9 +148,12 @@ TEST_CASE("poll ends previous session before RF off and list", "[pn532][polling]
     pn532_poll_status_t status;
     pn532_uids_array_t *uids       = pn532_14443_get_all_uids_ex(&pn532, &status);
     const uint8_t       expected[] = {PN532_COMMAND_INRELEASE, PN532_COMMAND_RFCONFIGURATION,
-                                      PN532_COMMAND_INLISTPASSIVETARGET, PN532_COMMAND_INSELECT};
+                                      PN532_COMMAND_INLISTPASSIVETARGET};
 
     TEST_ASSERT_EQUAL(PN532_POLL_FOUND, status);
+    TEST_ASSERT_EQUAL_UINT8(1, uids->uids[0].tg);
+    TEST_ASSERT_EQUAL_UINT8(0, pn532.inListedTag);
+    TEST_ASSERT_FALSE(pn532.session_opened);
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
     free(uids);
 }
@@ -172,14 +175,14 @@ TEST_CASE("two PN532 devices are polled sequentially", "[pn532][polling][spi]")
     pn532_poll_status_t second_status;
     pn532_uids_array_t *first_uids = pn532_14443_get_all_uids_ex(&first, &first_status);
     TEST_ASSERT_EQUAL(PN532_POLL_FOUND, first_status);
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&first, &first_uids->uids[0]));
     TEST_ASSERT_TRUE(pn532_release_target(&first));
     TEST_ASSERT_TRUE(pn532_set_rf_off(&first));
     pn532_uids_array_t *second_uids = pn532_14443_get_all_uids_ex(&second, &second_status);
 
     const uint8_t first_expected[]  = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_INLISTPASSIVETARGET,
                                        PN532_COMMAND_INSELECT, PN532_COMMAND_INRELEASE, PN532_COMMAND_RFCONFIGURATION};
-    const uint8_t second_expected[] = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_INLISTPASSIVETARGET,
-                                       PN532_COMMAND_INSELECT};
+    const uint8_t second_expected[] = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_INLISTPASSIVETARGET};
     TEST_ASSERT_EQUAL(PN532_POLL_FOUND, second_status);
     assert_commands(&first_bus, first_expected, ARRAY_SIZE(first_expected));
     assert_commands(&second_bus, second_expected, ARRAY_SIZE(second_expected));
