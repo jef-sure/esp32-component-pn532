@@ -78,32 +78,6 @@ static bool pn532_restore_runtime_config(pn532_t *pn532)
     return true;
 }
 
-static bool pn532_recover_after_reset(pn532_t *pn532)
-{
-    if (pn532 == NULL) {
-        return false;
-    }
-
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0 && !pn532_reset(pn532)) {
-            continue;
-        }
-
-        if (pn532_get_firmware_version(pn532) == 0) {
-            ESP_LOGW(TAG, "pn532: firmware version read failed after recovery reset (attempt %d)", attempt + 1);
-            continue;
-        }
-
-        if (pn532_restore_runtime_config(pn532)) {
-            return true;
-        }
-
-        ESP_LOGW(TAG, "pn532: runtime configuration restore failed after recovery reset (attempt %d)", attempt + 1);
-    }
-
-    return false;
-}
-
 void pn532_delay_ms(int ms)
 {
     int64_t start = esp_timer_get_time();
@@ -243,10 +217,6 @@ static void pn532_abort_current_command(pn532_t *pn532)
         return;
     }
 
-    if (pn532->bus->wake != NULL) {
-        pn532->bus->wake(pn532->bus);
-    }
-
     /* UM0701-02 abort procedure: host sends an ACK frame to stop the current
      * command. Use this only after a timeout; sending it during normal wake-up
      * aborts the next command instead. */
@@ -267,14 +237,6 @@ static void pn532_recover_after_timeout(pn532_t *pn532, uint8_t command, const c
 {
     ESP_LOGW(TAG, "pn532_execute_command: recovering after command 0x%02X %s timeout", command, phase);
     pn532_abort_current_command(pn532);
-    if (pn532 != NULL && pn532_gpio_is_valid(pn532->rst)) {
-        pn532->recovery_in_progress = true;
-        (void)pn532_reset(pn532);
-        if (!pn532_recover_after_reset(pn532)) {
-            ESP_LOGE(TAG, "pn532_execute_command: failed to restore configuration after timeout reset");
-        }
-        pn532->recovery_in_progress = false;
-    }
 }
 
 static bool pn532_read_response_frame(pn532_t *pn532, uint8_t expected_response, size_t *payload_offset,
@@ -366,6 +328,9 @@ bool pn532_execute_command(      //
     uint16_t       timeout       //
 )
 {
+    if (pn532 != NULL) {
+        pn532->last_command_status = PN532_COMMAND_STATUS_TRANSPORT_ERROR;
+    }
     if (response != NULL && response_len == NULL) {
         ESP_LOGE(TAG, "pn532_execute_command: response_len is required when response buffer is provided");
         return false;
@@ -383,9 +348,8 @@ bool pn532_execute_command(      //
 
     if (!pn532_wait_ready(pn532, timeout)) {
         ESP_LOGW(TAG, "pn532_execute_command: command 0x%02X timed out waiting for ACK", command);
-        if (pn532 == NULL || !pn532->recovery_in_progress) {
-            pn532_recover_after_timeout(pn532, command, "ACK");
-        }
+        pn532_recover_after_timeout(pn532, command, "ACK");
+        pn532->last_command_status = PN532_COMMAND_STATUS_TIMEOUT;
         return false;
     }
     if (!pn532_read_ack(pn532)) {
@@ -395,9 +359,8 @@ bool pn532_execute_command(      //
     }
     if (!pn532_wait_ready(pn532, timeout)) {
         ESP_LOGW(TAG, "pn532_execute_command: command 0x%02X timed out waiting for response", command);
-        if (pn532 == NULL || !pn532->recovery_in_progress) {
-            pn532_recover_after_timeout(pn532, command, "response");
-        }
+        pn532_recover_after_timeout(pn532, command, "response");
+        pn532->last_command_status = PN532_COMMAND_STATUS_TIMEOUT;
         return false;
     }
 
@@ -420,6 +383,7 @@ bool pn532_execute_command(      //
         *response_len = payload_len;
     }
 
+    pn532->last_command_status = PN532_COMMAND_STATUS_OK;
     return true;
 }
 
@@ -588,6 +552,10 @@ bool pn532_set_rf_field(pn532_t *pn532, bool enabled)
                                     (uint16_t)pn532->timeout_ms);
     if (ok && response_len == 0) {
         pn532->is_rf_on = enabled;
+        if (!enabled) {
+            pn532->inListedTag    = 0;
+            pn532->session_opened = false;
+        }
     }
     return ok && response_len == 0;
 }

@@ -228,7 +228,7 @@ static void pn532_dump_mifare_classic(pn532_t *pn532, const pn532_uid_t *uid)
         return;
     }
 
-    if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, uid)) {
+    if (!pn532_14443_select_by_uid(pn532, uid)) {
         ESP_LOGW(TAG, "select_by_uid failed; skipping dump");
         return;
     }
@@ -246,7 +246,7 @@ static void pn532_dump_mifare_classic(pn532_t *pn532, const pn532_uid_t *uid)
         }
 
         if (first_in_sector) {
-            if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, uid)) {
+            if (!pn532_14443_select_by_uid(pn532, uid)) {
                 ESP_LOGW(TAG, "  select failed at blk %u; skipping sector", (unsigned)blk);
                 blk += sector_size - 1;
                 continue;
@@ -271,7 +271,7 @@ static void pn532_dump_ultralight(pn532_t *pn532, const pn532_uid_t *uid)
 {
     uint8_t block[16];
 
-    if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, uid)) {
+    if (!pn532_14443_select_by_uid(pn532, uid)) {
         ESP_LOGW(TAG, "select_by_uid failed; skipping dump");
         return;
     }
@@ -294,7 +294,7 @@ static void pn532_dump_desfire(pn532_t *pn532, const pn532_uid_t *uid)
     static const uint8_t ndef_aid[]   = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
     static const uint8_t cc_file_id[] = {0xE1, 0x03};
 
-    if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, uid)) {
+    if (!pn532_14443_select_by_uid(pn532, uid)) {
         ESP_LOGW(TAG, "select_by_uid failed; skipping dump");
         return;
     }
@@ -511,7 +511,7 @@ static void pn532_process_all_cards(pn532_t *pn532, const pn532_uids_array_t *ui
         /* get_all_uids leaves only the first card selected on PN532. Reselect
          * additional cards on demand, mirroring the PN5180 example's
          * select-if-needed flow. */
-        pn532_process_card(pn532, &uids->uids[i], i, i != 0 || pn532->inListedTag == 0);
+        pn532_process_card(pn532, &uids->uids[i], i, i != 0);
     }
 }
 
@@ -549,13 +549,21 @@ void app_main(void)
     int         last_uids_count                  = 0;
 
     for (;;) {
-        pn532_uids_array_t *uids = pn532_14443_get_all_uids(pn532);
+        pn532_poll_status_t status;
+        pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(pn532, &status);
 
-        if (uids == NULL) {
+        if (status != PN532_POLL_FOUND) {
             if (last_uids_count != 0) {
                 ESP_LOGI(TAG, "No ISO14443A cards detected");
                 pn532_copy_uids_snapshot(NULL, last_uids, &last_uids_count);
             }
+            if (status == PN532_POLL_TIMEOUT) {
+                ESP_LOGW(TAG, "PN532 poll timed out");
+            } else if (status != PN532_POLL_NO_TARGET) {
+                ESP_LOGE(TAG, "PN532 poll failed (status %d)", (int)status);
+            }
+            (void)pn532_release_target(pn532);
+            (void)pn532_set_rf_off(pn532);
             pn532_delay_ms(PN532_SAMPLE_POLL_MS);
             continue;
         }
@@ -568,6 +576,8 @@ void app_main(void)
         }
 
         free(uids);
+        (void)pn532_release_target(pn532);
+        (void)pn532_set_rf_off(pn532);
         pn532_delay_ms(PN532_SAMPLE_POLL_MS);
     }
 }

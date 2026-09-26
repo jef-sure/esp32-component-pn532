@@ -18,7 +18,7 @@
 #include "freertos/queue.h"
 
 /** @brief Default 7-bit PN532 I2C address in ESP-IDF's left-shifted form. */
-#define PN532_I2C_DEFAULT_ADDRESS    (0x24)
+#define PN532_I2C_DEFAULT_ADDRESS (0x24)
 
 /** @brief Default PN532 HSU baud rate used when uart_init() receives a non-positive baud. */
 #define PN532_UART_DEFAULT_BAUD_RATE (115200)
@@ -78,6 +78,18 @@ typedef struct
     pn532_uid_t uids[1];
 } pn532_uids_array_t;
 
+/** @brief Typed outcome of an ISO14443A poll. */
+typedef enum
+{
+    PN532_POLL_FOUND = 0,
+    PN532_POLL_NO_TARGET,
+    PN532_POLL_TRANSPORT_ERROR,
+    PN532_POLL_TIMEOUT,
+    PN532_POLL_PROTOCOL_ERROR,
+    PN532_POLL_NO_MEMORY,
+    PN532_POLL_INVALID_ARGUMENT
+} pn532_poll_status_t;
+
 /**
  * @brief PN532 device context.
  *
@@ -88,17 +100,17 @@ typedef struct
  */
 typedef struct _pn532_t
 {
-    uint8_t     *send_buf;
-    uint8_t     *recv_buf;
-    pn532_bus_t *bus;
-    gpio_num_t   irq;
-    gpio_num_t   rst;
-    uint16_t     timeout_ms;
-    uint8_t      rf_config;
-    bool         is_rf_on;
-    uint8_t      inListedTag;
-    bool         session_opened;
-    bool         recovery_in_progress;
+    uint8_t      *send_buf;
+    uint8_t      *recv_buf;
+    pn532_bus_t  *bus;
+    gpio_num_t    irq;
+    gpio_num_t    rst;
+    uint16_t      timeout_ms;
+    uint8_t       rf_config;
+    bool          is_rf_on;
+    uint8_t       inListedTag;
+    bool          session_opened;
+    uint8_t       last_command_status;
     QueueHandle_t irq_queue;     /**< Set when IRQ ISR is installed; NULL otherwise. */
     bool          isr_installed; /**< True when this device owns a GPIO ISR handler on irq. */
 } pn532_t;
@@ -157,7 +169,7 @@ pn532_bus_t *pn532_i2c_init(       //
 pn532_bus_t *pn532_uart_init(uart_port_t uart_num, gpio_num_t tx, gpio_num_t rx, int baud_rate);
 
 /** @brief Destroy a transport handle created by pn532_spi_init(), pn532_i2c_init(), or pn532_uart_init(). */
-void         pn532_bus_destroy(pn532_bus_t *bus);
+void pn532_bus_destroy(pn532_bus_t *bus);
 
 /**
  * @brief Create and initialise a PN532 device context on top of an existing transport.
@@ -171,7 +183,7 @@ void         pn532_bus_destroy(pn532_bus_t *bus);
  * @param rst Optional reset pin; pass GPIO_NUM_NC when unused.
  * @return Newly allocated device context, or NULL on failure.
  */
-pn532_t     *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst);
+pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst);
 
 /**
  * @brief Free a PN532 device context.
@@ -179,7 +191,7 @@ pn532_t     *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst);
  * @param pn532 Device created by pn532_init().
  * @param free_bus When true, also destroys pn532->bus via pn532_bus_destroy().
  */
-void         pn532_deinit(pn532_t *pn532, bool free_bus);
+void pn532_deinit(pn532_t *pn532, bool free_bus);
 
 /**
  * @brief Reset the PN532 and clear target/session state.
@@ -187,7 +199,7 @@ void         pn532_deinit(pn532_t *pn532, bool free_bus);
  * If rst was provided at pn532_init() time, the pin is toggled. Otherwise this
  * is a logical driver reset only.
  */
-bool     pn532_reset(pn532_t *pn532);
+bool pn532_reset(pn532_t *pn532);
 
 /**
  * @brief Read the PN532 firmware identifier.
@@ -207,6 +219,18 @@ bool pn532_set_rf_on(pn532_t *pn532);
 
 /** @brief Convenience wrapper for pn532_set_rf_field(pn532, false). */
 bool pn532_set_rf_off(pn532_t *pn532);
+
+/**
+ * @brief Release the currently listed PN532 target with InRelease.
+ *
+ * The function is a no-op that returns true when no target is listed. On a
+ * successful command, the active target and session state are cleared.
+ * Call this before turning the RF field off when ending an active session.
+ *
+ * @return true when no target was active or InRelease was accepted; false on
+ *         command or transport failure.
+ */
+bool pn532_release_target(pn532_t *pn532);
 
 /**
  * @brief Configure the PN532 retry counters for ATR, PSL, and passive activation.
@@ -259,8 +283,21 @@ bool pn532_set_passive_activation_retries(pn532_t *pn532, uint8_t max_retries);
  *         undefined; @p *response_len is set to the required size if the
  *         buffer was too small.
  */
-bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len,
-                           uint8_t *response, size_t *response_len, uint16_t timeout_ms);
+bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len, uint8_t *response,
+                           size_t *response_len, uint16_t timeout_ms);
+
+/**
+ * @brief Poll for ISO14443A targets with an explicit typed outcome.
+ *
+ * Before each InListPassiveTarget this ends a previously active target session
+ * with InRelease and switches the RF field off, matching the NXP polling
+ * sequence. The list command restarts the field.
+ *
+ * @param status Optional output status. May be NULL when the caller only needs
+ *               the legacy nullable result.
+ * @return Heap-allocated UID array for PN532_POLL_FOUND, otherwise NULL.
+ */
+pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_status_t *status);
 
 /**
  * @brief Poll for ISO14443A targets and return their UIDs.
@@ -268,6 +305,10 @@ bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *param
  * The returned array is heap-allocated and must be released with free(). When
  * one or more targets are found, the first target is also opened with InSelect
  * and becomes the active PN532 target session.
+ *
+ * This compatibility wrapper calls pn532_14443_get_all_uids_ex() without a
+ * status output. New code should use that function to distinguish no card,
+ * timeout, transport failure, and successful discovery.
  *
  * @return Heap-allocated target array, or NULL when no card was found or polling failed.
  */
@@ -279,7 +320,7 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532);
  * The helper first tries a targeted passive-list command and falls back to an
  * untargeted scan plus UID match when necessary.
  */
-bool                pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid);
+bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid);
 
 /**
  * @brief Authenticate a MIFARE Classic sector with Key A or Key B.
@@ -287,7 +328,7 @@ bool                pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t 
  * For non-Classic subtypes this function returns true and performs no exchange,
  * which lets higher-level code share a single auth callback across card types.
  */
-bool                pn532_14443_authenticate(   //
+bool pn532_14443_authenticate(   //
     pn532_t           *pn532,    //
     const uint8_t     *key,      //
     uint8_t            key_type, //

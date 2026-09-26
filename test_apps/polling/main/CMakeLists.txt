@@ -4,7 +4,7 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../include/pn532.h")
 endif()
 
 idf_component_register(
-    SRCS "main.c"
-    REQUIRES ${PN532_COMPONENT}
-    INCLUDE_DIRS "."
+    SRCS "test_pn532_polling.c"
+    REQUIRES ${PN532_COMPONENT} unity
+    PRIV_INCLUDE_DIRS "../../../src"
 )

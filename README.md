@@ -117,8 +117,13 @@ For I2C, pass `0` as the address to use `PN532_I2C_DEFAULT_ADDRESS`. For UART, p
 
 #include "pn532.h"
 
-pn532_uids_array_t *uids = pn532_14443_get_all_uids(pn532);
-if (uids == NULL) {
+pn532_poll_status_t status;
+pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(pn532, &status);
+if (status == PN532_POLL_NO_TARGET) {
+    return;
+}
+if (status != PN532_POLL_FOUND) {
+    /* Handle PN532_POLL_TIMEOUT or PN532_POLL_TRANSPORT_ERROR. */
     return;
 }
 
@@ -138,14 +143,49 @@ for (uint8_t i = 0; i < uids->uids_count; i++) {
 }
 
 free(uids);
+pn532_release_target(pn532);
+pn532_set_rf_off(pn532);
 ```
 
 Notes:
 
-- `pn532_14443_get_all_uids()` returns a heap-allocated array and also leaves the first discovered target selected.
+- `pn532_14443_get_all_uids_ex()` distinguishes a successful discovery, no target, command timeout, transport failure, malformed response, invalid arguments, and allocation failure through its status output. Its returned array is owned by the caller only for `PN532_POLL_FOUND`.
+- `pn532_14443_get_all_uids()` remains available as a compatibility wrapper, but still returns `NULL` for every non-success status.
+- Successful polling leaves the first discovered target selected. End the session with `pn532_release_target()` before switching the RF field off.
 - `pn532_14443_select_by_uid()` is the right way to reacquire a card after an auth or read failure.
 - `pn532_14443_detect_card_type_and_capacity()` is a metadata helper that updates `uid->subtype`, `uid->blocks_count`, and `uid->block_size` in place.
 - `pn532_14443_detect_selected_card_type_and_capacity()` currently mirrors the same local detection and always sets `needs_reselect` to `false`.
+
+## Two PN532 Devices On One SPI Bus
+
+Call `pn532_spi_init()` once per PN532 with the same host and bus pins but a different NSS pin. ESP-IDF owns the shared host bus; each returned transport owns a separate `spi_device_handle_t` and controls its own NSS. A second call on an already initialized host is expected and does not log an error.
+
+Poll devices sequentially and turn off one reader before polling the other:
+
+```c
+pn532_bus_t *bus_a = pn532_spi_init(SPI3_HOST, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_23, GPIO_NUM_5, 1000000);
+pn532_bus_t *bus_b = pn532_spi_init(SPI3_HOST, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_23, GPIO_NUM_17, 1000000);
+pn532_t *reader_a = pn532_init(bus_a, GPIO_NUM_NC, GPIO_NUM_NC);
+pn532_t *reader_b = pn532_init(bus_b, GPIO_NUM_NC, GPIO_NUM_NC);
+
+for (;;) {
+    pn532_poll_status_t status_a;
+    pn532_uids_array_t *uids_a = pn532_14443_get_all_uids_ex(reader_a, &status_a);
+    /* Consume uids_a when status_a == PN532_POLL_FOUND. */
+    free(uids_a);
+    pn532_release_target(reader_a);
+    pn532_set_rf_off(reader_a);
+
+    pn532_poll_status_t status_b;
+    pn532_uids_array_t *uids_b = pn532_14443_get_all_uids_ex(reader_b, &status_b);
+    /* Consume uids_b when status_b == PN532_POLL_FOUND. */
+    free(uids_b);
+    pn532_release_target(reader_b);
+    pn532_set_rf_off(reader_b);
+}
+```
+
+The intended lifecycle is `poll -> use card -> release -> RF off`. Turning RF off successfully invalidates the local target and session state, so a later `pn532_release_target()` is a no-op and does not send stale `InRelease`.
 
 ## Read NDEF
 
@@ -225,7 +265,8 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - `pn532_init()` returns a heap-allocated `pn532_t *` device context.
 - `pn532_deinit(pn532, true)` frees both the device and its bus.
 - `pn532_deinit(pn532, false)` frees only the device; destroy the bus separately with `pn532_bus_destroy()`.
-- `pn532_14443_get_all_uids()` returns a heap-allocated `pn532_uids_array_t *`. Release it with `free()`.
+- `pn532_14443_get_all_uids_ex()` writes a typed status and, on discovery, returns a heap-allocated `pn532_uids_array_t *`. Release it with `free()`.
+- `pn532_14443_get_all_uids()` preserves the legacy nullable return contract.
 - `pn532_ndef_read_card_auto()` returns a heap-allocated `ndef_message_parsed_t *`. Release it with `ndef_free_parsed_message()`.
 
 `pn532_t` is a public struct because the driver is split across multiple source files, but application code should treat it as an owned handle and not modify its fields directly.
@@ -235,7 +276,7 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - Transport and device lifecycle: `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_init()`, `pn532_deinit()`
 - RF field control: `pn532_set_rf_field()`, `pn532_set_rf_on()`, `pn532_set_rf_off()`
 - Retry tuning and raw commands: `pn532_set_max_retries()`, `pn532_set_passive_activation_retries()`, `pn532_execute_command()`
-- Poll, select, and auth: `pn532_14443_get_all_uids()`, `pn532_14443_select_by_uid()`, `pn532_14443_authenticate()`
+- Poll, select, and auth: `pn532_14443_get_all_uids_ex()`, `pn532_14443_get_all_uids()`, `pn532_release_target()`, `pn532_14443_select_by_uid()`, `pn532_14443_authenticate()`
 - Selected-tag block access: `pn532_14443_block_read()`, `pn532_14443_block_write()`
 - Card metadata: `pn532_14443_detect_card_type_and_capacity()`, `pn532_14443_detect_selected_card_type_and_capacity()`
 - ISO-DEP and Type 4: `pn532_14443_4_transceive()`, `pn532_14443_4_select_file()`, `pn532_14443_4_read_binary()`

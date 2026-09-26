@@ -14,15 +14,11 @@ examples/simple/
 
 This folder now uses the standard ESP-IDF project layout: a project-level `CMakeLists.txt` plus a `main` component.
 
-## Make pn532 Available
+## Component Resolution
 
-Before building the example directly from `examples/simple`, make the `pn532` component available to the project in one of these ways:
+Inside this repository, the example automatically adds the repository root as a local ESP-IDF component and accounts for the checkout directory name.
 
-1. Add an example-local `idf_component.yml` that depends on `jef-sure/pn532` and uses `override_path: ../../` while developing inside this repository.
-2. Build the example in an ESP-IDF workspace where `pn532` is already available as a local component, for example under `components/pn532`.
-3. Copy `main/main.c` and `main/CMakeLists.txt` into another ESP-IDF application.
-
-If you reuse the sample `main/CMakeLists.txt`, keep `REQUIRES pn532` so the example links against this driver.
+When copying the example into another application, add `jef-sure/pn532` through ESP-IDF Component Manager or place the component under `components/pn532`. The `main/CMakeLists.txt` defaults to `REQUIRES pn532` outside this checkout.
 
 ## Default SPI Wiring
 
@@ -46,12 +42,14 @@ If you wire the PN532 IRQ line, set `PN532_PIN_IRQ` to a valid GPIO so the drive
 - initializes the PN532 over SPI
 - reads and logs the PN532 firmware identifier
 - polls for ISO14443A cards every 250 ms
+- distinguishes no-card, timeout, and other polling failures through the typed polling API
 - supports up to two cards per scan
 - prints discovered UIDs
 - attempts an NDEF read first
 - falls back to raw dumps by card family when NDEF is unavailable
 
 The sample always runs the NDEF read path first and falls back to a raw dump when that read reports no NDEF data.
+Each loop explicitly follows `poll -> release -> RF off`, so it can be adapted to alternate between multiple readers without leaving the previous reader's field active. See the root README for a two-PN532 shared-SPI example using distinct NSS pins.
 
 ## Build And Run
 

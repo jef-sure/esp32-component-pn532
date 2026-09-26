@@ -239,7 +239,13 @@ static bool pn532_list_passive_iso14443a_targets( //
                                  timeout);
 }
 
-pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
+static pn532_poll_status_t pn532_poll_command_error(const pn532_t *pn532)
+{
+    return pn532 != NULL && pn532->last_command_status == PN532_COMMAND_STATUS_TIMEOUT ? PN532_POLL_TIMEOUT
+                                                                                       : PN532_POLL_TRANSPORT_ERROR;
+}
+
+pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_status_t *status)
 {
     uint8_t     response[64];
     size_t      response_len = sizeof(response);
@@ -249,24 +255,45 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
     uint8_t     first_target_number = 0;
     pn532_uid_t parsed_uid;
 
+    if (status != NULL) {
+        *status = PN532_POLL_INVALID_ARGUMENT;
+    }
     if (pn532 == NULL) {
         return NULL;
     }
 
-    /* Release any leftover activation before scanning. */
-    (void)pn532_release_target(pn532);
+    if (!pn532_release_target(pn532)) {
+        if (status != NULL) {
+            *status = pn532_poll_command_error(pn532);
+        }
+        return NULL;
+    }
 
     if (!pn532_prepare_for_passive_target_list(pn532)) {
+        if (status != NULL) {
+            *status = pn532_poll_command_error(pn532);
+        }
         return NULL;
     }
 
     if (!pn532_list_passive_iso14443a_targets(pn532, PN532_MAX_PASSIVE_TARGETS_ISO14443A, NULL, 0, response,
                                               &response_len, (uint16_t)pn532->timeout_ms)) {
+        if (status != NULL) {
+            *status = pn532_poll_command_error(pn532);
+        }
         return NULL;
     }
     pn532->is_rf_on = true;
-    if (response_len == 0 || response[0] == 0) {
-        (void)pn532_set_rf_off(pn532);
+    if (response_len == 0) {
+        if (status != NULL) {
+            *status = PN532_POLL_PROTOCOL_ERROR;
+        }
+        return NULL;
+    }
+    if (response[0] == 0) {
+        if (status != NULL) {
+            *status = PN532_POLL_NO_TARGET;
+        }
         return NULL;
     }
 
@@ -279,6 +306,9 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
 
     pn532_uids_array_t *uids = calloc(1, alloc_size);
     if (uids == NULL) {
+        if (status != NULL) {
+            *status = PN532_POLL_NO_MEMORY;
+        }
         return NULL;
     }
 
@@ -291,6 +321,9 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
 
         if (!pn532_parse_iso14443a_target(response, response_len, &offset, &target_number, &parsed_uid)) {
             free(uids);
+            if (status != NULL) {
+                *status = PN532_POLL_PROTOCOL_ERROR;
+            }
             return NULL;
         }
 
@@ -299,10 +332,12 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
         if (uids->uids_count == 0) {
             first_target_number = target_number;
             if (!pn532_in_select(pn532, target_number)) {
+                pn532_poll_status_t select_error = pn532_poll_command_error(pn532);
                 free(uids);
                 (void)pn532_set_rf_off(pn532);
-                pn532->inListedTag    = 0;
-                pn532->session_opened = false;
+                if (status != NULL) {
+                    *status = select_error;
+                }
                 return NULL;
             }
         }
@@ -311,6 +346,9 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
 
     if (uids->uids_count == 0) {
         free(uids);
+        if (status != NULL) {
+            *status = PN532_POLL_PROTOCOL_ERROR;
+        }
         return NULL;
     }
 
@@ -319,7 +357,15 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
         pn532->session_opened = false;
     }
 
+    if (status != NULL) {
+        *status = PN532_POLL_FOUND;
+    }
     return uids;
+}
+
+pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
+{
+    return pn532_14443_get_all_uids_ex(pn532, NULL);
 }
 
 bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)

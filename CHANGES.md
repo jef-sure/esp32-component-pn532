@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.1.0 - 2026-09-26
+
+- Added `pn532_14443_get_all_uids_ex()` with an optional polling-status output while preserving `pn532_14443_get_all_uids()`.
+- Exposed `pn532_release_target()` and made successful RF-off invalidate the active target/session.
+- Aligned polling and timeout abort behavior with the NXP TAMA reference.
+- Documented and tested sequential PN532 polling on a shared SPI bus with distinct NSS pins.
+
 ## v 0.0.3 - 2026-04-29
 
 ### Convert examples/simple to ESP-IDF project layout
