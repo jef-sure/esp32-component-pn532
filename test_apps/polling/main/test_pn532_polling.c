@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "pn532-internal.h"
+#include "pn532-ndef.h"
 #include "unity.h"
 
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
@@ -452,6 +453,53 @@ TEST_CASE("MI chained data is not misread as an exchange error", "[pn532][exchan
     TEST_ASSERT_TRUE(pn532.session_opened);
     TEST_ASSERT_EQUAL(2, rx_len);
     TEST_ASSERT_EQUAL_UINT8(0xAA, rx[0]);
+}
+
+TEST_CASE("NDEF CF chunks are assembled into one logical record", "[pn532][ndef][chunk]")
+{
+    static const uint8_t encoded[] = {
+        0xB1, 0x01, 0x03, 'T', 'h', 'e', 'l', /* MB | CF | SR, first chunk */
+        0x56, 0x00, 0x02, 'l', 'o',           /* ME | SR, TNF_UNCHANGED */
+    };
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(encoded, sizeof(encoded), &message));
+    TEST_ASSERT_NOT_NULL(message);
+    TEST_ASSERT_EQUAL(1, message->record_count);
+    TEST_ASSERT_EQUAL(NDEF_TNF_WELL_KNOWN, message->records[0].tnf);
+    TEST_ASSERT_EQUAL_UINT8('T', message->records[0].type[0]);
+    TEST_ASSERT_EQUAL(5, message->records[0].payload_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY("hello", message->records[0].payload, 5);
+    ndef_free_parsed_message(message);
+}
+
+TEST_CASE("NDEF chunk sequence can precede another record", "[pn532][ndef][chunk]")
+{
+    static const uint8_t encoded[] = {
+        0xB1, 0x01, 0x02, 'T', 'h',  'e', /* MB | CF | SR, first chunk */
+        0x36, 0x00, 0x02, 'l', 'l',       /* CF | SR, middle chunk */
+        0x16, 0x00, 0x01, 'o',            /* SR, final chunk */
+        0x51, 0x01, 0x02, 'U', 0x00, 'x'  /* ME | SR, normal record */
+    };
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(encoded, sizeof(encoded), &message));
+    TEST_ASSERT_EQUAL(2, message->record_count);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY("hello", message->records[0].payload, 5);
+    TEST_ASSERT_EQUAL_UINT8('U', message->records[1].type[0]);
+    TEST_ASSERT_EQUAL(2, message->records[1].payload_len);
+    ndef_free_parsed_message(message);
+}
+
+TEST_CASE("NDEF orphan continuation chunk is rejected", "[pn532][ndef][chunk]")
+{
+    static const uint8_t encoded[] = {
+        0xD6, 0x00, 0x01, 'x', /* MB | ME | SR, TNF_UNCHANGED without first chunk */
+    };
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(encoded, sizeof(encoded), &message));
+    TEST_ASSERT_NULL(message);
 }
 
 void app_main(void)

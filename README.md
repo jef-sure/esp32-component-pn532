@@ -251,7 +251,7 @@ if (res == NDEF_OK) {
             char lang[8] = {0};
             bool utf16 = false;
             if (ndef_extract_text(rec, &text, &text_len, lang, &utf16)) {
-                /* text points into msg->raw_data */
+                /* text remains valid until msg is freed */
             }
         }
     }
@@ -264,6 +264,8 @@ Behavior by card family:
 - Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed.
 - MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `NDEF_ERR_NO_NDEF`. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
 - Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in MLe-sized chunks (capped at 250 bytes).
+
+The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `ndef_parse_message()`; the returned record storage remains valid until `ndef_free_parsed_message()`.
 
 ## Build And Write NDEF
 
@@ -316,6 +318,7 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - `pn532_14443_get_all_uids_ex()` writes a typed status and, on discovery, returns a heap-allocated `pn532_uids_array_t *`. Release it with `free()`.
 - `pn532_14443_get_all_uids()` preserves the legacy nullable return contract.
 - `pn532_ndef_read_card_auto()` returns a heap-allocated `ndef_message_parsed_t *`. Release it with `ndef_free_parsed_message()`.
+- `ndef_parse_message()` follows the same ownership contract and copies the encoded input into the parsed message.
 
 `pn532_t` is a public struct because the driver is split across multiple source files, but application code should treat it as an owned handle and not modify its fields directly.
 
@@ -329,4 +332,4 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - Card metadata: `pn532_14443_detect_card_type_and_capacity()`, `pn532_14443_detect_selected_card_type_and_capacity()`
 - ISO-DEP and Type 4: `pn532_14443_4_transceive()`, `pn532_14443_4_select_file()`, `pn532_14443_4_read_binary()`
 - MIFARE raw access: `pn532_mifare_block_read()`, `pn532_mifare_block_write()`, value operations
-- NDEF: `pn532_ndef_read_card_auto()`, `ndef_message_init()`, `ndef_message_add()`, `ndef_record_init()`, `ndef_make_text_record()`, `ndef_make_uri_record()`, `ndef_make_mime_record()`, `ndef_make_external_record()`, `ndef_encode_message()`, `ndef_write_to_selected_card()`, `ndef_extract_text()`, `ndef_extract_uri()`, `ndef_get_record_type()`, `ndef_decode_smartposter()`, `ndef_free_parsed_message()`, `ndef_result_to_string()`
+- NDEF: `pn532_ndef_read_card_auto()`, `ndef_parse_message()`, `ndef_message_init()`, `ndef_message_add()`, `ndef_record_init()`, `ndef_make_text_record()`, `ndef_make_uri_record()`, `ndef_make_mime_record()`, `ndef_make_external_record()`, `ndef_encode_message()`, `ndef_write_to_selected_card()`, `ndef_extract_text()`, `ndef_extract_uri()`, `ndef_get_record_type()`, `ndef_decode_smartposter()`, `ndef_free_parsed_message()`, `ndef_result_to_string()`

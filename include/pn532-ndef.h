@@ -49,7 +49,7 @@ typedef enum
     NDEF_ERR_UNSUPPORTED      = -9,
 } ndef_result_t;
 
-/** @brief NDEF record descriptor referencing bytes owned by ndef_message_parsed_t::raw_data. */
+/** @brief NDEF record descriptor referencing storage owned by ndef_message_parsed_t. */
 typedef struct
 {
     ndef_tnf_t     tnf;
@@ -93,6 +93,22 @@ typedef struct
     ndef_record_t *records;
     size_t         record_count;
 } ndef_message_parsed_t;
+
+/**
+ * @brief Parse an encoded NDEF message into logical records.
+ *
+ * Physical records carrying the CF flag are validated and reassembled. The
+ * first chunk supplies TNF, type, and ID; continuation chunks must use
+ * NDEF_TNF_UNCHANGED and their payloads are concatenated into one logical
+ * record. The returned message owns both the original encoded bytes and any
+ * assembled payload storage.
+ *
+ * @param raw_data Encoded NDEF message bytes (without a TLV or NLEN prefix).
+ * @param raw_data_len Number of encoded bytes.
+ * @param out_msg Receives an allocation released by ndef_free_parsed_message().
+ * @return NDEF_OK or an NDEF error code.
+ */
+ndef_result_t ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len, ndef_message_parsed_t **out_msg);
 
 /** @brief Common high-level record classes recognised by the helper predicates. */
 typedef enum
