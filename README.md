@@ -165,7 +165,7 @@ Notes:
 
 Call `pn532_spi_init()` once per PN532 with the same host and bus pins but a different NSS pin. ESP-IDF owns the shared host bus; each returned transport owns a separate `spi_device_handle_t` and controls its own NSS. A second call on an already initialized host is expected and does not log an error.
 
-Poll devices sequentially and turn off one reader before polling the other:
+Poll devices sequentially and turn off one reader before polling the other. The driver inserts the RF settle delay after each RF off itself, so no manual post-off delay is needed:
 
 ```c
 pn532_bus_t *bus_a = pn532_spi_init(SPI3_HOST, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_23, GPIO_NUM_5, 1000000);
@@ -178,7 +178,7 @@ for (;;) {
     pn532_uids_array_t *uids_a = pn532_14443_get_all_uids_ex(reader_a, &status_a);
     /* Consume uids_a when status_a == PN532_POLL_FOUND. */
     free(uids_a);
-    pn532_set_rf_off(reader_a);
+    pn532_set_rf_off(reader_a); /* includes the RF settle delay */
 
     pn532_poll_status_t status_b;
     pn532_uids_array_t *uids_b = pn532_14443_get_all_uids_ex(reader_b, &status_b);
@@ -189,6 +189,51 @@ for (;;) {
 ```
 
 For UID-only discovery the lifecycle is `poll -> RF off`. When card data is read, use `poll -> select/read -> release -> RF off`. Turning RF off successfully invalidates the local target and session state, so a later `pn532_release_target()` is a no-op and does not send stale `InRelease`.
+
+## Timeouts And Recovery
+
+Every `pn532_execute_command()` runs in two phases with separate budgets:
+
+- **ACK phase** — the PN532 must acknowledge the command within `pn532->ack_timeout_ms` (default `PN532_ACK_TIMEOUT_MS` = 50 ms; the NXP TAMA reference uses 10 ms). A miss here means the transport or the chip is wedged, so the command fails fast through `PN532_COMMAND_STATUS_ACK_TIMEOUT` instead of burning the full response timeout. At the polling layer this surfaces as `PN532_POLL_TRANSPORT_ERROR`.
+- **Response phase** — the full caller timeout (`pn532->timeout_ms`, default 500 ms) applies while the command runs. A miss here is an RF/card-side problem (quiet card, field collision) and maps to `PN532_POLL_TIMEOUT`.
+
+Tune both budgets with `pn532_set_ack_timeout()` and by writing `pn532->timeout_ms`:
+
+```c
+pn532_set_ack_timeout(pn532, 30); /* faster dead-transport detection */
+pn532->timeout_ms = 800;          /* more headroom for slow cards */
+```
+
+After a timeout the driver sends the UM0701-02 ACK-abort frame and drains the full PN532 buffer (an aborted two-card `InListPassiveTarget` can leave ~65 bytes behind; a short drain would corrupt the next frame with `invalid frame header`).
+
+### pn532_recover()
+
+When a device keeps failing (repeated `PN532_POLL_TRANSPORT_ERROR`, wedged ACK phase), `pn532_recover()` performs a full software re-initialisation on the existing bus — no `pn532_deinit()` / `pn532_spi_init()` / `pn532_init()` cycle needed:
+
+```c
+if (status == PN532_POLL_TRANSPORT_ERROR) {
+    if (++failures >= 3) {
+        if (!pn532_recover(pn532)) {
+            /* Transport is gone: deinit and re-create the bus. */
+        }
+        failures = 0;
+    }
+}
+```
+
+It aborts any in-flight command, resets target/session state, re-applies the SAM/retry configuration, verifies the firmware version, and leaves the RF field off.
+
+### Bus wake-up
+
+The PN532 enters low-power after power-up and after PowerDown. Each transport implements the NXP `phTalTama_WakeUp` role in its own way: SPI wakes on the NSS falling edge, HSU on a `0x55 0x55` preamble, I2C on a START condition (a zero-length probe plus an oscillator start-up delay). `pn532_reset()` and `pn532_recover()` send the wake automatically — there is no per-command wake frame, so the SPI/HSU hot paths stay lean.
+
+### RF settle delay
+
+`pn532_set_rf_off()` waits `pn532->rf_settle_delay_ms` (default `PN532_RF_SETTLE_DELAY_MS` = 20 ms) before returning, so a card sitting in HALT powers down and the next `InListPassiveTarget` re-activates it cleanly. With a static card and a 250 ms two-reader poll cycle this keeps every iteration at `PN532_POLL_FOUND` without alternating `FOUND`/`NO_TARGET`. Applications no longer need their own post-RF-off delay; tune or disable it with `pn532_set_rf_settle_delay()` (pass 0 to disable).
+
+### Soft deselect
+
+`pn532_deselect_target()` issues `InDeselect` (0x44): the card goes to HALT but stays listed inside the PN532, so a later select reactivates it without a field restart. Use `pn532_release_target()` when you are done with the card entirely.
 
 ## Read NDEF
 
@@ -276,10 +321,10 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 
 ## API Map
 
-- Transport and device lifecycle: `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_init()`, `pn532_deinit()`
-- RF field control: `pn532_set_rf_field()`, `pn532_set_rf_on()`, `pn532_set_rf_off()`
-- Retry tuning and raw commands: `pn532_set_max_retries()`, `pn532_set_passive_activation_retries()`, `pn532_execute_command()`
-- Poll, select, and auth: `pn532_14443_get_all_uids_ex()`, `pn532_14443_get_all_uids()`, `pn532_release_target()`, `pn532_14443_select_by_uid()`, `pn532_14443_authenticate()`
+- Transport and device lifecycle: `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_init()`, `pn532_deinit()`, `pn532_reset()`, `pn532_recover()`
+- RF field control: `pn532_set_rf_field()`, `pn532_set_rf_on()`, `pn532_set_rf_off()`, `pn532_set_rf_settle_delay()`
+- Retry tuning and raw commands: `pn532_set_max_retries()`, `pn532_set_passive_activation_retries()`, `pn532_set_ack_timeout()`, `pn532_execute_command()`
+- Poll, select, and auth: `pn532_14443_get_all_uids_ex()`, `pn532_14443_get_all_uids()`, `pn532_release_target()`, `pn532_deselect_target()`, `pn532_14443_select_by_uid()`, `pn532_14443_authenticate()`
 - Selected-tag block access: `pn532_14443_block_read()`, `pn532_14443_block_write()`
 - Card metadata: `pn532_14443_detect_card_type_and_capacity()`, `pn532_14443_detect_selected_card_type_and_capacity()`
 - ISO-DEP and Type 4: `pn532_14443_4_transceive()`, `pn532_14443_4_select_file()`, `pn532_14443_4_read_binary()`

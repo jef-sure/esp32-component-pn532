@@ -91,6 +91,25 @@ static bool pn532_i2c_bus_is_ready(pn532_bus_t *bus)
     return status == PN532_I2C_READY;
 }
 
+static void pn532_i2c_bus_wake(pn532_bus_t *bus)
+{
+    pn532_i2c_bus_t *i2c_bus = pn532_i2c_bus(bus);
+
+    if (i2c_bus == NULL) {
+        return;
+    }
+
+    /*
+     * I2C wake-up, mirroring phDalNfc / UM0701-02 §6.2.2: the PN532 exits
+     * low-power on a START condition on the bus. A zero-length probe
+     * transaction generates it; the chip then needs a few ms of oscillator
+     * start-up before it ACKs real commands, matching the HSU wake delay.
+     * Called from pn532_reset()/pn532_recover().
+     */
+    (void)i2c_master_transmit(i2c_bus->dev_handle, NULL, 0, PN532_I2C_TRANSFER_TIMEOUT_MS);
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
 static void pn532_i2c_bus_destroy(pn532_bus_t *bus)
 {
     pn532_i2c_bus_t *i2c_bus = pn532_i2c_bus(bus);
@@ -171,6 +190,7 @@ pn532_bus_t *pn532_i2c_init(i2c_port_num_t port, gpio_num_t scl, gpio_num_t sda,
     i2c_bus->base.write_command = pn532_i2c_bus_write_command;
     i2c_bus->base.read_data     = pn532_i2c_bus_read_data;
     i2c_bus->base.is_ready      = pn532_i2c_bus_is_ready;
+    i2c_bus->base.wake          = pn532_i2c_bus_wake;
     i2c_bus->base.destroy       = pn532_i2c_bus_destroy;
     return &i2c_bus->base;
 }

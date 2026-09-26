@@ -32,6 +32,7 @@ struct pn532_bus_t
 #define PN532_COMMAND_INDATAEXCHANGE      (0x40)
 #define PN532_COMMAND_INRELEASE           (0x52)
 #define PN532_COMMAND_INSELECT            (0x54)
+#define PN532_COMMAND_INDESELECT          (0x44)
 
 #define PN532_SPI_STATREAD  (0x02)
 #define PN532_SPI_DATAWRITE (0x01)
@@ -44,7 +45,8 @@ typedef enum
 {
     PN532_COMMAND_STATUS_OK = 0,
     PN532_COMMAND_STATUS_TRANSPORT_ERROR,
-    PN532_COMMAND_STATUS_TIMEOUT
+    PN532_COMMAND_STATUS_TIMEOUT,
+    PN532_COMMAND_STATUS_ACK_TIMEOUT
 } pn532_command_status_t;
 
 bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len, uint8_t *response,
@@ -52,3 +54,5 @@ bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *param
 bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                             size_t *response_len, uint16_t timeout);
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number);
+bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number);
+void pn532_abort_current_command(pn532_t *pn532);

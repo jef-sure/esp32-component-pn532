@@ -5,7 +5,6 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "esp_rom_sys.h"
 
 static const char *TAG_T4 = "PN532-T4";
 
@@ -20,14 +19,14 @@ static bool pn532_prepare_for_passive_target_list(pn532_t *pn532)
 
     /* NXP's libnfc/TAMA stack halts RF before every InListPassiveTarget
      * because the PN532 can stay in a state where the next poll is unreliable
-     * until the field is recycled. The next list command restarts the field. */
+     * until the field is recycled. The next list command restarts the field.
+     * pn532_set_rf_off() already applies the configurable RF settle delay
+     * (pn532->rf_settle_delay_ms) so a HALT-state card powers down cleanly. */
     pn532->rf_config = PN532_MIFARE_ISO14443A;
     if (!pn532_set_rf_off(pn532)) {
         return false;
     }
     pn532->session_opened = false;
-    pn532_delay_ms(5);
-    esp_rom_delay_us(100);
     return true;
 }
 
@@ -239,8 +238,12 @@ static bool pn532_list_passive_iso14443a_targets( //
 
 static pn532_poll_status_t pn532_poll_command_error(const pn532_t *pn532)
 {
-    return pn532 != NULL && pn532->last_command_status == PN532_COMMAND_STATUS_TIMEOUT ? PN532_POLL_TIMEOUT
-                                                                                       : PN532_POLL_TRANSPORT_ERROR;
+    if (pn532 != NULL && pn532->last_command_status == PN532_COMMAND_STATUS_TIMEOUT) {
+        return PN532_POLL_TIMEOUT;
+    }
+    /* ACK timeouts and hard transport failures both mean the PN532 is not
+     * talking to us; report them as transport errors, not RF problems. */
+    return PN532_POLL_TRANSPORT_ERROR;
 }
 
 pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_status_t *status)

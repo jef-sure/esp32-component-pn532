@@ -20,8 +20,14 @@
 /** @brief Default 7-bit PN532 I2C address in ESP-IDF's left-shifted form. */
 #define PN532_I2C_DEFAULT_ADDRESS (0x24)
 
-/** @brief Default PN532 HSU baud rate used when uart_init() receives a non-positive baud. */
+/** @brief Default HSU baud rate used when uart_init() receives a non-positive baud. */
 #define PN532_UART_DEFAULT_BAUD_RATE (115200)
+
+/** @brief ACK timeout in milliseconds applied by pn532_execute_command(). */
+#define PN532_ACK_TIMEOUT_MS (50)
+
+/** @brief Default RF settle delay in milliseconds after pn532_set_rf_off(). */
+#define PN532_RF_SETTLE_DELAY_MS (20)
 
 /** @brief Maximum PN532 host frame size handled by this driver, including protocol overhead. */
 #define PN532_MAX_BUF_SIZE 280
@@ -108,6 +114,8 @@ typedef struct _pn532_t
     gpio_num_t    irq;
     gpio_num_t    rst;
     uint16_t      timeout_ms;
+    uint16_t      ack_timeout_ms;     /**< ACK wait budget per command; 0 waits forever. */
+    uint16_t      rf_settle_delay_ms; /**< Pause applied after RF off before the next poll. */
     uint8_t       rf_config;
     bool          is_rf_on;
     uint8_t       inListedTag;
@@ -204,6 +212,18 @@ void pn532_deinit(pn532_t *pn532, bool free_bus);
 bool pn532_reset(pn532_t *pn532);
 
 /**
+ * @brief Fully re-initialise a wedged PN532 without recreating the transport.
+ *
+ * Runs the abort procedure, resets target/session state, re-applies the
+ * SAM/retry runtime configuration, verifies the firmware version, and leaves
+ * the RF field off. Use this instead of a pn532_deinit()/pn532_init() cycle
+ * after repeated ACK timeouts or transport errors.
+ *
+ * @return true when every recovery step succeeded.
+ */
+bool pn532_recover(pn532_t *pn532);
+
+/**
  * @brief Read the PN532 firmware identifier.
  *
  * The packed return value is PN532's four response bytes in big-endian order:
@@ -233,6 +253,43 @@ bool pn532_set_rf_off(pn532_t *pn532);
  *         command or transport failure.
  */
 bool pn532_release_target(pn532_t *pn532);
+
+/**
+ * @brief Soft-deselect the currently selected target with InDeselect.
+ *
+ * Unlike pn532_release_target(), this keeps the target listed by the PN532 so
+ * a later pn532_in_select()/pn532_14443_select_by_uid() can reactivate it
+ * without a field restart. Sending InDeselect puts an ISO14443-4 target into
+ * HALT. When no target is listed the function is a no-op returning true.
+ *
+ * @return true when the target was deselected or none was listed.
+ */
+bool pn532_deselect_target(pn532_t *pn532);
+
+/**
+ * @brief Configure the per-command ACK timeout.
+ *
+ * The PN532 sends its ACK within a few milliseconds; when no ACK arrives
+ * within this budget the transport is considered dead and the command fails
+ * fast instead of consuming the full response timeout. The NXP TAMA reference
+ * uses 10 ms; the driver default is PN532_ACK_TIMEOUT_MS (50 ms) to cover
+ * slow bus clocking.
+ *
+ * @param ack_timeout_ms ACK wait budget in milliseconds; 0 waits forever.
+ */
+void pn532_set_ack_timeout(pn532_t *pn532, uint16_t ack_timeout_ms);
+
+/**
+ * @brief Configure the settle delay applied after RF off.
+ *
+ * After pn532_set_rf_off() the driver waits this long before the next
+ * InListPassiveTarget so a card sitting in HALT powers down and answers the
+ * next activation cleanly. The default PN532_RF_SETTLE_DELAY_MS was measured
+ * on hardware with a static card and a 250 ms two-reader poll cycle.
+ *
+ * @param delay_ms Settle delay in milliseconds; 0 disables the delay.
+ */
+void pn532_set_rf_settle_delay(pn532_t *pn532, uint16_t delay_ms);
 
 /**
  * @brief Configure the PN532 retry counters for ATR, PSL, and passive activation.
@@ -278,8 +335,9 @@ bool pn532_set_passive_activation_retries(pn532_t *pn532, uint8_t max_retries);
  *                    the caller does not need the payload (the command must
  *                    still produce a valid response frame for this to return
  *                    true).
- * @param timeout_ms Per-phase timeout in milliseconds (used for both ACK and
- *                   response waits). 0 means wait indefinitely.
+ * @param timeout_ms Response-phase timeout in milliseconds. The ACK phase
+ *                   always uses pn532->ack_timeout_ms (see
+ *                   pn532_set_ack_timeout()). 0 means wait indefinitely.
  *
  * @return true on success. On false, the response buffer contents are
  *         undefined; @p *response_len is set to the required size if the

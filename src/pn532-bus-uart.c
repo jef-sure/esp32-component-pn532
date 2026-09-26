@@ -116,6 +116,31 @@ static bool pn532_uart_bus_is_ready(pn532_bus_t *bus)
     return buffered_len >= PN532_UART_MIN_READY_BYTES;
 }
 
+static void pn532_uart_bus_wake(pn532_bus_t *bus)
+{
+    pn532_uart_bus_t *uart_bus = pn532_uart_bus(bus);
+
+    if (uart_bus == NULL) {
+        return;
+    }
+
+    /*
+     * HSU wake-up, mirroring NXP phTalTama_WakeUp: the PN532 enters low-power
+     * state on power-up and after PowerDown. Per UM0701-02 §6.2.1 the host
+     * sends 0x55 0x55 followed by dummy zeros before the first command is
+     * accepted. Called from pn532_reset()/pn532_recover() so a sleeping chip
+     * is also woken on recovery, not only at bus creation.
+     */
+    static const uint8_t wakeup[] = {0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    int                  written  = uart_write_bytes(uart_bus->uart_num, wakeup, sizeof(wakeup));
+    if (written != (int)sizeof(wakeup)) {
+        ESP_LOGW(TAG, "pn532_uart_bus_wake: failed to send HSU wake-up preamble");
+    }
+    (void)uart_wait_tx_done(uart_bus->uart_num, pdMS_TO_TICKS(PN532_UART_IO_TIMEOUT_MS));
+    vTaskDelay(pdMS_TO_TICKS(20));
+    (void)uart_flush_input(uart_bus->uart_num);
+}
+
 static void pn532_uart_bus_destroy(pn532_bus_t *bus)
 {
     pn532_uart_bus_t *uart_bus = pn532_uart_bus(bus);
@@ -183,29 +208,16 @@ pn532_bus_t *pn532_uart_init(uart_port_t uart_num, gpio_num_t tx, gpio_num_t rx,
         ESP_LOGW(TAG, "pn532_uart_init: uart_flush_input failed (%s)", esp_err_to_name(err));
     }
 
-    /*
-     * HSU wake-up: PN532 enters low-power state on power-up and after PowerDown.
-     * Per NXP UM0701-02 §6.2.1, host must send a wake-up preamble (0x55 byte
-     * followed by at least 15 ms of dummy bytes) before the first command is
-     * accepted. We send a generous burst followed by a small idle delay so the
-     * subsequent SAMConfiguration call from pn532_init() is recognised.
-     */
-    static const uint8_t pn532_uart_wakeup[] = {
-        0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-    int written = uart_write_bytes(uart_num, pn532_uart_wakeup, sizeof(pn532_uart_wakeup));
-    if (written != (int)sizeof(pn532_uart_wakeup)) {
-        ESP_LOGW(TAG, "pn532_uart_init: failed to send HSU wake-up preamble");
-    }
-    (void)uart_wait_tx_done(uart_num, pdMS_TO_TICKS(PN532_UART_IO_TIMEOUT_MS));
-    vTaskDelay(pdMS_TO_TICKS(20));
-    (void)uart_flush_input(uart_num);
-
     uart_bus->uart_num = uart_num;
 
     uart_bus->base.write_command = pn532_uart_bus_write_command;
     uart_bus->base.read_data     = pn532_uart_bus_read_data;
     uart_bus->base.is_ready      = pn532_uart_bus_is_ready;
+    uart_bus->base.wake          = pn532_uart_bus_wake;
     uart_bus->base.destroy       = pn532_uart_bus_destroy;
+
+    /* Wake the chip once here; pn532_reset()/pn532_recover() re-send the same
+     * preamble through base.wake when needed. */
+    pn532_uart_bus_wake(&uart_bus->base);
     return &uart_bus->base;
 }

@@ -43,10 +43,14 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 #define PN532_STATUS_MIFARE_ERROR_13     0x13
 #define PN532_STATUS_MIFARE_ERROR_14     0x14
 #define PN532_STATUS_ALREADY_SELECTED    0x27
+#define PN532_STATUS_NAD_MASK            0x80
+#define PN532_STATUS_MI_MASK             0x40
+#define PN532_STATUS_ERROR_MASK          0x3F
 
 static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8_t *config_data,
                                    size_t config_data_len);
 static bool pn532_sam_configuration(pn532_t *pn532, uint8_t mode, uint8_t timeout, uint8_t irq_enable);
+static void pn532_apply_rf_settle_delay(pn532_t *pn532);
 
 static bool pn532_status_requires_reselect(uint8_t status)
 {
@@ -211,7 +215,18 @@ static bool pn532_read_ack(pn532_t *pn532)
     return memcmp(pn532->recv_buf, pn532_ack, sizeof(pn532_ack)) == 0;
 }
 
-static void pn532_abort_current_command(pn532_t *pn532)
+static void pn532_apply_rf_settle_delay(pn532_t *pn532)
+{
+    if (pn532 == NULL || pn532->rf_settle_delay_ms == 0) {
+        return;
+    }
+    /* Give the field collapse time to release a HALT-state card before the
+     * next InListPassiveTarget restarts the field. The default mirrors the
+     * two-reader interleaving measured on hardware. */
+    pn532_delay_ms(pn532->rf_settle_delay_ms);
+}
+
+void pn532_abort_current_command(pn532_t *pn532)
 {
     if (pn532 == NULL || pn532->bus == NULL || pn532->bus->write_command == NULL) {
         return;
@@ -223,9 +238,16 @@ static void pn532_abort_current_command(pn532_t *pn532)
     (void)pn532->bus->write_command(pn532->bus, pn532_ack, sizeof(pn532_ack));
     pn532_delay_ms(2);
 
-    if (pn532->bus->is_ready != NULL && pn532->bus->read_data != NULL && pn532->bus->is_ready(pn532->bus)) {
-        uint8_t drain[16];
-        (void)pn532->bus->read_data(pn532->bus, drain, sizeof(drain));
+    /* Drain the full PN532 buffer: an aborted InListPassiveTarget with two
+     * cards can leave ~65 bytes of response behind. A short 16-byte read
+     * would leave the tail in the FIFO and corrupt the next frame. */
+    if (pn532->bus->is_ready != NULL && pn532->bus->read_data != NULL) {
+        size_t guard = 0;
+        while (pn532->bus->is_ready(pn532->bus) && guard++ < PN532_MAX_BUF_SIZE) {
+            if (!pn532->bus->read_data(pn532->bus, pn532->recv_buf, PN532_MAX_BUF_SIZE)) {
+                break;
+            }
+        }
     }
 
     pn532->inListedTag    = 0;
@@ -238,7 +260,6 @@ static void pn532_recover_after_timeout(pn532_t *pn532, uint8_t command, const c
     ESP_LOGW(TAG, "pn532_execute_command: recovering after command 0x%02X %s timeout", command, phase);
     pn532_abort_current_command(pn532);
 }
-
 static bool pn532_read_response_frame(pn532_t *pn532, uint8_t expected_response, size_t *payload_offset,
                                       size_t *payload_len)
 {
@@ -346,10 +367,16 @@ bool pn532_execute_command(      //
         return false;
     }
 
-    if (!pn532_wait_ready(pn532, timeout)) {
-        ESP_LOGW(TAG, "pn532_execute_command: command 0x%02X timed out waiting for ACK", command);
+    /* ACK phase: the PN532 acknowledges a command within a few ms. Waiting the
+     * full response timeout here only masks a dead transport, so the ACK gets
+     * its own short budget (NXP TAMA uses 10 ms; we keep headroom for slow
+     * SPI/I2C clocking of the frame). A miss here means the transport or the
+     * chip is wedged — not an RF/card problem. */
+    if (!pn532_wait_ready(pn532, pn532->ack_timeout_ms)) {
+        ESP_LOGE(TAG, "pn532_execute_command: no ACK for command 0x%02X within %u ms (transport not responding)",
+                 command, (unsigned)pn532->ack_timeout_ms);
         pn532_recover_after_timeout(pn532, command, "ACK");
-        pn532->last_command_status = PN532_COMMAND_STATUS_TIMEOUT;
+        pn532->last_command_status = PN532_COMMAND_STATUS_ACK_TIMEOUT;
         return false;
     }
     if (!pn532_read_ack(pn532)) {
@@ -357,6 +384,10 @@ bool pn532_execute_command(      //
         pn532_abort_current_command(pn532);
         return false;
     }
+
+    /* Response phase: the full caller timeout applies. A miss here is an
+     * RF/card-side problem (field collision, quiet card), not a transport
+     * failure. */
     if (!pn532_wait_ready(pn532, timeout)) {
         ESP_LOGW(TAG, "pn532_execute_command: command 0x%02X timed out waiting for response", command);
         pn532_recover_after_timeout(pn532, command, "response");
@@ -414,8 +445,9 @@ bool pn532_reset(pn532_t *pn532)
     pn532->is_rf_on       = false;
     pn532->session_opened = false;
 
-    /* Some buses (SPI) need a wake-up sequence after a hard reset before the
-     * chip will respond to commands. */
+    /* Buses put the chip into low-power after reset/PowerDown: SPI wakes on
+     * the NSS edge, HSU on the 0x55 0x55 preamble, I2C on a START condition.
+     * Each transport provides its own wake() for this. */
     if (pn532->bus != NULL && pn532->bus->wake != NULL) {
         pn532->bus->wake(pn532->bus);
     }
@@ -443,11 +475,13 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
         return NULL;
     }
 
-    pn532->bus        = bus;
-    pn532->irq        = irq;
-    pn532->rst        = rst;
-    pn532->rf_config  = PN532_MIFARE_ISO14443A;
-    pn532->timeout_ms = PN532_DEFAULT_TIMEOUT_MS;
+    pn532->bus                = bus;
+    pn532->irq                = irq;
+    pn532->rst                = rst;
+    pn532->rf_config          = PN532_MIFARE_ISO14443A;
+    pn532->timeout_ms         = PN532_DEFAULT_TIMEOUT_MS;
+    pn532->ack_timeout_ms     = PN532_ACK_TIMEOUT_MS;
+    pn532->rf_settle_delay_ms = PN532_RF_SETTLE_DELAY_MS;
 
     if (pn532_gpio_is_valid(rst)) {
         gpio_set_direction(rst, GPIO_MODE_OUTPUT);
@@ -555,6 +589,9 @@ bool pn532_set_rf_field(pn532_t *pn532, bool enabled)
         if (!enabled) {
             pn532->inListedTag    = 0;
             pn532->session_opened = false;
+            /* Let the collapsed field release a HALT-state card before the
+             * next InListPassiveTarget restarts the field. */
+            pn532_apply_rf_settle_delay(pn532);
         }
     }
     return ok && response_len == 0;
@@ -568,6 +605,20 @@ bool pn532_set_rf_on(pn532_t *pn532)
 bool pn532_set_rf_off(pn532_t *pn532)
 {
     return pn532_set_rf_field(pn532, false);
+}
+
+void pn532_set_ack_timeout(pn532_t *pn532, uint16_t ack_timeout_ms)
+{
+    if (pn532 != NULL) {
+        pn532->ack_timeout_ms = ack_timeout_ms;
+    }
+}
+
+void pn532_set_rf_settle_delay(pn532_t *pn532, uint16_t delay_ms)
+{
+    if (pn532 != NULL) {
+        pn532->rf_settle_delay_ms = delay_ms;
+    }
 }
 
 static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8_t *config_data, size_t config_data_len)
@@ -634,6 +685,24 @@ bool pn532_release_target(pn532_t *pn532)
     return ok;
 }
 
+bool pn532_deselect_target(pn532_t *pn532)
+{
+    if (pn532 == NULL) {
+        return false;
+    }
+
+    if (pn532->inListedTag == 0) {
+        return true;
+    }
+
+    bool ok = pn532_in_deselect(pn532, pn532->inListedTag);
+    if (ok) {
+        /* Target stays listed for the chip; only our session flag drops. */
+        pn532->session_opened = false;
+    }
+    return ok;
+}
+
 bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                             size_t *response_len, uint16_t timeout)
 {
@@ -660,20 +729,31 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
         ESP_LOGE(TAG, "pn532_in_data_exchange: empty response");
         return false;
     }
-    if (raw_response[0] != PN532_STATUS_OK) {
+    if ((raw_response[0] & PN532_STATUS_ERROR_MASK) != PN532_STATUS_OK) {
         /*
          * NXP's TAMA stack reports 0x01/0x13/0x14 as RF timeout style errors
          * from transceive, but it does not discard the target handle there.
          * Keep the listed target number and only mark the session as needing a
-         * fresh InSelect before the next exchange.
+         * fresh InSelect before the next exchange. Error codes live in the
+         * low 6 bits (ERROR_MASK 0x3F); MI (0x40) and NAD (0x80) are data
+         * flags, not errors.
          */
-        if (pn532_status_requires_reselect(raw_response[0])) {
-            if (raw_response[0] == PN532_STATUS_RF_TIMEOUT) {
-                pn532->is_rf_on = false;
+        uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
+        if (pn532_status_requires_reselect(status)) {
+            if (status == PN532_STATUS_RF_TIMEOUT) {
+                /* NXP's TAMA switches the field OFF after an RF_TIMEOUT to
+                 * keep PN53x/PN51x state consistent; mirror that with a
+                 * best-effort RFConfiguration (a failure here must not mask
+                 * the RF_TIMEOUT the caller sees). */
+                pn532->is_rf_on               = false;
+                const uint8_t rf_off_params[] = {0x01, 0x02};
+                size_t        rf_response_len = 0;
+                (void)pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, rf_off_params, sizeof(rf_off_params),
+                                            NULL, &rf_response_len, (uint16_t)pn532->timeout_ms);
             }
             pn532->session_opened = false;
         }
-        ESP_LOGD(TAG, "pn532_in_data_exchange: PN532 status 0x%02X", raw_response[0]);
+        ESP_LOGD(TAG, "pn532_in_data_exchange: PN532 status 0x%02X", status);
         return false;
     }
 
@@ -715,5 +795,58 @@ bool pn532_in_select(pn532_t *pn532, uint8_t target_number)
     }
     pn532->inListedTag    = target_number;
     pn532->session_opened = true;
+    return true;
+}
+
+bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number)
+{
+    const uint8_t params[]   = {target_number};
+    uint8_t       status[1]  = {0};
+    size_t        status_len = sizeof(status);
+    if (!pn532_execute_command(pn532, PN532_COMMAND_INDESELECT, params, sizeof(params), status, &status_len,
+                               (uint16_t)pn532->timeout_ms)) {
+        pn532->session_opened = false;
+        return false;
+    }
+    if (status_len == 0) {
+        ESP_LOGE(TAG, "pn532_in_deselect: empty response");
+        pn532->session_opened = false;
+        return false;
+    }
+    if (status[0] != PN532_STATUS_OK && status[0] != PN532_STATUS_ALREADY_SELECTED) {
+        ESP_LOGE(TAG, "pn532_in_deselect: status 0x%02X", status[0]);
+        pn532->session_opened = false;
+        return false;
+    }
+    pn532->session_opened = false;
+    return true;
+}
+
+bool pn532_recover(pn532_t *pn532)
+{
+    if (pn532 == NULL) {
+        return false;
+    }
+
+    /* Full software re-initialisation without tearing down the transport:
+     * abort anything in flight, drop target/session state, re-apply the
+     * SAM/retry runtime configuration, and leave the RF field off. */
+    pn532_abort_current_command(pn532);
+    pn532_reset(pn532);
+
+    if (!pn532_restore_runtime_config(pn532)) {
+        return false;
+    }
+
+    uint32_t firmware = pn532_get_firmware_version(pn532);
+    if (firmware == 0) {
+        ESP_LOGE(TAG, "pn532_recover: firmware version read failed");
+        return false;
+    }
+
+    if (!pn532_set_rf_off(pn532)) {
+        return false;
+    }
+
     return true;
 }

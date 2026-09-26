@@ -543,6 +543,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Polling ISO14443A cards over SPI");
     ESP_LOGI(TAG, "Tap a card to print its UID");
 
+    int         consecutive_failures             = 0;
     pn532_uid_t last_uids[PN532_SAMPLE_MAX_UIDS] = {0};
     int         last_uids_count                  = 0;
 
@@ -559,11 +560,20 @@ void app_main(void)
                 ESP_LOGW(TAG, "PN532 poll timed out");
             } else if (status != PN532_POLL_NO_TARGET) {
                 ESP_LOGE(TAG, "PN532 poll failed (status %d)", (int)status);
+                /* A dead transport is exactly what pn532_recover() is for:
+                 * it re-initialises the chip without recreating the bus. */
+                if (++consecutive_failures >= 3) {
+                    ESP_LOGW(TAG, "Recovering PN532 after %d failures", consecutive_failures);
+                    if (pn532_recover(pn532)) {
+                        consecutive_failures = 0;
+                    }
+                }
             }
             (void)pn532_set_rf_off(pn532);
             pn532_delay_ms(PN532_SAMPLE_POLL_MS);
             continue;
         }
+        consecutive_failures = 0;
 
         if (!pn532_uids_match(uids, last_uids, last_uids_count)) {
             pn532_log_detected_cards(uids);
