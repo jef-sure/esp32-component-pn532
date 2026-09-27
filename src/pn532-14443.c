@@ -215,21 +215,48 @@ static bool pn532_list_passive_iso14443a_targets( //
     uint16_t       timeout                        //
 )
 {
-    uint8_t params[2 + 10];
-    size_t  params_len = 2;
+    /* UM0701-02 §7.3.5: the InListPassiveTarget InitiatorData for a cascaded
+     * UID must contain the cascade tag 0x88 in front of every cascade level
+     * except the last one. Callers hand us the plain UID stored in pn532_uid_t,
+     * so the tags are inserted here into a local copy: 4-byte UID stays 4
+     * bytes, 7-byte becomes 8, 10-byte becomes 12. */
+    uint8_t params[2 + 12];
+    uint8_t cascaded[12];
+    size_t  cascaded_len = 0;
+    size_t  params_len   = 2;
 
     if (pn532 == NULL || response == NULL || response_len == NULL) {
         return false;
     }
-    if (initiator_data_len > sizeof(params) - 2) {
+    if (initiator_data_len != 0 && initiator_data_len != 4 && initiator_data_len != 7 && initiator_data_len != 10) {
         return false;
+    }
+    if (initiator_data == NULL && initiator_data_len != 0) {
+        return false;
+    }
+
+    if (initiator_data != NULL && initiator_data_len > 0) {
+        size_t pos = 0;
+        while (pos < initiator_data_len) {
+            size_t remaining = initiator_data_len - pos;
+            if (remaining > 4) {
+                cascaded[cascaded_len++] = 0x88;
+                memcpy(cascaded + cascaded_len, initiator_data + pos, 3);
+                cascaded_len += 3;
+                pos += 3;
+            } else {
+                memcpy(cascaded + cascaded_len, initiator_data + pos, remaining);
+                cascaded_len += remaining;
+                pos += remaining;
+            }
+        }
     }
 
     params[0] = max_targets;
     params[1] = PN532_MIFARE_ISO14443A;
-    if (initiator_data != NULL && initiator_data_len > 0) {
-        memcpy(params + 2, initiator_data, initiator_data_len);
-        params_len += initiator_data_len;
+    if (cascaded_len > 0) {
+        memcpy(params + 2, cascaded, cascaded_len);
+        params_len += cascaded_len;
     }
 
     return pn532_execute_command(pn532, PN532_COMMAND_INLISTPASSIVETARGET, params, params_len, response, response_len,

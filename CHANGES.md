@@ -1,5 +1,14 @@
 # Changelog
 
+## v 0.4.3 - 2026-09-27
+
+- Fixed targeted `InListPassiveTarget` activation for cascaded UIDs (UM0701-02 §7.3.5): the InitiatorData now carries the cascade tag `0x88` in front of every cascade level except the last, instead of passing the raw 7/10-byte UID. Single-level 4-byte UIDs are unchanged, and the caller-owned `pn532_uid_t` is no longer mutated while building the frame.
+- Resized the command buffer from `params[2 + 10]` to `params[2 + 12]`: the old buffer could not physically hold a 10-byte UID plus its two cascade tags (12 data bytes), which would have been a silent stack overflow once the tags were inserted.
+- Fixed `pn532_in_select()` and `pn532_in_deselect()` treating status `0x27` as success via a misleading `PN532_STATUS_ALREADY_SELECTED` constant. Per UM0701-02, `0x27` means "target not known" and is an error for both commands; only `0x00` is success now. Added regression coverage for the rejected status.
+- Fixed `pn532_release_target()` ignoring the `InRelease` status byte: transport success was treated as command success even when the PN532 reported an error, and local target state was cleared anyway. The status is now checked like InSelect/InDeselect; on a real error the local state is left untouched, while `0x27` (target not known) clears the state and succeeds like the NXP TAMA reference so poll loops cannot wedge.
+- Fixed a deadlock after an RF-timeout `InDataExchange`: the forced RF field-off makes the PN532 drop every listed target, but the stale `inListedTag` survived and made every later auto-`InSelect` fail with `0x27` forever. The target handle is now cleared together with the field state.
+- Added mock-based regression coverage verifying the emitted InitiatorData for 7- and 10-byte UIDs.
+
 ## v 0.4.2 - 2026-09-27
 
 - Documented the ISO-DEP lifecycle explicitly: poll, select, repeated APDU exchange, and release/deselect, including automatic `InSelect` when a listed target remains but its session is closed.

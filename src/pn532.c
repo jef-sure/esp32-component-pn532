@@ -42,7 +42,7 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 #define PN532_STATUS_RF_TIMEOUT          0x01
 #define PN532_STATUS_MIFARE_ERROR_13     0x13
 #define PN532_STATUS_MIFARE_ERROR_14     0x14
-#define PN532_STATUS_ALREADY_SELECTED    0x27
+#define PN532_STATUS_TARGET_NOT_KNOWN    0x27
 #define PN532_STATUS_NAD_MASK            0x80
 #define PN532_STATUS_MI_MASK             0x40
 #define PN532_STATUS_ERROR_MASK          0x3F
@@ -713,16 +713,37 @@ bool pn532_release_target(pn532_t *pn532)
     uint8_t params[] = {pn532->inListedTag};
     uint8_t response[4];
     size_t  response_len = sizeof(response);
-    bool    ok = pn532_execute_command(pn532, PN532_COMMAND_INRELEASE, params, sizeof(params), response, &response_len,
-                                       (uint16_t)pn532->timeout_ms);
-    if (ok) {
+    if (!pn532_execute_command(pn532, PN532_COMMAND_INRELEASE, params, sizeof(params), response, &response_len,
+                               (uint16_t)pn532->timeout_ms)) {
+        return false;
+    }
+
+    /* UM0701-02 §7.3.9: InRelease returns a status byte like InSelect and
+     * InDeselect. Only 0x00 means the target was released; 0x27 means the
+     * target number is not known. Per the NXP TAMA reference (its release
+     * path ignores the status and always closes the session) a release after
+     * the chip already lost the target is not an error the caller can act
+     * on: treat 0x27 as "nothing left to release", clear the local state,
+     * and succeed so poll loops keep working. Any other non-zero status is a
+     * real error and leaves the state untouched. */
+    if (response_len == 0) {
+        ESP_LOGE(TAG, "pn532_release_target: empty response");
+        return false;
+    }
+    if (response[0] == PN532_STATUS_TARGET_NOT_KNOWN) {
+        ESP_LOGD(TAG, "pn532_release_target: target already lost (0x27)");
         pn532->inListedTag    = 0;
         pn532->session_opened = false;
+        return true;
     }
-    /* Status byte (response[0]) of 0x00 means success; non-zero is reported but we
-     * still consider the target released because the chip won't keep activation
-     * after issuing InRelease. */
-    return ok;
+    if (response[0] != PN532_STATUS_OK) {
+        ESP_LOGE(TAG, "pn532_release_target: status 0x%02X", response[0]);
+        return false;
+    }
+
+    pn532->inListedTag    = 0;
+    pn532->session_opened = false;
+    return true;
 }
 
 bool pn532_deselect_target(pn532_t *pn532)
@@ -810,8 +831,14 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
                     /* NXP's TAMA switches the field OFF after an RF_TIMEOUT to
                      * keep PN53x/PN51x state consistent; mirror that with a
                      * best-effort RFConfiguration (a failure here must not mask
-                     * the RF_TIMEOUT the caller sees). */
+                     * the RF_TIMEOUT the caller sees). Switching the field off
+                     * makes the PN532 drop every listed target, so the stale
+                     * target handle must not survive either — otherwise the
+                     * next auto-InSelect hits 0x27 forever (the TAMA reference
+                     * keeps its handle but treats 0x27 as success in its
+                     * connect path, which we deliberately do not). */
                     pn532->is_rf_on               = false;
+                    pn532->inListedTag            = 0;
                     const uint8_t rf_off_params[] = {0x01, 0x02};
                     size_t        rf_response_len = 0;
                     (void)pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, rf_off_params,
@@ -970,7 +997,10 @@ bool pn532_in_select(pn532_t *pn532, uint8_t target_number)
         pn532->session_opened = false;
         return false;
     }
-    if (status[0] != PN532_STATUS_OK && status[0] != PN532_STATUS_ALREADY_SELECTED) {
+    /* UM0701-02 §7.3.7: InSelect returns 0x00 on success; 0x27 means the
+     * target number is not known to the PN532 and is a hard error, not an
+     * idempotent "already selected" confirmation. */
+    if (status[0] != PN532_STATUS_OK) {
         ESP_LOGE(TAG, "pn532_in_select: status 0x%02X", status[0]);
         pn532->session_opened = false;
         return false;
@@ -995,7 +1025,17 @@ bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number)
         pn532->session_opened = false;
         return false;
     }
-    if (status[0] != PN532_STATUS_OK && status[0] != PN532_STATUS_ALREADY_SELECTED) {
+    /* UM0701-02 §7.3.6: InDeselect returns 0x00 on success; 0x27 means the
+     * target is not attributed anymore. Like the NXP TAMA reference (which
+     * closes the session on both 0x00 and 0x27), a target the chip already
+     * lost is deselected as far as we are concerned: clear the local state
+     * and succeed. Other non-zero statuses are errors. */
+    if (status[0] == PN532_STATUS_TARGET_NOT_KNOWN) {
+        ESP_LOGD(TAG, "pn532_in_deselect: target already lost (0x27)");
+        pn532->session_opened = false;
+        return true;
+    }
+    if (status[0] != PN532_STATUS_OK) {
         ESP_LOGE(TAG, "pn532_in_deselect: status 0x%02X", status[0]);
         pn532->session_opened = false;
         return false;

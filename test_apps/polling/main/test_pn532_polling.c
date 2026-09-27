@@ -18,7 +18,8 @@ typedef enum
     MOCK_EXCHANGE_MI,
     MOCK_COMMUNICATE_THRU,
     MOCK_EXCHANGE_NAD,
-    MOCK_TYPE4_APDU
+    MOCK_TYPE4_APDU,
+    MOCK_STATUS_TARGET_NOT_KNOWN
 } mock_mode_t;
 
 typedef struct
@@ -31,6 +32,9 @@ typedef struct
     size_t      command_count;
     size_t      abort_count;
     size_t      drained_frames;
+    uint8_t     list_initiator[16];
+    size_t      list_initiator_len;
+    bool        list_initiator_valid;
     uint8_t     pending_frames;
     uint8_t     mi_round;
     bool        exchange_loops_mi;
@@ -50,6 +54,22 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
     uint8_t command = buffer[3] == 0xFF ? buffer[9] : buffer[6];
     if (mock->mode == MOCK_LIST_TRANSPORT_ERROR && command == PN532_COMMAND_INLISTPASSIVETARGET) {
         return false;
+    }
+
+    /* Short frame layout: preamble(3) LEN ~LEN TF CMD then params. Capture the
+     * InitiatorData of targeted InListPassiveTarget calls so tests can verify
+     * cascade-tag insertion without real hardware. */
+    if (command == PN532_COMMAND_INLISTPASSIVETARGET) {
+        size_t params_len = (buffer[3] == 0xFF) ? (((size_t)buffer[5] << 8) | buffer[6]) : (size_t)buffer[3];
+        params_len -= 2u; /* payload = TF + CMD */
+        if (params_len > 2u) {
+            size_t initiator_len = params_len - 2u; /* MaxTg + BrTy */
+            const uint8_t *initiator = (buffer[3] == 0xFF) ? &buffer[10] : &buffer[7];
+            TEST_ASSERT_LESS_OR_EQUAL(sizeof(mock->list_initiator), initiator_len);
+            memcpy(mock->list_initiator, initiator, initiator_len);
+            mock->list_initiator_len   = initiator_len;
+            mock->list_initiator_valid = true;
+        }
     }
 
     TEST_ASSERT_LESS_THAN(ARRAY_SIZE(mock->commands), mock->command_count);
@@ -183,6 +203,15 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         return true;
     }
 
+    /* UM0701: 0x27 = target not known. InSelect/InDeselect must treat it as
+     * a failure, not as an idempotent success. */
+    if (mock->mode == MOCK_STATUS_TARGET_NOT_KNOWN &&
+        (mock->current_command == PN532_COMMAND_INSELECT || mock->current_command == PN532_COMMAND_INDESELECT)) {
+        static const uint8_t not_known[] = {0x27};
+        mock_response_frame(mock->current_command, not_known, sizeof(not_known), buffer, len);
+        return true;
+    }
+
     if (mock->mode == MOCK_COMMUNICATE_THRU && mock->current_command == PN532_COMMAND_INCOMMUNICATETHRU) {
         /* Raw exchange: round 1 MI-fragments {0x11}, round 2 completes with
          * {0x22, 0x33}. Exercises both the raw path and its MI drain. */
@@ -258,6 +287,45 @@ TEST_CASE("poll ends previous session and does not select a target", "[pn532][po
     TEST_ASSERT_FALSE(pn532.session_opened);
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
     free(uids);
+}
+
+TEST_CASE("targeted polling inserts cascade tags for cascaded UIDs", "[pn532][polling][cascade]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+
+    pn532_uid_t uid = {0};
+    uid.uid_length  = 7;
+    uid.uid[0]      = 0x04;
+    uid.uid[1]      = 0x11;
+    uid.uid[2]      = 0x22;
+    uid.uid[3]      = 0x33;
+    uid.uid[4]      = 0x44;
+    uid.uid[5]      = 0x55;
+    uid.uid[6]      = 0x66;
+
+    /* RF is off and tg is unset, so select_by_uid takes the targeted path
+     * first. The mock answers with its fixed 4-byte card, so the overall call
+     * falls back and fails; the captured targeted frame is what matters. */
+    (void)pn532_14443_select_by_uid(&pn532, &uid);
+    TEST_ASSERT_TRUE(mock.list_initiator_valid);
+    TEST_ASSERT_EQUAL(8u, mock.list_initiator_len);
+    TEST_ASSERT_EQUAL_UINT8(0x88, mock.list_initiator[0]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(uid.uid, &mock.list_initiator[1], 7);
+
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    uid.uid_length = 10;
+    for (int i = 0; i < 10; i++) {
+        uid.uid[i] = (uint8_t)(0xA0 + i);
+    }
+    (void)pn532_14443_select_by_uid(&pn532, &uid);
+    TEST_ASSERT_TRUE(mock.list_initiator_valid);
+    TEST_ASSERT_EQUAL(12u, mock.list_initiator_len);
+    const uint8_t cascaded10[] = {0x88, 0xA0, 0xA1, 0xA2, 0x88, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(cascaded10, mock.list_initiator, sizeof(cascaded10));
 }
 
 TEST_CASE("two PN532 devices are polled sequentially", "[pn532][polling][spi]")
@@ -675,6 +743,38 @@ TEST_CASE("Type 4 helpers delegate APDUs to InDataExchange", "[pn532][exchange][
 
     const uint8_t expected[] = {PN532_COMMAND_INDATAEXCHANGE, PN532_COMMAND_INDATAEXCHANGE};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
+}
+
+TEST_CASE("InSelect and InDeselect reject the target-not-known status", "[pn532][status]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_STATUS_TARGET_NOT_KNOWN, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    /* InSelect with 0x27 stays a hard error: selecting a target the chip
+     * does not know must fail so the caller re-polls. */
+    TEST_ASSERT_FALSE(pn532_in_select(&pn532, 1));
+    TEST_ASSERT_FALSE(pn532.session_opened);
+
+    /* InDeselect/InRelease with 0x27 mean the chip already lost the target:
+     * mirror the NXP TAMA reference and close our session as a success so
+     * poll loops do not wedge (release also clears the listed target). */
+    mock_init(&mock, &pn532, MOCK_STATUS_TARGET_NOT_KNOWN, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+    TEST_ASSERT_TRUE(pn532_deselect_target(&pn532));
+    TEST_ASSERT_FALSE(pn532.session_opened);
+
+    mock_init(&mock, &pn532, MOCK_STATUS_TARGET_NOT_KNOWN, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+    TEST_ASSERT_TRUE(pn532_release_target(&pn532));
+    TEST_ASSERT_EQUAL_UINT8(0, pn532.inListedTag);
+    TEST_ASSERT_FALSE(pn532.session_opened);
 }
 
 TEST_CASE("in communicate thru requires an active target", "[pn532][thru]")
