@@ -58,3 +58,5 @@ dist/*
 build/*
 .vscode/c_cpp_properties.json
 .vscode/settings.json
+examples/simple/sdkconfig
+examples/simple/dependencies.lock

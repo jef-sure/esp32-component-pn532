@@ -654,6 +654,78 @@ TEST_CASE("NDEF orphan continuation chunk is rejected", "[pn532][ndef][chunk]")
     TEST_ASSERT_NULL(message);
 }
 
+TEST_CASE("APDU command parsing handles short cases and rejects malformed frames", "[pn532][apdu]")
+{
+    static const uint8_t case1[] = {0x00, 0xA4, 0x04, 0x00};
+    static const uint8_t case2s[] = {0x00, 0xCA, 0x00, 0x00, 0x10};
+    static const uint8_t case3s[] = {0x00, 0xD0, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03};
+    static const uint8_t case4s[] = {0x00, 0xD0, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x10};
+
+    pn532_apdu_command_t cmd;
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case1, sizeof(case1), &cmd));
+    TEST_ASSERT_EQUAL_UINT8(0x00, cmd.cla);
+    TEST_ASSERT_EQUAL_UINT8(0xA4, cmd.ins);
+    TEST_ASSERT_EQUAL_UINT8(0x04, cmd.p1);
+    TEST_ASSERT_EQUAL_UINT8(0x00, cmd.p2);
+    TEST_ASSERT_FALSE(cmd.has_le);
+    TEST_ASSERT_EQUAL(0, cmd.data_len);
+
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case2s, sizeof(case2s), &cmd));
+    TEST_ASSERT_TRUE(cmd.has_le);
+    TEST_ASSERT_EQUAL(16u, cmd.le);
+
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case3s, sizeof(case3s), &cmd));
+    TEST_ASSERT_EQUAL(3u, cmd.data_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, cmd.data, 3);
+
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case4s, sizeof(case4s), &cmd));
+    TEST_ASSERT_TRUE(cmd.has_le);
+    TEST_ASSERT_EQUAL(16u, cmd.le);
+
+    static const uint8_t too_short[] = {0x00, 0xA4, 0x04};
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_apdu_parse_command(too_short, sizeof(too_short), &cmd));
+
+    static const uint8_t bad_lc[] = {0x00, 0xD0, 0x00, 0x00, 0x05, 0x01, 0x02};
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_apdu_parse_command(bad_lc, sizeof(bad_lc), &cmd));
+
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_apdu_parse_command(NULL, 0, &cmd));
+}
+
+TEST_CASE("APDU response parsing and building preserve data and status word", "[pn532][apdu]")
+{
+    static const uint8_t raw[] = {0x01, 0x02, 0x03, 0x90, 0x00};
+    pn532_apdu_response_t resp;
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_response(raw, sizeof(raw), &resp));
+    TEST_ASSERT_EQUAL(3u, resp.data_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, resp.data, 3);
+    TEST_ASSERT_EQUAL_UINT8(0x90, resp.sw1);
+    TEST_ASSERT_EQUAL_UINT8(0x00, resp.sw2);
+
+    uint8_t out[16];
+    size_t  out_len = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_build_response(out, sizeof(out), raw, 3, 0x90, 0x00, &out_len));
+    TEST_ASSERT_EQUAL(5u, out_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(raw, out, 5);
+
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_apdu_build_response(out, 4, raw, 3, 0x90, 0x00, &out_len));
+}
+
+TEST_CASE("ISO-DEP helpers validate target state and delegate to existing exchange path", "[pn532][apdu]")
+{
+    pn532_t pn532 = {0};
+    pn532_uid_t uid = {0};
+
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_iso_dep_connect(NULL, &uid));
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_iso_dep_connect(&pn532, NULL));
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_iso_dep_disconnect(NULL));
+
+    uint8_t tx[16] = {0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
+    uint8_t rx[32] = {0};
+    size_t  rx_len = 0;
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_iso_dep_transceive(NULL, tx, sizeof(tx), rx, sizeof(rx), &rx_len, 0));
+    TEST_ASSERT_NOT_EQUAL(ESP_OK, pn532_iso_dep_transceive(&pn532, tx, sizeof(tx), NULL, sizeof(rx), &rx_len, 0));
+}
+
 void app_main(void)
 {
     unity_run_menu();

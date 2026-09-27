@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.4.0 - 2026-09-27
+
+- Added a zero-copy ISO 7816-4 short APDU API: command parsing for cases 1, 2S, 3S, and 4S, response parsing, response construction, and common status-word constants.
+- Added `pn532_iso_dep_connect()`, `pn532_iso_dep_transceive()`, and `pn532_iso_dep_disconnect()` as thin convenience wrappers over the existing selected-target state and PN532 `InDataExchange` path.
+- Documented Type 4 NDEF reading, raw APDU exchange with status-word handling, and APDU inspection before transfer.
+- Correctly convert the ISO-DEP exchange timeout from FreeRTOS ticks to milliseconds before passing it to the existing PN532 timeout path.
+
 ## v 0.3.2 - 2026-09-27
 
 - Documentation only: expanded the README with I2C and UART setup snippets, a complete MIFARE Classic read cycle (poll, select, key-A auth, data blocks, release), a Type 4 ISO-DEP example (NDEF AID, file select, READ BINARY), a full NTAG URI write cycle, `GetGeneralStatus` and `InCommunicateThru` usage examples, a troubleshooting section, and the ESP Component Registry badge.
