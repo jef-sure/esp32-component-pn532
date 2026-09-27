@@ -825,14 +825,30 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
             break;
         }
 
-        size_t payload_len = raw_response_len - 1;
+        const uint8_t *fragment    = raw_response + 1;
+        size_t         payload_len = raw_response_len - 1;
+        bool           nad_present = (raw_response[0] & PN532_STATUS_NAD_MASK) != 0;
+        if (nad_present) {
+            /* NXP phTalTama_Transceive(): when the status carries NAD (0x80)
+             * the first payload byte is the node address, not card data. We
+             * never negotiate NAD (no SetTamaParameters), but a target that
+             * sends it anyway must not shift the caller's payload. */
+            if (payload_len == 0) {
+                ESP_LOGE(TAG, "pn532_in_data_exchange: NAD flag with empty payload");
+                exchange_failed = true;
+                break;
+            }
+            fragment++;
+            payload_len--;
+        }
+
         if (raw_cursor != NULL && payload_len > 0) {
             if (total_payload + payload_len > raw_capacity) {
                 capacity_exceeded = true;
                 total_payload += payload_len;
                 break;
             }
-            memcpy(raw_cursor, raw_response + 1, payload_len);
+            memcpy(raw_cursor, fragment, payload_len);
             raw_cursor += payload_len;
         }
         total_payload += payload_len;
@@ -853,6 +869,11 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
                                size_t *response_len, uint16_t timeout)
 {
     if (pn532 == NULL || data == NULL || data_len == 0 || data_len + 1 > PN532_MAX_BUF_SIZE) {
+        return false;
+    }
+
+    if (pn532->inListedTag == 0) {
+        ESP_LOGE(TAG, "pn532_in_communicate_thru: no target selected");
         return false;
     }
 
@@ -898,14 +919,26 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
             break;
         }
 
-        size_t payload_len = raw_response_len - 1;
+        const uint8_t *fragment    = raw_response + 1;
+        size_t         payload_len = raw_response_len - 1;
+        if ((raw_response[0] & PN532_STATUS_NAD_MASK) != 0) {
+            /* Same NAD handling as pn532_in_data_exchange(); see there. */
+            if (payload_len == 0) {
+                ESP_LOGE(TAG, "pn532_in_communicate_thru: NAD flag with empty payload");
+                exchange_failed = true;
+                break;
+            }
+            fragment++;
+            payload_len--;
+        }
+
         if (raw_cursor != NULL && payload_len > 0) {
             if (total_payload + payload_len > raw_capacity) {
                 capacity_exceeded = true;
                 total_payload += payload_len;
                 break;
             }
-            memcpy(raw_cursor, raw_response + 1, payload_len);
+            memcpy(raw_cursor, fragment, payload_len);
             raw_cursor += payload_len;
         }
         total_payload += payload_len;

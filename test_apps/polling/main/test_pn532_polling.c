@@ -16,7 +16,8 @@ typedef enum
     MOCK_ACK_TIMEOUT,
     MOCK_PENDING_RESPONSE,
     MOCK_EXCHANGE_MI,
-    MOCK_COMMUNICATE_THRU
+    MOCK_COMMUNICATE_THRU,
+    MOCK_EXCHANGE_NAD
 } mock_mode_t;
 
 typedef struct
@@ -164,6 +165,14 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
             mock->mi_round++;
         }
         mock_response_frame(mock->current_command, payload, payload_sz, buffer, len);
+        return true;
+    }
+
+    if (mock->mode == MOCK_EXCHANGE_NAD && mock->current_command == PN532_COMMAND_INDATAEXCHANGE) {
+        /* Status 0x80 = NAD present: the first payload byte (0x77) is the
+         * node address and must be stripped from the caller's payload. */
+        static const uint8_t nad[] = {0x80, 0x77, 0x10, 0x20};
+        mock_response_frame(mock->current_command, nad, sizeof(nad), buffer, len);
         return true;
     }
 
@@ -559,6 +568,43 @@ TEST_CASE("in communicate thru forwards raw bits and drains MI", "[pn532][thru]"
 
     const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU, PN532_COMMAND_INCOMMUNICATETHRU};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
+}
+
+TEST_CASE("NAD byte is stripped from exchange payload", "[pn532][exchange][nad]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_EXCHANGE_NAD, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    uint8_t rx[16];
+    size_t  rx_len = sizeof(rx);
+    /* Status 0x80 = NAD present; payload {0x77, 0x10, 0x20} must surface as
+     * {0x10, 0x20} with the node-address byte consumed. */
+    TEST_ASSERT_TRUE(pn532_in_data_exchange(&pn532, (const uint8_t *)"\x30\x00", 2, rx, &rx_len, 100));
+    TEST_ASSERT_EQUAL(2, rx_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x10, 0x20}), rx, 2);
+    TEST_ASSERT_TRUE(pn532.session_opened);
+}
+
+TEST_CASE("in communicate thru requires an active target", "[pn532][thru]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_COMMUNICATE_THRU, send_buf, recv_buf);
+    pn532.inListedTag = 0;
+
+    uint8_t rx[16];
+    size_t  rx_len = sizeof(rx);
+    /* No listed target: the call must fail locally without touching the bus,
+     * instead of burning an RF timeout. */
+    TEST_ASSERT_FALSE(pn532_in_communicate_thru(&pn532, (const uint8_t *)"\xE0", 1, rx, &rx_len, 100));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
 }
 
 TEST_CASE("NDEF CF chunks are assembled into one logical record", "[pn532][ndef][chunk]")

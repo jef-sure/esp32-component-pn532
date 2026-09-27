@@ -1,5 +1,10 @@
 # Changelog
 
+## v 0.3.1 - 2026-09-27
+
+- Stripped the NAD byte from `InDataExchange` and `InCommunicateThru` responses when the status byte carries NAD (0x80), matching `phTalTama_Transceive()`. The driver never negotiates NAD, but a target sending it anyway no longer shifts the caller's payload by one byte. A NAD flag with an empty payload is rejected as a protocol error.
+- `pn532_in_communicate_thru()` now fails fast with "no target selected" instead of burning an RF timeout when no target is listed.
+
 ## v 0.3.0 - 2026-09-27
 
 - Added `pn532_in_communicate_thru()` exposing the InCommunicateThru command (0x42): raw ISO14443 bit exchange with the currently activated target, without the DEP/MIFARE wrapping of InDataExchange. MI-chained raw replies are drained and concatenated; the API bump marks the new public raw-exchange surface.
