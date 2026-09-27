@@ -433,6 +433,45 @@ uint32_t pn532_get_firmware_version(pn532_t *pn532)
     return ((uint32_t)response[0] << 24) | ((uint32_t)response[1] << 16) | ((uint32_t)response[2] << 8) | response[3];
 }
 
+bool pn532_get_general_status(pn532_t *pn532, pn532_general_status_t *status)
+{
+    if (pn532 == NULL || status == NULL) {
+        return false;
+    }
+
+    uint8_t response[16];
+    size_t  response_len = sizeof(response);
+    if (!pn532_execute_command(pn532, PN532_COMMAND_GETGENERALSTATUS, NULL, 0, response, &response_len,
+                               (uint16_t)pn532->timeout_ms)) {
+        return false;
+    }
+
+    /* UM0701-02 §7.3.2 General Status: error byte, field presence, number of
+     * targets, logical target bitmask, then three 2-byte target bitmasks
+     * (ISO14443-4 activation, CID, NAD). Parse defensively so a shorter
+     * firmware reply still fills the fixed leading fields. */
+    memset(status, 0, sizeof(*status));
+    if (response_len < 4) {
+        ESP_LOGE(TAG, "pn532_get_general_status: truncated status (%u bytes)", (unsigned)response_len);
+        return false;
+    }
+
+    status->error           = response[0];
+    status->field_present   = (response[1] & 0x01) != 0;
+    status->targets_count   = response[2];
+    status->logical_targets = response[3];
+    if (response_len >= 6) {
+        status->iso14443_4_mask = (uint16_t)response[4] | ((uint16_t)response[5] << 8);
+    }
+    if (response_len >= 8) {
+        status->cid_mask = (uint16_t)response[6] | ((uint16_t)response[7] << 8);
+    }
+    if (response_len >= 10) {
+        status->nad_mask = (uint16_t)response[8] | ((uint16_t)response[9] << 8);
+    }
+    return true;
+}
+
 bool pn532_reset(pn532_t *pn532)
 {
     if (pn532_gpio_is_valid(pn532->rst)) {

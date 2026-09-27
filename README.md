@@ -327,6 +327,7 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - Transport and device lifecycle: `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_init()`, `pn532_deinit()`, `pn532_reset()`, `pn532_recover()`
 - RF field control: `pn532_set_rf_field()`, `pn532_set_rf_on()`, `pn532_set_rf_off()`, `pn532_set_rf_settle_delay()`
 - Retry tuning and raw commands: `pn532_set_max_retries()`, `pn532_set_passive_activation_retries()`, `pn532_set_ack_timeout()`, `pn532_execute_command()`
+- Diagnostics: `pn532_get_firmware_version()`, `pn532_get_general_status()`
 - Poll, select, and auth: `pn532_14443_get_all_uids_ex()`, `pn532_14443_get_all_uids()`, `pn532_release_target()`, `pn532_deselect_target()`, `pn532_14443_select_by_uid()`, `pn532_14443_authenticate()`
 - Selected-tag block access: `pn532_14443_block_read()`, `pn532_14443_block_write()`
 - Card metadata: `pn532_14443_detect_card_type_and_capacity()`, `pn532_14443_detect_selected_card_type_and_capacity()`

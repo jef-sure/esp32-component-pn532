@@ -1,5 +1,9 @@
 # Changelog
 
+## v 0.2.2 - 2026-09-27
+
+- Added `pn532_get_general_status()` exposing the GetGeneralStatus command (0x04): decoded error code, external RF field presence, detected target count, and the logical target / ISO14443-4 activation / CID / NAD bitmasks, mirroring the NXP TAL `PHHALNFC_IOCTL_PN53X_GET_STATUS` diagnostics probe.
+
 ## v 0.2.1 - 2026-09-27
 
 - Implemented MI (More Information) chaining in `pn532_in_data_exchange()`, mirroring `phTalTama_Transceive()`: when the status byte carries MI (0x40) the exchange is re-issued and payload fragments are concatenated until a non-MI status terminates the chain. Chains that never terminate are cut off after 64 rounds and drop the session so the next exchange re-selects the target.

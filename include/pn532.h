@@ -233,6 +233,34 @@ bool pn532_recover(pn532_t *pn532);
  */
 uint32_t pn532_get_firmware_version(pn532_t *pn532);
 
+/** @brief Decoded payload of the GetGeneralStatus command (UM0701-02 §7.3.2). */
+typedef struct
+{
+    uint8_t  error;           /**< Last error code seen by the PN532 firmware. */
+    bool     field_present;   /**< External RF field presence (bit 0). */
+    uint8_t  targets_count;   /**< Number of targets currently detected. */
+    uint8_t  logical_targets; /**< Bitmask of logical targets (b7..b2 = Tg 3..1). */
+    uint16_t iso14443_4_mask; /**< Bitmask of activated ISO14443-4 targets. */
+    uint16_t cid_mask;        /**< Bitmask of targets using a CID. */
+    uint16_t nad_mask;        /**< Bitmask of targets using NAD. */
+} pn532_general_status_t;
+
+/**
+ * @brief Read the PN532 general status (GetGeneralStatus, command 0x04).
+ *
+ * Surfaces the chip-side diagnostics the NXP TAL exposes through
+ * PHHALNFC_IOCTL_PN53X_GET_STATUS: the last firmware error code, external RF
+ * field presence, the number of detected targets, and the logical target /
+ * ISO14443-4 activation / CID / NAD bitmasks. Useful as a cheap health probe
+ * after transport failures or to inspect what the PN532 still holds listed
+ * without recycling the field.
+ *
+ * @param pn532 Device context.
+ * @param status Output structure filled on success.
+ * @return true when the status frame was received and decoded.
+ */
+bool pn532_get_general_status(pn532_t *pn532, pn532_general_status_t *status);
+
 /** @brief Turn the RF field on or off through RFConfiguration item 0x01. */
 bool pn532_set_rf_field(pn532_t *pn532, bool enabled);
 
