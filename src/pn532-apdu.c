@@ -72,6 +72,11 @@ esp_err_t pn532_apdu_parse_response(const uint8_t *buffer, size_t length, pn532_
     return ESP_OK;
 }
 
+uint16_t pn532_apdu_get_status(const pn532_apdu_response_t *response)
+{
+    return response == NULL ? 0u : (uint16_t)(((uint16_t)response->sw1 << 8) | response->sw2);
+}
+
 esp_err_t pn532_apdu_build_response(uint8_t *buffer, size_t buffer_size, const uint8_t *data, size_t data_len,
                                     uint8_t sw1, uint8_t sw2, size_t *response_len)
 {

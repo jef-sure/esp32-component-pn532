@@ -493,21 +493,21 @@ bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t fi
     if (!pn532_14443_4_transceive(pn532, apdu, 5u + file_id_len, rx, &rx_len)) {
         return false;
     }
-    if (rx_len < 2) {
+
+    pn532_apdu_response_t response;
+    if (pn532_apdu_parse_response(rx, rx_len, &response) != ESP_OK) {
         return false;
     }
-    uint8_t sw1 = rx[rx_len - 2];
-    uint8_t sw2 = rx[rx_len - 1];
-    if (sw1 == 0x90 && sw2 == 0x00) {
+    if (pn532_apdu_get_status(&response) == PN532_APDU_SW_SUCCESS) {
         return true;
     }
-    ESP_LOGD(TAG_T4, "SELECT failed SW=%02X%02X", sw1, sw2);
+    ESP_LOGD(TAG_T4, "SELECT failed SW=%02X%02X", response.sw1, response.sw2);
     return false;
 }
 
 bool pn532_14443_4_read_binary(pn532_t *pn532, uint16_t offset, uint8_t le, uint8_t *buffer, size_t *got)
 {
-    if (pn532 == NULL || buffer == NULL || got == NULL || le == 0) {
+    if (pn532 == NULL || buffer == NULL || got == NULL) {
         return false;
     }
 
@@ -523,21 +523,21 @@ bool pn532_14443_4_read_binary(pn532_t *pn532, uint16_t offset, uint8_t le, uint
     if (!pn532_14443_4_transceive(pn532, apdu, sizeof(apdu), rx, &rx_len)) {
         return false;
     }
-    if (rx_len < 2) {
+
+    pn532_apdu_response_t response;
+    if (pn532_apdu_parse_response(rx, rx_len, &response) != ESP_OK) {
         return false;
     }
-    uint8_t sw1 = rx[rx_len - 2];
-    uint8_t sw2 = rx[rx_len - 1];
-    if (sw1 != 0x90 || sw2 != 0x00) {
-        ESP_LOGD(TAG_T4, "READ BINARY @0x%04X len=%u SW=%02X%02X", offset, le, sw1, sw2);
+    if (pn532_apdu_get_status(&response) != PN532_APDU_SW_SUCCESS) {
+        ESP_LOGD(TAG_T4, "READ BINARY @0x%04X len=%u SW=%02X%02X", offset, le, response.sw1, response.sw2);
         return false;
     }
 
-    size_t data_len = rx_len - 2;
+    size_t data_len = response.data_len;
     if (data_len > *got) {
         data_len = *got;
     }
-    memcpy(buffer, rx, data_len);
+    memcpy(buffer, response.data, data_len);
     *got = data_len;
     return true;
 }

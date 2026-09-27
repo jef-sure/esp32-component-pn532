@@ -17,7 +17,8 @@ typedef enum
     MOCK_PENDING_RESPONSE,
     MOCK_EXCHANGE_MI,
     MOCK_COMMUNICATE_THRU,
-    MOCK_EXCHANGE_NAD
+    MOCK_EXCHANGE_NAD,
+    MOCK_TYPE4_APDU
 } mock_mode_t;
 
 typedef struct
@@ -173,6 +174,12 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
          * node address and must be stripped from the caller's payload. */
         static const uint8_t nad[] = {0x80, 0x77, 0x10, 0x20};
         mock_response_frame(mock->current_command, nad, sizeof(nad), buffer, len);
+        return true;
+    }
+
+    if (mock->mode == MOCK_TYPE4_APDU && mock->current_command == PN532_COMMAND_INDATAEXCHANGE) {
+        static const uint8_t apdu_response[] = {0x00, 0x01, 0x02, 0x03, 0x90, 0x00};
+        mock_response_frame(mock->current_command, apdu_response, sizeof(apdu_response), buffer, len);
         return true;
     }
 
@@ -615,6 +622,61 @@ TEST_CASE("ISO-DEP exchange enforces the PN532 host frame size", "[pn532][exchan
     TEST_ASSERT_EQUAL(1u, mock.command_count);
 }
 
+TEST_CASE("ISO-DEP exchange uses the existing selected-target lifecycle", "[pn532][exchange][apdu]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+
+    static const uint8_t apdu[] = {0x00, 0xCA, 0x00, 0x00, 0x10};
+    uint8_t response[1];
+    size_t  response_len = sizeof(response);
+
+    TEST_ASSERT_FALSE(pn532_14443_4_transceive(&pn532, apdu, sizeof(apdu), response, &response_len));
+    TEST_ASSERT_EQUAL(0u, mock.command_count);
+
+    pn532.inListedTag = 1;
+    response_len = sizeof(response);
+    TEST_ASSERT_TRUE(pn532_14443_4_transceive(&pn532, apdu, sizeof(apdu), response, &response_len));
+    TEST_ASSERT_TRUE(pn532.session_opened);
+    const uint8_t first_exchange[] = {PN532_COMMAND_INSELECT, PN532_COMMAND_INDATAEXCHANGE};
+    assert_commands(&mock, first_exchange, ARRAY_SIZE(first_exchange));
+
+    response_len = sizeof(response);
+    TEST_ASSERT_TRUE(pn532_14443_4_transceive(&pn532, apdu, sizeof(apdu), response, &response_len));
+    const uint8_t repeated_exchange[] = {
+        PN532_COMMAND_INSELECT,
+        PN532_COMMAND_INDATAEXCHANGE,
+        PN532_COMMAND_INDATAEXCHANGE,
+    };
+    assert_commands(&mock, repeated_exchange, ARRAY_SIZE(repeated_exchange));
+}
+
+TEST_CASE("Type 4 helpers delegate APDUs to InDataExchange", "[pn532][exchange][apdu]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_TYPE4_APDU, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    static const uint8_t file_id[] = {0xE1, 0x03};
+    TEST_ASSERT_TRUE(pn532_14443_4_select_file(&pn532, file_id, sizeof(file_id)));
+
+    uint8_t data[3];
+    size_t  data_len = sizeof(data);
+    TEST_ASSERT_TRUE(pn532_14443_4_read_binary(&pn532, 0, sizeof(data), data, &data_len));
+    TEST_ASSERT_EQUAL(3u, data_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, data, data_len);
+
+    const uint8_t expected[] = {PN532_COMMAND_INDATAEXCHANGE, PN532_COMMAND_INDATAEXCHANGE};
+    assert_commands(&mock, expected, ARRAY_SIZE(expected));
+}
+
 TEST_CASE("in communicate thru requires an active target", "[pn532][thru]")
 {
     mock_bus_t mock;
@@ -746,6 +808,7 @@ TEST_CASE("APDU response parsing and building preserve data and status word", "[
     TEST_ASSERT_EQUAL_PTR(status_only, response.data);
     TEST_ASSERT_EQUAL(0u, response.data_len);
     TEST_ASSERT_EQUAL_HEX16(PN532_APDU_SW_SUCCESS, pn532_apdu_get_status(&response));
+    TEST_ASSERT_EQUAL_HEX16(0, pn532_apdu_get_status(NULL));
 
     static const uint8_t raw[] = {0x01, 0x02, 0x03, 0x6A, 0x86};
     TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_response(raw, sizeof(raw), &response));

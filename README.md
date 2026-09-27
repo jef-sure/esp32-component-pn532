@@ -51,6 +51,15 @@ Application
 
 `pn532_apdu_parse_command()` supports short APDU cases 1, 2S, 3S, and 4S. `pn532_apdu_parse_response()` separates response data from SW1/SW2, while `pn532_apdu_build_response()` writes `DATA SW1 SW2` into a caller-provided buffer. These helpers do not access PN532 hardware, allocate memory, or depend on a transport. Parsed data pointers refer directly to the caller-owned input buffer. Extended-length APDUs are not supported.
 
+The ISO-DEP lifecycle is:
+
+1. Poll for a target and call `pn532_14443_select_by_uid()` to select it. A successful `InSelect` starts the session.
+2. Call `pn532_14443_4_transceive()` repeatedly while the target remains selected. It does not poll or select by UID. If the target is still listed but the session was deselected, it automatically issues `InSelect` for that target number before the exchange.
+3. End the session with `pn532_deselect_target()`, `pn532_release_target()`, or `pn532_set_rf_off()`. Deselect keeps the target listed; release and RF off invalidate it.
+4. After target loss, RF timeout, or `pn532_recover()`, reacquire the card through polling and `pn532_14443_select_by_uid()` before continuing. A transceive with no listed target fails without starting a new discovery.
+
+`pn532_14443_4_select_file()` and `pn532_14443_4_read_binary()` are convenience wrappers that construct their APDUs and delegate exchange to `pn532_14443_4_transceive()`; they do not implement a separate ISO-DEP path. In `pn532_14443_4_read_binary()`, encoded `Le = 0` requests the short-APDU maximum of 256 bytes.
+
 ## Requirements
 
 - ESP-IDF `>=5.2.0`
@@ -237,7 +246,7 @@ Notes:
 
 ### Exchange APDUs with a Type 4 card
 
-This example assumes that polling returned a `pn532_uid_t *uid` as shown above. The command and response parsers are optional utilities; the exchange still goes directly through `pn532_14443_4_transceive()`.
+The command and response parsers are optional utilities; the exchange still goes directly through `pn532_14443_4_transceive()`.
 
 ```c
 static const uint8_t select_ndef[] = {
@@ -245,24 +254,41 @@ static const uint8_t select_ndef[] = {
     0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01,
 };
 
-pn532_apdu_command_t command;
-if (pn532_apdu_parse_command(select_ndef, sizeof(select_ndef), &command) == ESP_OK &&
-    pn532_14443_select_by_uid(pn532, uid)) {
-    uint8_t response_buffer[128];
-    size_t response_len = sizeof(response_buffer);
+pn532_poll_status_t poll_status;
+pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(pn532, &poll_status);
+if (poll_status == PN532_POLL_FOUND && uids->uids_count > 0) {
+    pn532_apdu_command_t command;
+    if (pn532_apdu_parse_command(select_ndef, sizeof(select_ndef), &command) == ESP_OK &&
+        pn532_14443_select_by_uid(pn532, &uids->uids[0])) {
+        uint8_t response_buffer[128];
+        size_t response_len = sizeof(response_buffer);
 
-    if (pn532_14443_4_transceive(pn532, select_ndef, sizeof(select_ndef),
-                                 response_buffer, &response_len)) {
-        pn532_apdu_response_t response;
-        if (pn532_apdu_parse_response(response_buffer, response_len, &response) == ESP_OK) {
-            if (pn532_apdu_get_status(&response) == PN532_APDU_SW_SUCCESS) {
+        if (pn532_14443_4_transceive(pn532, select_ndef, sizeof(select_ndef),
+                                     response_buffer, &response_len)) {
+            pn532_apdu_response_t response;
+            if (pn532_apdu_parse_response(response_buffer, response_len, &response) == ESP_OK &&
+                pn532_apdu_get_status(&response) == PN532_APDU_SW_SUCCESS) {
                 /* response.data points into response_buffer; no allocation is made. */
             }
         }
+        pn532_release_target(pn532);
     }
-    pn532_release_target(pn532);
 }
+free(uids);
 pn532_set_rf_off(pn532);
+```
+
+The command parser can also be used without a PN532 device:
+
+```c
+static const uint8_t command_bytes[] = {
+    0x00, 0xD0, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x10,
+};
+pn532_apdu_command_t command;
+
+if (pn532_apdu_parse_command(command_bytes, sizeof(command_bytes), &command) == ESP_OK) {
+    /* Case 4S: command.data points at {0x01, 0x02, 0x03}; Le is 16. */
+}
 ```
 
 ## Two PN532 Devices On One SPI Bus

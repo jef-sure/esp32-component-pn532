@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.4.2 - 2026-09-27
+
+- Documented the ISO-DEP lifecycle explicitly: poll, select, repeated APDU exchange, and release/deselect, including automatic `InSelect` when a listed target remains but its session is closed.
+- Made `pn532_apdu_get_status()` a regular exported function and aligned all APDU helper declarations, definitions, tests, and README examples on the `esp_err_t` contract.
+- Reused the common response APDU parser in the Type 4 SELECT FILE and READ BINARY helpers; encoded short `Le = 0` now requests 256 bytes.
+- Added regression coverage for ISO-DEP session reuse, Type 4 helper delegation through `InDataExchange`, APDU frame-size limits, parser edge cases, and response-builder capacity checks.
+
 ## v 0.4.1 - 2026-09-27
 
 - Finalized the transport-independent ISO 7816-4 utility API with `esp_err_t` parser/builder results, zero-copy command and response data, decoded short `Le = 0` semantics, and `pn532_apdu_get_status()`.

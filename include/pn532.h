@@ -498,7 +498,9 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
  * @brief Exchange one ISO14443-4 APDU with the currently selected Type 4 target.
  *
  * The PN532 firmware handles RATS, PCB toggling, WTX, and chaining internally;
- * callers provide only raw APDU bytes.
+ * callers provide only raw APDU bytes. Select a target first with
+ * pn532_14443_select_by_uid(). If a listed target remains but its session was
+ * deselected, this function issues InSelect before exchanging the APDU.
  *
  * @param apdu Command APDU payload.
  * @param apdu_len Command length in bytes. The PN532 target byte and extended
@@ -543,21 +545,29 @@ typedef struct
  *
  * Supports cases 1, 2S, 3S, and 4S. Extended-length APDUs are rejected. The
  * data member points into buffer and remains valid only while buffer is valid.
+ *
+ * @return ESP_OK on success, ESP_ERR_NOT_SUPPORTED for an extended-length
+ *         APDU, or ESP_ERR_INVALID_ARG for invalid or malformed input.
  */
 esp_err_t pn532_apdu_parse_command(const uint8_t *buffer, size_t length, pn532_apdu_command_t *command);
 
-/** @brief Build a response APDU as [data...][SW1][SW2] in caller-owned memory. */
+/**
+ * @brief Build a response APDU as [data...][SW1][SW2] in caller-owned memory.
+ * @return ESP_OK on success, ESP_ERR_NO_MEM when buffer is too small, or
+ *         ESP_ERR_INVALID_ARG for invalid arguments.
+ */
 esp_err_t pn532_apdu_build_response(uint8_t *buffer, size_t buffer_size, const uint8_t *data, size_t data_len,
                                     uint8_t sw1, uint8_t sw2, size_t *response_len);
 
-/** @brief Parse a response APDU in caller-owned memory without allocation. */
+/**
+ * @brief Parse a response APDU in caller-owned memory without allocation.
+ * @return ESP_OK on success or ESP_ERR_INVALID_ARG when fewer than two bytes
+ *         are available or an argument is NULL.
+ */
 esp_err_t pn532_apdu_parse_response(const uint8_t *buffer, size_t length, pn532_apdu_response_t *response);
 
-/** @brief Return SW1 and SW2 as a single 16-bit status word. */
-static inline uint16_t pn532_apdu_get_status(const pn532_apdu_response_t *response)
-{
-    return response == NULL ? 0u : (uint16_t)(((uint16_t)response->sw1 << 8) | response->sw2);
-}
+/** @brief Return SW1 and SW2 as a single 16-bit status word, or 0 for NULL. */
+uint16_t pn532_apdu_get_status(const pn532_apdu_response_t *response);
 
 /** @brief Issue ISO-DEP SELECT FILE by AID or file identifier. */
 bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len);
@@ -566,7 +576,7 @@ bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t fi
  * @brief Issue ISO-DEP READ BINARY on the currently selected file.
  *
  * @param offset File offset to read from.
- * @param le Requested byte count.
+ * @param le Encoded short Le; 0 requests 256 bytes.
  * @param buffer Output buffer.
  * @param got In: buffer capacity. Out: actual bytes returned.
  */
