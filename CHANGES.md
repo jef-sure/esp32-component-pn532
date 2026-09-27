@@ -1,5 +1,9 @@
 # Changelog
 
+## v 0.4.4 - 2026-09-27
+
+- Fixed the stale-handle class in `pn532_in_deselect()`: the `0x27` (target not known) branch closed only `session_opened` while keeping `inListedTag`, so a later `pn532_14443_4_transceive()` would retry the auto-`InSelect` against a target the chip no longer knows — the same stale-target wedge already fixed for the RF-timeout path. The `0x27` branch now clears both fields; the normal `0x00` path still keeps the target listed for reactivation. Regression coverage extended to assert the cleared handle, and the README lifecycle wording now scopes the listed-target guarantee to the success path.
+
 ## v 0.4.3 - 2026-09-27
 
 - Fixed targeted `InListPassiveTarget` activation for cascaded UIDs (UM0701-02 §7.3.5): the InitiatorData now carries the cascade tag `0x88` in front of every cascade level except the last, instead of passing the raw 7/10-byte UID. Single-level 4-byte UIDs are unchanged, and the caller-owned `pn532_uid_t` is no longer mutated while building the frame.

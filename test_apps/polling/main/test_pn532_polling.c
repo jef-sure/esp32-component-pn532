@@ -762,12 +762,14 @@ TEST_CASE("InSelect and InDeselect reject the target-not-known status", "[pn532]
 
     /* InDeselect/InRelease with 0x27 mean the chip already lost the target:
      * mirror the NXP TAMA reference and close our session as a success so
-     * poll loops do not wedge (release also clears the listed target). */
+     * poll loops do not wedge; both also clear the stale listed handle so
+     * a later auto-InSelect cannot hit 0x27 forever. */
     mock_init(&mock, &pn532, MOCK_STATUS_TARGET_NOT_KNOWN, send_buf, recv_buf);
     pn532.inListedTag    = 1;
     pn532.session_opened = true;
     TEST_ASSERT_TRUE(pn532_deselect_target(&pn532));
     TEST_ASSERT_FALSE(pn532.session_opened);
+    TEST_ASSERT_EQUAL_UINT8(0, pn532.inListedTag);
 
     mock_init(&mock, &pn532, MOCK_STATUS_TARGET_NOT_KNOWN, send_buf, recv_buf);
     pn532.inListedTag    = 1;

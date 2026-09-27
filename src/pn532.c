@@ -1028,10 +1028,15 @@ bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number)
     /* UM0701-02 §7.3.6: InDeselect returns 0x00 on success; 0x27 means the
      * target is not attributed anymore. Like the NXP TAMA reference (which
      * closes the session on both 0x00 and 0x27), a target the chip already
-     * lost is deselected as far as we are concerned: clear the local state
-     * and succeed. Other non-zero statuses are errors. */
+     * lost is deselected as far as we are concerned. Unlike the 0x00 path —
+     * where the chip keeps the target listed for reactivation — 0x27 means
+     * the handle is gone on the chip side too, so our inListedTag must not
+     * survive; a stale handle would make every later auto-InSelect fail
+     * with 0x27 (our InSelect, unlike TAL's connect, treats it as an
+     * error). Other non-zero statuses are errors. */
     if (status[0] == PN532_STATUS_TARGET_NOT_KNOWN) {
         ESP_LOGD(TAG, "pn532_in_deselect: target already lost (0x27)");
+        pn532->inListedTag    = 0;
         pn532->session_opened = false;
         return true;
     }

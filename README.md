@@ -55,7 +55,7 @@ The ISO-DEP lifecycle is:
 
 1. Poll for a target and call `pn532_14443_select_by_uid()` to select it. A successful `InSelect` starts the session.
 2. Call `pn532_14443_4_transceive()` repeatedly while the target remains selected. It does not poll or select by UID. If the target is still listed but the session was deselected, it automatically issues `InSelect` for that target number before the exchange.
-3. End the session with `pn532_deselect_target()`, `pn532_release_target()`, or `pn532_set_rf_off()`. Deselect keeps the target listed; release and RF off invalidate it. Deselect and release verify the returned status byte: `0x27` (target not known) means the chip already lost the target, and is treated as a successful close with local state cleanup — mirroring the NXP TAMA reference — so poll loops cannot wedge. Any other non-zero status fails, leaving the local state untouched. `pn532_in_select()` treats `0x27` as a hard error so callers re-poll.
+3. End the session with `pn532_deselect_target()`, `pn532_release_target()`, or `pn532_set_rf_off()`. On success (`0x00`) deselect keeps the target listed for reactivation; release and RF off invalidate it. Deselect and release verify the returned status byte: `0x27` (target not known) means the chip already lost the target, and is treated as a successful close that clears both the session and the listed-target state — mirroring the NXP TAMA reference — so poll loops cannot wedge. Any other non-zero status fails, leaving the local state untouched. `pn532_in_select()` treats `0x27` as a hard error so callers re-poll.
 4. After target loss, RF timeout, or `pn532_recover()`, reacquire the card through polling and `pn532_14443_select_by_uid()` before continuing. A transceive with no listed target fails without starting a new discovery.
 
 `pn532_14443_4_select_file()` and `pn532_14443_4_read_binary()` are convenience wrappers that construct their APDUs and delegate exchange to `pn532_14443_4_transceive()`; they do not implement a separate ISO-DEP path. In `pn532_14443_4_read_binary()`, encoded `Le = 0` requests the short-APDU maximum of 256 bytes.
@@ -363,7 +363,7 @@ The PN532 enters low-power after power-up and after PowerDown. Each transport im
 
 ### Soft deselect
 
-`pn532_deselect_target()` issues `InDeselect` (0x44): the card goes to HALT but stays listed inside the PN532, so a later select reactivates it without a field restart. Use `pn532_release_target()` when you are done with the card entirely. Both check the returned status byte per UM0701-02: `0x27` (target not known) closes the local session successfully like the NXP TAMA reference; other non-zero statuses fail.
+`pn532_deselect_target()` issues `InDeselect` (0x44): the card goes to HALT but stays listed inside the PN532, so a later select reactivates it without a field restart. Use `pn532_release_target()` when you are done with the card entirely. Both check the returned status byte per UM0701-02: `0x27` (target not known) closes the local session successfully and clears the listed-target handle like the NXP TAMA reference; other non-zero statuses fail.
 
 ## Read NDEF
 
