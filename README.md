@@ -246,7 +246,7 @@ static const uint8_t select_ndef[] = {
 };
 
 pn532_apdu_command_t command;
-if (pn532_apdu_parse_command(select_ndef, sizeof(select_ndef), &command) &&
+if (pn532_apdu_parse_command(select_ndef, sizeof(select_ndef), &command) == ESP_OK &&
     pn532_14443_select_by_uid(pn532, uid)) {
     uint8_t response_buffer[128];
     size_t response_len = sizeof(response_buffer);
@@ -254,7 +254,7 @@ if (pn532_apdu_parse_command(select_ndef, sizeof(select_ndef), &command) &&
     if (pn532_14443_4_transceive(pn532, select_ndef, sizeof(select_ndef),
                                  response_buffer, &response_len)) {
         pn532_apdu_response_t response;
-        if (pn532_apdu_parse_response(response_buffer, response_len, &response)) {
+        if (pn532_apdu_parse_response(response_buffer, response_len, &response) == ESP_OK) {
             if (pn532_apdu_get_status(&response) == PN532_APDU_SW_SUCCESS) {
                 /* response.data points into response_buffer; no allocation is made. */
             }

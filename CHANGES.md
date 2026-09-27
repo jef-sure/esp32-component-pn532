@@ -2,7 +2,7 @@
 
 ## v 0.4.1 - 2026-09-27
 
-- Finalized the transport-independent ISO 7816-4 utility API with `bool` parser/builder results, zero-copy command and response data, decoded short `Le = 0` semantics, and `pn532_apdu_get_status()`.
+- Finalized the transport-independent ISO 7816-4 utility API with `esp_err_t` parser/builder results, zero-copy command and response data, decoded short `Le = 0` semantics, and `pn532_apdu_get_status()`.
 - Moved APDU parsing and response construction into the standalone `pn532-apdu.c` module with no hardware access or dynamic allocation.
 - Removed the redundant `pn532_iso_dep_connect()`, `pn532_iso_dep_transceive()`, and `pn532_iso_dep_disconnect()` wrappers; `pn532_14443_4_transceive()` remains the single low-level ISO-DEP exchange API.
 - Expanded unit coverage for all short APDU cases, malformed and extended APDUs, NULL arguments, response status words, output capacity, and PN532 host-frame size boundaries.

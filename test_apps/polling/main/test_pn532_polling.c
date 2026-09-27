@@ -689,7 +689,7 @@ TEST_CASE("APDU command parsing handles short cases and rejects malformed frames
     static const uint8_t case4s_max[] = {0x00, 0xD0, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, 0x00};
 
     pn532_apdu_command_t command;
-    TEST_ASSERT_TRUE(pn532_apdu_parse_command(case1, sizeof(case1), &command));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case1, sizeof(case1), &command));
     TEST_ASSERT_EQUAL_UINT8(0x00, command.cla);
     TEST_ASSERT_EQUAL_UINT8(0xA4, command.ins);
     TEST_ASSERT_EQUAL_UINT8(0x04, command.p1);
@@ -698,82 +698,82 @@ TEST_CASE("APDU command parsing handles short cases and rejects malformed frames
     TEST_ASSERT_EQUAL(0, command.data_len);
     TEST_ASSERT_FALSE(command.has_le);
 
-    TEST_ASSERT_TRUE(pn532_apdu_parse_command(case2s, sizeof(case2s), &command));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case2s, sizeof(case2s), &command));
     TEST_ASSERT_NULL(command.data);
     TEST_ASSERT_TRUE(command.has_le);
     TEST_ASSERT_EQUAL_UINT16(16, command.le);
 
-    TEST_ASSERT_TRUE(pn532_apdu_parse_command(case2s_max, sizeof(case2s_max), &command));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case2s_max, sizeof(case2s_max), &command));
     TEST_ASSERT_TRUE(command.has_le);
     TEST_ASSERT_EQUAL_UINT16(256, command.le);
 
-    TEST_ASSERT_TRUE(pn532_apdu_parse_command(case3s, sizeof(case3s), &command));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case3s, sizeof(case3s), &command));
     TEST_ASSERT_EQUAL_PTR(&case3s[5], command.data);
     TEST_ASSERT_EQUAL(3u, command.data_len);
     TEST_ASSERT_FALSE(command.has_le);
     TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, command.data, 3);
 
-    TEST_ASSERT_TRUE(pn532_apdu_parse_command(case4s, sizeof(case4s), &command));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case4s, sizeof(case4s), &command));
     TEST_ASSERT_EQUAL_PTR(&case4s[5], command.data);
     TEST_ASSERT_TRUE(command.has_le);
     TEST_ASSERT_EQUAL_UINT16(16, command.le);
 
-    TEST_ASSERT_TRUE(pn532_apdu_parse_command(case4s_max, sizeof(case4s_max), &command));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case4s_max, sizeof(case4s_max), &command));
     TEST_ASSERT_TRUE(command.has_le);
     TEST_ASSERT_EQUAL_UINT16(256, command.le);
 
     static const uint8_t too_short[] = {0x00, 0xA4, 0x04};
-    TEST_ASSERT_FALSE(pn532_apdu_parse_command(too_short, sizeof(too_short), &command));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_command(too_short, sizeof(too_short), &command));
 
     static const uint8_t bad_lc[] = {0x00, 0xD0, 0x00, 0x00, 0x05, 0x01, 0x02};
-    TEST_ASSERT_FALSE(pn532_apdu_parse_command(bad_lc, sizeof(bad_lc), &command));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_command(bad_lc, sizeof(bad_lc), &command));
 
     static const uint8_t extra_byte[] = {0x00, 0xD0, 0x00, 0x00, 0x01, 0xAA, 0x10, 0xFF};
-    TEST_ASSERT_FALSE(pn532_apdu_parse_command(extra_byte, sizeof(extra_byte), &command));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_command(extra_byte, sizeof(extra_byte), &command));
 
     static const uint8_t extended[] = {0x00, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x01, 0xAA};
-    TEST_ASSERT_FALSE(pn532_apdu_parse_command(extended, sizeof(extended), &command));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, pn532_apdu_parse_command(extended, sizeof(extended), &command));
 
-    TEST_ASSERT_FALSE(pn532_apdu_parse_command(NULL, 0, &command));
-    TEST_ASSERT_FALSE(pn532_apdu_parse_command(case1, sizeof(case1), NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_command(NULL, 0, &command));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_command(case1, sizeof(case1), NULL));
 }
 
 TEST_CASE("APDU response parsing and building preserve data and status word", "[pn532][apdu]")
 {
     static const uint8_t status_only[] = {0x90, 0x00};
     pn532_apdu_response_t response;
-    TEST_ASSERT_TRUE(pn532_apdu_parse_response(status_only, sizeof(status_only), &response));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_response(status_only, sizeof(status_only), &response));
     TEST_ASSERT_EQUAL_PTR(status_only, response.data);
     TEST_ASSERT_EQUAL(0u, response.data_len);
     TEST_ASSERT_EQUAL_HEX16(PN532_APDU_SW_SUCCESS, pn532_apdu_get_status(&response));
 
     static const uint8_t raw[] = {0x01, 0x02, 0x03, 0x6A, 0x86};
-    TEST_ASSERT_TRUE(pn532_apdu_parse_response(raw, sizeof(raw), &response));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_response(raw, sizeof(raw), &response));
     TEST_ASSERT_EQUAL_PTR(raw, response.data);
     TEST_ASSERT_EQUAL(3u, response.data_len);
     TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, response.data, 3);
     TEST_ASSERT_EQUAL_HEX16(PN532_APDU_SW_WRONG_P1P2, pn532_apdu_get_status(&response));
 
-    TEST_ASSERT_FALSE(pn532_apdu_parse_response(raw, 1, &response));
-    TEST_ASSERT_FALSE(pn532_apdu_parse_response(NULL, 0, &response));
-    TEST_ASSERT_FALSE(pn532_apdu_parse_response(raw, sizeof(raw), NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_response(raw, 1, &response));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_response(NULL, 0, &response));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_response(raw, sizeof(raw), NULL));
 
     uint8_t out[16];
     size_t  out_len = 0;
-    TEST_ASSERT_TRUE(pn532_apdu_build_response(out, sizeof(out), raw, 3, 0x90, 0x00, &out_len));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_build_response(out, sizeof(out), raw, 3, 0x90, 0x00, &out_len));
     TEST_ASSERT_EQUAL(5u, out_len);
     TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03, 0x90, 0x00}, out, 5);
 
-    TEST_ASSERT_TRUE(pn532_apdu_build_response(out, sizeof(out), NULL, 0, 0x90, 0x00, &out_len));
+    TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_build_response(out, sizeof(out), NULL, 0, 0x90, 0x00, &out_len));
     TEST_ASSERT_EQUAL(2u, out_len);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(status_only, out, 2);
 
-    TEST_ASSERT_FALSE(pn532_apdu_build_response(out, 4, raw, 3, 0x90, 0x00, &out_len));
+    TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, pn532_apdu_build_response(out, 4, raw, 3, 0x90, 0x00, &out_len));
     TEST_ASSERT_EQUAL(0u, out_len);
-    TEST_ASSERT_FALSE(pn532_apdu_build_response(out, 1, NULL, 0, 0x90, 0x00, &out_len));
-    TEST_ASSERT_FALSE(pn532_apdu_build_response(out, sizeof(out), NULL, 1, 0x90, 0x00, &out_len));
-    TEST_ASSERT_FALSE(pn532_apdu_build_response(NULL, sizeof(out), raw, 3, 0x90, 0x00, &out_len));
-    TEST_ASSERT_FALSE(pn532_apdu_build_response(out, sizeof(out), raw, 3, 0x90, 0x00, NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_NO_MEM, pn532_apdu_build_response(out, 1, NULL, 0, 0x90, 0x00, &out_len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_build_response(out, sizeof(out), NULL, 1, 0x90, 0x00, &out_len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_build_response(NULL, sizeof(out), raw, 3, 0x90, 0x00, &out_len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_build_response(out, sizeof(out), raw, 3, 0x90, 0x00, NULL));
 }
 
 void app_main(void)

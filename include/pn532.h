@@ -14,6 +14,7 @@
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
@@ -543,14 +544,14 @@ typedef struct
  * Supports cases 1, 2S, 3S, and 4S. Extended-length APDUs are rejected. The
  * data member points into buffer and remains valid only while buffer is valid.
  */
-bool pn532_apdu_parse_command(const uint8_t *buffer, size_t length, pn532_apdu_command_t *command);
+esp_err_t pn532_apdu_parse_command(const uint8_t *buffer, size_t length, pn532_apdu_command_t *command);
 
 /** @brief Build a response APDU as [data...][SW1][SW2] in caller-owned memory. */
-bool pn532_apdu_build_response(uint8_t *buffer, size_t buffer_size, const uint8_t *data, size_t data_len,
-                               uint8_t sw1, uint8_t sw2, size_t *response_len);
+esp_err_t pn532_apdu_build_response(uint8_t *buffer, size_t buffer_size, const uint8_t *data, size_t data_len,
+                                    uint8_t sw1, uint8_t sw2, size_t *response_len);
 
 /** @brief Parse a response APDU in caller-owned memory without allocation. */
-bool pn532_apdu_parse_response(const uint8_t *buffer, size_t length, pn532_apdu_response_t *response);
+esp_err_t pn532_apdu_parse_response(const uint8_t *buffer, size_t length, pn532_apdu_response_t *response);
 
 /** @brief Return SW1 and SW2 as a single 16-bit status word. */
 static inline uint16_t pn532_apdu_get_status(const pn532_apdu_response_t *response)
