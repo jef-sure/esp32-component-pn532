@@ -146,7 +146,9 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         payload_len = 0;
         break;
     case PN532_COMMAND_GETGENERALSTATUS: {
-        static const uint8_t general[] = {0x00, 0x01, 0x02, 0x0C, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00};
+        /* UM0701-02 format: Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus.
+         * Two targets: Tg1 at 106 kbps ISO14443-3A, Tg2 at 212 kbps ISO14443-3A. */
+        static const uint8_t general[] = {0x00, 0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00};
         payload                        = general;
         payload_len                    = sizeof(general);
         break;
@@ -607,17 +609,23 @@ TEST_CASE("get general status decodes diagnostics fields", "[pn532][status]")
     uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
     mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
 
-    /* Mock payload: error=0, field on, 2 targets, logical 0x0C,
-     * ISO14443-4 mask 0x0004, CID 0x0004, NAD 0x0000. */
+    /* Real chip-format reply (UM0701-02): Err Field NbTg then per-target
+     * 4-byte entries and the trailing SAM status byte. */
     pn532_general_status_t status;
     TEST_ASSERT_TRUE(pn532_get_general_status(&pn532, &status));
     TEST_ASSERT_EQUAL_UINT8(0, status.error);
     TEST_ASSERT_TRUE(status.field_present);
     TEST_ASSERT_EQUAL_UINT8(2, status.targets_count);
-    TEST_ASSERT_EQUAL_UINT8(0x0C, status.logical_targets);
-    TEST_ASSERT_EQUAL_UINT16(0x0004, status.iso14443_4_mask);
-    TEST_ASSERT_EQUAL_UINT16(0x0004, status.cid_mask);
-    TEST_ASSERT_EQUAL_UINT16(0x0000, status.nad_mask);
+    TEST_ASSERT_EQUAL_UINT8(1, status.targets[0].tg);
+    TEST_ASSERT_EQUAL_UINT8(0x00, status.targets[0].br_rx);
+    TEST_ASSERT_EQUAL_UINT8(0x00, status.targets[0].br_tx);
+    TEST_ASSERT_EQUAL_UINT8(0x00, status.targets[0].type);
+    TEST_ASSERT_EQUAL_UINT8(2, status.targets[1].tg);
+    TEST_ASSERT_EQUAL_UINT8(0x01, status.targets[1].br_rx);
+    TEST_ASSERT_EQUAL_UINT8(0x01, status.targets[1].br_tx);
+    TEST_ASSERT_EQUAL_UINT8(0x00, status.targets[1].type);
+    TEST_ASSERT_TRUE(status.sam_status_valid);
+    TEST_ASSERT_EQUAL_UINT8(0x00, status.sam_status);
 
     const uint8_t expected[] = {PN532_COMMAND_GETGENERALSTATUS};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));

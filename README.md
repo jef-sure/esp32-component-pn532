@@ -22,7 +22,7 @@ Most applications only need `pn532.h` plus `pn532-ndef.h`.
 - 14443 block read/write compatibility helpers in `pn532.h`
 - ISO-DEP helpers for Type 4 style APDU exchange
 - MI-chained response reassembly and NAD byte stripping aligned with the NXP TAMA reference (`phTalTama_Transceive` behaviour)
-- `GetGeneralStatus` diagnostics (error code, field presence, target bitmasks)
+- `GetGeneralStatus` diagnostics (error code, field presence, per-target baud rate and modulation type)
 - Raw `InCommunicateThru` exchange for non-standard ISO14443A cards
 - Retry tuning helpers for ATR, PSL, and passive activation
 - Raw PN532 command access for commands without a dedicated helper
@@ -468,13 +468,18 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 
 ### Diagnostics with GetGeneralStatus
 
-`pn532_get_general_status()` is a cheap health probe that does not disturb the RF field or the listed targets. It mirrors the NXP TAL `PN53X_GET_STATUS` ioctl:
+`pn532_get_general_status()` is a cheap health probe that does not disturb the RF field or the listed targets. It decodes the raw UM0701-02 response (`Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus`) into per-target entries:
 
 ```c
 pn532_general_status_t status;
 if (pn532_get_general_status(pn532, &status)) {
     printf("error=0x%02X field=%d targets=%u\n",
            status.error, status.field_present, status.targets_count);
+    for (uint8_t i = 0; i < status.targets_count; i++) {
+        printf("  Tg%u: rx=%u tx=%u type=0x%02X\n",
+               status.targets[i].tg, status.targets[i].br_rx,
+               status.targets[i].br_tx, status.targets[i].type);
+    }
 }
 ```
 

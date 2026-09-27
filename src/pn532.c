@@ -446,28 +446,40 @@ bool pn532_get_general_status(pn532_t *pn532, pn532_general_status_t *status)
         return false;
     }
 
-    /* UM0701-02 §7.3.2 General Status: error byte, field presence, number of
-     * targets, logical target bitmask, then three 2-byte target bitmasks
-     * (ISO14443-4 activation, CID, NAD). Parse defensively so a shorter
-     * firmware reply still fills the fixed leading fields. */
+    /* UM0701-02 GetGeneralStatus response payload:
+     *   Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus
+     * A variable-length list with one 4-byte entry per logical target
+     * (max 2), then the trailing SAM status byte. There are no bitmask
+     * fields in this command — the NXP TAL ioctl passes the raw buffer
+     * through undecoded (phTalTama.c, PHHALNFC_IOCTL_PN53X_GET_STATUS). */
     memset(status, 0, sizeof(*status));
-    if (response_len < 4) {
+    if (response_len < 3) {
         ESP_LOGE(TAG, "pn532_get_general_status: truncated status (%u bytes)", (unsigned)response_len);
         return false;
     }
 
-    status->error           = response[0];
-    status->field_present   = (response[1] & 0x01) != 0;
-    status->targets_count   = response[2];
-    status->logical_targets = response[3];
-    if (response_len >= 6) {
-        status->iso14443_4_mask = (uint16_t)response[4] | ((uint16_t)response[5] << 8);
+    status->error         = response[0];
+    status->field_present = (response[1] & 0x01) != 0;
+    status->targets_count = response[2] > 2 ? 2 : response[2];
+
+    size_t needed = 3u + 4u * (size_t)status->targets_count;
+    if (response_len < needed) {
+        ESP_LOGE(TAG, "pn532_get_general_status: %u target entries truncated (%u bytes)", (unsigned)status->targets_count,
+                 (unsigned)response_len);
+        return false;
     }
-    if (response_len >= 8) {
-        status->cid_mask = (uint16_t)response[6] | ((uint16_t)response[7] << 8);
+
+    for (uint8_t i = 0; i < status->targets_count; i++) {
+        const uint8_t *entry = &response[3 + 4u * (size_t)i];
+        status->targets[i].tg    = entry[0];
+        status->targets[i].br_rx = entry[1];
+        status->targets[i].br_tx = entry[2];
+        status->targets[i].type  = entry[3];
     }
-    if (response_len >= 10) {
-        status->nad_mask = (uint16_t)response[8] | ((uint16_t)response[9] << 8);
+
+    if (response_len >= needed + 1u) {
+        status->sam_status       = response[needed];
+        status->sam_status_valid = true;
     }
     return true;
 }

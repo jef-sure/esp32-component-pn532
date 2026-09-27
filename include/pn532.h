@@ -234,27 +234,36 @@ bool pn532_recover(pn532_t *pn532);
  */
 uint32_t pn532_get_firmware_version(pn532_t *pn532);
 
-/** @brief Decoded payload of the GetGeneralStatus command (UM0701-02 §7.3.2). */
+/** @brief Decoded payload of the GetGeneralStatus command (UM0701-02).
+ *
+ * Raw layout: `Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus` — a
+ * variable-length list with one 4-byte entry per logical target (max 2)
+ * followed by the SAM status byte.
+ */
 typedef struct
 {
-    uint8_t  error;           /**< Last error code seen by the PN532 firmware. */
-    bool     field_present;   /**< External RF field presence (bit 0). */
-    uint8_t  targets_count;   /**< Number of targets currently detected. */
-    uint8_t  logical_targets; /**< Bitmask of logical targets (b7..b2 = Tg 3..1). */
-    uint16_t iso14443_4_mask; /**< Bitmask of activated ISO14443-4 targets. */
-    uint16_t cid_mask;        /**< Bitmask of targets using a CID. */
-    uint16_t nad_mask;        /**< Bitmask of targets using NAD. */
+    uint8_t error;         /**< Last error code seen by the PN532 firmware. */
+    bool    field_present; /**< External RF field detected (Field bit 0). */
+    uint8_t targets_count; /**< Number of logical targets reported by NbTg. */
+    struct
+    {
+        uint8_t tg;    /**< Logical target number. */
+        uint8_t br_rx; /**< Reception baud rate (0x00 = 106 kbps, 0x01 = 212, 0x02 = 424, 0x03 = 847). */
+        uint8_t br_tx; /**< Transmission baud rate, same encoding as br_rx. */
+        uint8_t type;  /**< Modulation type (0x00 = ISO/IEC 14443-3A / MIFARE). */
+    } targets[2];      /**< Per-target entries; valid for indexes < targets_count. */
+    uint8_t sam_status;     /**< Trailing SAM status byte. */
+    bool    sam_status_valid; /**< True when the reply carried the trailing SAM byte. */
 } pn532_general_status_t;
 
 /**
  * @brief Read the PN532 general status (GetGeneralStatus, command 0x04).
  *
- * Surfaces the chip-side diagnostics the NXP TAL exposes through
- * PHHALNFC_IOCTL_PN53X_GET_STATUS: the last firmware error code, external RF
- * field presence, the number of detected targets, and the logical target /
- * ISO14443-4 activation / CID / NAD bitmasks. Useful as a cheap health probe
- * after transport failures or to inspect what the PN532 still holds listed
- * without recycling the field.
+ * Decodes the raw UM0701-02 response payload: the last firmware error code,
+ * external RF field presence, the number of detected logical targets with
+ * their per-target baud rates and modulation types, and the trailing SAM
+ * status byte. Useful as a cheap health probe after transport failures or
+ * to inspect what the PN532 still holds listed without recycling the field.
  *
  * @param pn532 Device context.
  * @param status Output structure filled on success.

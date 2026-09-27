@@ -1,5 +1,9 @@
 # Changelog
 
+## v 0.4.5 - 2026-09-27
+
+- Fixed `pn532_get_general_status()` decoding the wrong response format. The invented "logical target / ISO14443-4 / CID / NAD bitmask" fields do not exist in the raw GetGeneralStatus reply; the code was actually reading `Tg1`, `BrRx1/BrTx1`, and `Type1 + Tg2` as masks (a confusion with the higher-level TAL `PN53X_GET_STATUS` abstraction, which passes the raw buffer through undecoded). The struct now models the real UM0701-02 layout `Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus` with per-target entries and the trailing SAM status byte; truncated target lists are rejected. The mock regression test now feeds a realistic chip-format frame instead of a self-consistent one.
+
 ## v 0.4.4 - 2026-09-27
 
 - Fixed the stale-handle class in `pn532_in_deselect()`: the `0x27` (target not known) branch closed only `session_opened` while keeping `inListedTag`, so a later `pn532_14443_4_transceive()` would retry the auto-`InSelect` against a target the chip no longer knows — the same stale-target wedge already fixed for the RF-timeout path. The `0x27` branch now clears both fields; the normal `0x00` path still keeps the target listed for reactivation. Regression coverage extended to assert the cleared handle, and the README lifecycle wording now scopes the listed-target guarantee to the success path.
