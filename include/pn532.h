@@ -14,7 +14,6 @@
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
-#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
@@ -501,34 +500,35 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
  * callers provide only raw APDU bytes.
  *
  * @param apdu Command APDU payload.
- * @param apdu_len Command length in bytes.
+ * @param apdu_len Command length in bytes. The PN532 target byte and extended
+ *                 host-frame overhead must also fit in PN532_MAX_BUF_SIZE;
+ *                 with the current buffer size, at most 267 APDU bytes fit.
  * @param rx Output buffer for the response APDU.
  * @param rx_len In: rx capacity. Out: received response size.
  */
 bool pn532_14443_4_transceive(pn532_t *pn532, const uint8_t *apdu, size_t apdu_len, uint8_t *rx, size_t *rx_len);
 
-/** @brief ISO 7816-4 status words commonly used by Type 4 / ISO-DEP cards. */
-enum
-{
-    PN532_APDU_SW_SUCCESS          = 0x9000,
-    PN532_APDU_SW_WRONG_LENGTH     = 0x6700,
-    PN532_APDU_SW_INS_NOT_SUPPORTED = 0x6D00,
-    PN532_APDU_SW_CLA_NOT_SUPPORTED = 0x6E00,
-    PN532_APDU_SW_WRONG_P1P2       = 0x6A86,
-};
+/** @brief Common ISO 7816-4 response status words. */
+#define PN532_APDU_SW_SUCCESS           0x9000u
+#define PN532_APDU_SW_WRONG_LENGTH      0x6700u
+#define PN532_APDU_SW_WRONG_P1P2        0x6A86u
+#define PN532_APDU_SW_INS_NOT_SUPPORTED 0x6D00u
+#define PN532_APDU_SW_CLA_NOT_SUPPORTED 0x6E00u
 
+/** @brief Zero-copy representation of a short ISO 7816-4 command APDU. */
 typedef struct
 {
-    uint8_t  cla;
-    uint8_t  ins;
-    uint8_t  p1;
-    uint8_t  p2;
+    uint8_t        cla;
+    uint8_t        ins;
+    uint8_t        p1;
+    uint8_t        p2;
     const uint8_t *data;
-    size_t   data_len;
-    bool     has_le;
-    uint32_t le;
+    size_t         data_len;
+    bool           has_le;
+    uint16_t       le; /**< Decoded Le; an encoded short Le of 0 is reported as 256. */
 } pn532_apdu_command_t;
 
+/** @brief Zero-copy representation of an ISO 7816-4 response APDU. */
 typedef struct
 {
     const uint8_t *data;
@@ -537,25 +537,26 @@ typedef struct
     uint8_t        sw2;
 } pn532_apdu_response_t;
 
-/** @brief Parse an ISO 7816-4 short command APDU in caller-owned memory. */
-esp_err_t pn532_apdu_parse_command(const uint8_t *buffer, size_t length, pn532_apdu_command_t *apdu);
+/**
+ * @brief Parse a short ISO 7816-4 command APDU without allocating memory.
+ *
+ * Supports cases 1, 2S, 3S, and 4S. Extended-length APDUs are rejected. The
+ * data member points into buffer and remains valid only while buffer is valid.
+ */
+bool pn532_apdu_parse_command(const uint8_t *buffer, size_t length, pn532_apdu_command_t *command);
 
 /** @brief Build a response APDU as [data...][SW1][SW2] in caller-owned memory. */
-esp_err_t pn532_apdu_build_response(uint8_t *buffer, size_t buffer_size, const uint8_t *data, size_t data_len,
-                                     uint8_t sw1, uint8_t sw2, size_t *response_len);
+bool pn532_apdu_build_response(uint8_t *buffer, size_t buffer_size, const uint8_t *data, size_t data_len,
+                               uint8_t sw1, uint8_t sw2, size_t *response_len);
 
 /** @brief Parse a response APDU in caller-owned memory without allocation. */
-esp_err_t pn532_apdu_parse_response(const uint8_t *buffer, size_t length, pn532_apdu_response_t *response);
+bool pn532_apdu_parse_response(const uint8_t *buffer, size_t length, pn532_apdu_response_t *response);
 
-/** @brief Prepare the currently selected ISO-DEP target for APDU exchange. */
-esp_err_t pn532_iso_dep_connect(pn532_t *pn532, const pn532_uid_t *target);
-
-/** @brief Exchange a raw APDU with the currently selected ISO-DEP target. */
-esp_err_t pn532_iso_dep_transceive(pn532_t *pn532, const uint8_t *tx, size_t tx_len, uint8_t *rx,
-                                    size_t rx_size, size_t *rx_len, TickType_t timeout);
-
-/** @brief Close the local ISO-DEP session state without tearing down the driver. */
-esp_err_t pn532_iso_dep_disconnect(pn532_t *pn532);
+/** @brief Return SW1 and SW2 as a single 16-bit status word. */
+static inline uint16_t pn532_apdu_get_status(const pn532_apdu_response_t *response)
+{
+    return response == NULL ? 0u : (uint16_t)(((uint16_t)response->sw1 << 8) | response->sw2);
+}
 
 /** @brief Issue ISO-DEP SELECT FILE by AID or file identifier. */
 bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len);

@@ -36,33 +36,20 @@ Current scope is reader mode plus low-level NDEF encode/write helpers for alread
 
 ## ISO-DEP and APDU API
 
-This component is designed as a PN532 reader stack, not as a generic provisioning or application protocol framework. The ISO-DEP / Type 4 helper layer is intentionally thin: it reuses the existing PN532 command path, selected-target state, and `InDataExchange` / `InCommunicateThru` access instead of introducing another transport or a second state machine.
+`pn532_14443_4_transceive()` is the low-level APDU exchange API. It uses the existing selected-target state and `InDataExchange` implementation, including MI chaining and NAD handling. Applications keep the normal `poll -> select -> exchange -> release` lifecycle.
 
-The intended architecture is:
+The APDU utilities are independent of that transport:
 
 ```text
 Application
-    │
-    ├─ APDU parser / helpers
-    │
-    ▼
-ISO-DEP helper API
-    │
-    ▼
-PN532 InDataExchange / InCommunicateThru
-    │
-    ▼
-PN532 protocol layer
-    │
-    ▼
-Transport (SPI / I2C / UART)
+    |-- APDU parser / response builder (stateless)
+    |
+    `-- pn532_14443_4_transceive()
+              |
+              `-- existing InDataExchange -> PN532 transport
 ```
 
-This keeps the implementation compatible with the existing public API while still exposing a convenient layer for ISO-DEP exchanges, Type 4 SELECT/READ BINARY flows, and raw APDU interactions with a selected target.
-
-The APDU helper layer is intentionally zero-copy and stateless. Parsers operate on caller-owned buffers and return pointers into those buffers rather than allocating new memory. The ISO-DEP wrapper does not invent a separate connection protocol; it uses the PN532 target/session state that already exists in the driver and only prepares or validates that state before transfer.
-
-The current helper API is aimed at short APDU exchanges (case 1 / 2S / 3S / 4S). Extended APDU is intentionally out of scope unless a real application requires it, because the component should stay focused on the actual PN532 reader use case rather than turning into a generic ISO 7816 framework.
+`pn532_apdu_parse_command()` supports short APDU cases 1, 2S, 3S, and 4S. `pn532_apdu_parse_response()` separates response data from SW1/SW2, while `pn532_apdu_build_response()` writes `DATA SW1 SW2` into a caller-provided buffer. These helpers do not access PN532 hardware, allocate memory, or depend on a transport. Parsed data pointers refer directly to the caller-owned input buffer. Extended-length APDUs are not supported.
 
 ## Requirements
 
@@ -250,29 +237,7 @@ Notes:
 
 ### Exchange APDUs with a Type 4 card
 
-The examples below assume that polling returned a `pn532_uid_t *uid` as shown above.
-
-#### Select and read an NDEF file
-
-```c
-static const uint8_t ndef_aid[] = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
-static const uint8_t ndef_file[] = {0x10, 0x42};
-
-if (pn532_iso_dep_connect(pn532, uid) == ESP_OK) {
-    if (pn532_14443_4_select_file(pn532, ndef_aid, sizeof(ndef_aid)) &&
-        pn532_14443_4_select_file(pn532, ndef_file, sizeof(ndef_file))) {
-        uint8_t data[32];
-        size_t got = sizeof(data);
-        if (pn532_14443_4_read_binary(pn532, 0, sizeof(data), data, &got)) {
-            /* data[0..got) contains the start of the NDEF file. */
-        }
-    }
-    pn532_iso_dep_disconnect(pn532);
-}
-pn532_set_rf_off(pn532);
-```
-
-#### Send a raw SELECT APDU and inspect its status word
+This example assumes that polling returned a `pn532_uid_t *uid` as shown above. The command and response parsers are optional utilities; the exchange still goes directly through `pn532_14443_4_transceive()`.
 
 ```c
 static const uint8_t select_ndef[] = {
@@ -280,46 +245,24 @@ static const uint8_t select_ndef[] = {
     0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01,
 };
 
-if (pn532_iso_dep_connect(pn532, uid) == ESP_OK) {
-    uint8_t response_buffer[64];
-    size_t response_len = 0;
+pn532_apdu_command_t command;
+if (pn532_apdu_parse_command(select_ndef, sizeof(select_ndef), &command) &&
+    pn532_14443_select_by_uid(pn532, uid)) {
+    uint8_t response_buffer[128];
+    size_t response_len = sizeof(response_buffer);
 
-    if (pn532_iso_dep_transceive(pn532, select_ndef, sizeof(select_ndef),
-                                 response_buffer, sizeof(response_buffer), &response_len,
-                                 pdMS_TO_TICKS(1000)) == ESP_OK) {
+    if (pn532_14443_4_transceive(pn532, select_ndef, sizeof(select_ndef),
+                                 response_buffer, &response_len)) {
         pn532_apdu_response_t response;
-        if (pn532_apdu_parse_response(response_buffer, response_len, &response) == ESP_OK) {
-            uint16_t sw = ((uint16_t)response.sw1 << 8) | response.sw2;
-            if (sw == PN532_APDU_SW_SUCCESS) {
+        if (pn532_apdu_parse_response(response_buffer, response_len, &response)) {
+            if (pn532_apdu_get_status(&response) == PN532_APDU_SW_SUCCESS) {
                 /* response.data points into response_buffer; no allocation is made. */
             }
         }
     }
-    pn532_iso_dep_disconnect(pn532);
+    pn532_release_target(pn532);
 }
-```
-
-#### Inspect a short APDU before sending it
-
-This can be useful when APDUs are received from another task, a serial protocol, or a network endpoint.
-
-```c
-static const uint8_t get_data[] = {0x00, 0xCA, 0x00, 0x00, 0x10};
-pn532_apdu_command_t command;
-
-if (pn532_apdu_parse_command(get_data, sizeof(get_data), &command) == ESP_OK &&
-    command.ins == 0xCA && command.has_le && command.le == 16 &&
-    pn532_iso_dep_connect(pn532, uid) == ESP_OK) {
-    uint8_t response[32];
-    size_t response_len = 0;
-    esp_err_t err = pn532_iso_dep_transceive(pn532, get_data, sizeof(get_data),
-                                             response, sizeof(response), &response_len,
-                                             pdMS_TO_TICKS(1000));
-    if (err == ESP_OK) {
-        /* Parse response to separate its data from SW1/SW2. */
-    }
-    pn532_iso_dep_disconnect(pn532);
-}
+pn532_set_rf_off(pn532);
 ```
 
 ## Two PN532 Devices On One SPI Bus
@@ -560,5 +503,6 @@ Common log messages and what they mean:
 - Selected-tag block access: `pn532_14443_block_read()`, `pn532_14443_block_write()`
 - Card metadata: `pn532_14443_detect_card_type_and_capacity()`, `pn532_14443_detect_selected_card_type_and_capacity()`
 - ISO-DEP and Type 4: `pn532_14443_4_transceive()`, `pn532_14443_4_select_file()`, `pn532_14443_4_read_binary()`
+- APDU utilities: `pn532_apdu_parse_command()`, `pn532_apdu_parse_response()`, `pn532_apdu_build_response()`, `pn532_apdu_get_status()`
 - MIFARE raw access: `pn532_mifare_block_read()`, `pn532_mifare_block_write()`, value operations
 - NDEF: `pn532_ndef_read_card_auto()`, `ndef_parse_message()`, `ndef_message_init()`, `ndef_message_add()`, `ndef_record_init()`, `ndef_make_text_record()`, `ndef_make_uri_record()`, `ndef_make_mime_record()`, `ndef_make_external_record()`, `ndef_encode_message()`, `ndef_write_to_selected_card()`, `ndef_extract_text()`, `ndef_extract_uri()`, `ndef_get_record_type()`, `ndef_decode_smartposter()`, `ndef_free_parsed_message()`, `ndef_result_to_string()`
