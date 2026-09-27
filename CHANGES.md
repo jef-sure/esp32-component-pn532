@@ -1,5 +1,10 @@
 # Changelog
 
+## v 0.2.1 - 2026-09-27
+
+- Implemented MI (More Information) chaining in `pn532_in_data_exchange()`, mirroring `phTalTama_Transceive()`: when the status byte carries MI (0x40) the exchange is re-issued and payload fragments are concatenated until a non-MI status terminates the chain. Chains that never terminate are cut off after 64 rounds and drop the session so the next exchange re-selects the target.
+- MI-chained responses previously returned only the first fragment as a successful payload, silently losing the remainder of long responses.
+
 ## v 0.2.0 - 2026-09-27
 
 - Split the ACK wait from the response wait in `pn532_execute_command()`: the ACK phase now gets its own short budget (`pn532->ack_timeout_ms`, default 50 ms, NXP TAMA reference uses 10 ms) so a wedged chip fails fast instead of blocking 2 × 500 ms per command. ACK timeouts report `PN532_COMMAND_STATUS_ACK_TIMEOUT` and surface as `PN532_POLL_TRANSPORT_ERROR`; response timeouts keep `PN532_POLL_TIMEOUT`. Tunable via `pn532_set_ack_timeout()`.

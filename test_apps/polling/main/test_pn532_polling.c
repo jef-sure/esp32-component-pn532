@@ -24,11 +24,13 @@ typedef struct
     mock_mode_t mode;
     uint8_t     current_command;
     uint8_t     read_phase;
-    uint8_t     commands[16];
+    uint8_t     commands[96];
     size_t      command_count;
     size_t      abort_count;
     size_t      drained_frames;
     uint8_t     pending_frames;
+    uint8_t     mi_round;
+    bool        exchange_loops_mi;
 } mock_bus_t;
 
 static const uint8_t ack_frame[] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
@@ -144,9 +146,17 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
     }
 
     if (mock->mode == MOCK_EXCHANGE_MI && mock->current_command == PN532_COMMAND_INDATAEXCHANGE) {
-        /* Status byte 0x40: MI chaining flag set, error bits clear. */
-        static const uint8_t mi[] = {0x40, 0xAA, 0xBB};
-        mock_response_frame(mock->current_command, mi, sizeof(mi), buffer, len);
+        /* Round 1: status 0x40 = MI chaining flag with the first fragment.
+         * Round 2: status 0x00 terminates the chain with the tail fragment.
+         * The driver must re-issue InDataExchange and concatenate both. */
+        static const uint8_t first[]    = {0x40, 0x01, 0x02};
+        static const uint8_t last[]     = {0x00, 0x03, 0x04, 0x05};
+        const uint8_t       *payload    = (mock->mi_round == 0) ? first : last;
+        size_t               payload_sz = (mock->mi_round == 0) ? sizeof(first) : sizeof(last);
+        if (!mock->exchange_loops_mi) {
+            mock->mi_round++;
+        }
+        mock_response_frame(mock->current_command, payload, payload_sz, buffer, len);
         return true;
     }
 
@@ -434,7 +444,40 @@ TEST_CASE("rf settle delay and ack timeout are configurable", "[pn532][rf]")
     TEST_ASSERT_EQUAL_UINT16(5, pn532.ack_timeout_ms);
 }
 
-TEST_CASE("MI chained data is not misread as an exchange error", "[pn532][exchange]")
+TEST_CASE("MI chained data is assembled across exchange rounds", "[pn532][exchange][mi]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_EXCHANGE_MI, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    uint8_t rx[16];
+    size_t  rx_len = sizeof(rx);
+    /* Round 1 replies status 0x40 (MI) with {0x01,0x02}; round 2 replies
+     * status 0x00 with {0x03,0x04,0x05}. The driver must re-issue
+     * InDataExchange and deliver the concatenated 5-byte payload. */
+    TEST_ASSERT_TRUE(pn532_in_data_exchange(&pn532, (const uint8_t *)"\x30\x00", 2, rx, &rx_len, 100));
+    TEST_ASSERT_EQUAL(5, rx_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x01, 0x02, 0x03, 0x04, 0x05}), rx, 5);
+    TEST_ASSERT_TRUE(pn532.session_opened);
+    TEST_ASSERT_EQUAL(2, mock.command_count);
+
+    /* A chain that never clears MI is cut off instead of looping forever;
+     * the session is dropped so the next exchange re-selects. The large rx
+     * buffer keeps the round guard, not capacity, as the limiting factor. */
+    mock.mode              = MOCK_EXCHANGE_MI;
+    mock.mi_round          = 0;
+    mock.exchange_loops_mi = true;
+    uint8_t loop_rx[PN532_MAX_BUF_SIZE];
+    rx_len = sizeof(loop_rx);
+    TEST_ASSERT_FALSE(pn532_in_data_exchange(&pn532, (const uint8_t *)"\x30\x00", 2, loop_rx, &rx_len, 100));
+    TEST_ASSERT_FALSE(pn532.session_opened);
+}
+
+TEST_CASE("MI chain capacity shortfall reports the required size", "[pn532][exchange][mi]")
 {
     mock_bus_t mock;
     pn532_t    pn532;
@@ -443,16 +486,12 @@ TEST_CASE("MI chained data is not misread as an exchange error", "[pn532][exchan
     mock_init(&mock, &pn532, MOCK_EXCHANGE_MI, send_buf, recv_buf);
     pn532.inListedTag = 1;
 
-    uint8_t rx[16];
+    uint8_t rx[3];
     size_t  rx_len = sizeof(rx);
-    /* Status byte 0x40 = MI (more information) — a chaining flag, not an
-     * error per NXP ERROR_MASK 0x3F. The exchange must succeed and must not
-     * touch the session state. */
-    pn532.session_opened = true;
-    TEST_ASSERT_TRUE(pn532_in_data_exchange(&pn532, (const uint8_t *)"\x30\x00", 2, rx, &rx_len, 100));
-    TEST_ASSERT_TRUE(pn532.session_opened);
-    TEST_ASSERT_EQUAL(2, rx_len);
-    TEST_ASSERT_EQUAL_UINT8(0xAA, rx[0]);
+    /* Total payload is 5 bytes; the 3-byte buffer cannot hold the chain. The
+     * call fails and reports the required size through rx_len. */
+    TEST_ASSERT_FALSE(pn532_in_data_exchange(&pn532, (const uint8_t *)"\x30\x00", 2, rx, &rx_len, 100));
+    TEST_ASSERT_EQUAL(5, rx_len);
 }
 
 TEST_CASE("NDEF CF chunks are assembled into one logical record", "[pn532][ndef][chunk]")

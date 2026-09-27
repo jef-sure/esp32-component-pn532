@@ -46,6 +46,7 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 #define PN532_STATUS_NAD_MASK            0x80
 #define PN532_STATUS_MI_MASK             0x40
 #define PN532_STATUS_ERROR_MASK          0x3F
+#define PN532_MI_MAX_CHAIN_ROUNDS        64
 
 static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8_t *config_data,
                                    size_t config_data_len);
@@ -719,58 +720,94 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
     params[0] = pn532->inListedTag;
     memcpy(params + 1, data, data_len);
 
-    uint8_t raw_response[PN532_MAX_BUF_SIZE];
-    size_t  raw_response_len = sizeof(raw_response);
-    if (!pn532_execute_command(pn532, PN532_COMMAND_INDATAEXCHANGE, params, data_len + 1, raw_response,
-                               &raw_response_len, timeout)) {
-        return false;
-    }
-    if (raw_response_len == 0) {
-        ESP_LOGE(TAG, "pn532_in_data_exchange: empty response");
-        return false;
-    }
-    if ((raw_response[0] & PN532_STATUS_ERROR_MASK) != PN532_STATUS_OK) {
-        /*
-         * NXP's TAMA stack reports 0x01/0x13/0x14 as RF timeout style errors
-         * from transceive, but it does not discard the target handle there.
-         * Keep the listed target number and only mark the session as needing a
-         * fresh InSelect before the next exchange. Error codes live in the
-         * low 6 bits (ERROR_MASK 0x3F); MI (0x40) and NAD (0x80) are data
-         * flags, not errors.
-         */
-        uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
-        if (pn532_status_requires_reselect(status)) {
-            if (status == PN532_STATUS_RF_TIMEOUT) {
-                /* NXP's TAMA switches the field OFF after an RF_TIMEOUT to
-                 * keep PN53x/PN51x state consistent; mirror that with a
-                 * best-effort RFConfiguration (a failure here must not mask
-                 * the RF_TIMEOUT the caller sees). */
-                pn532->is_rf_on               = false;
-                const uint8_t rf_off_params[] = {0x01, 0x02};
-                size_t        rf_response_len = 0;
-                (void)pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, rf_off_params, sizeof(rf_off_params),
-                                            NULL, &rf_response_len, (uint16_t)pn532->timeout_ms);
-            }
-            pn532->session_opened = false;
-        }
-        ESP_LOGD(TAG, "pn532_in_data_exchange: PN532 status 0x%02X", status);
-        return false;
-    }
+    uint8_t  raw_response[PN532_MAX_BUF_SIZE];
+    uint8_t *raw_cursor        = response;
+    size_t   raw_capacity      = (response != NULL && response_len != NULL) ? *response_len : 0;
+    size_t   total_payload     = 0;
+    bool     chaining_active   = true;
+    bool     exchange_failed   = false;
+    bool     capacity_exceeded = false;
 
-    size_t payload_len = raw_response_len - 1;
-    if (response_len != NULL) {
-        size_t capacity = (response != NULL) ? *response_len : 0;
-        if (response != NULL && payload_len > capacity) {
-            *response_len = payload_len;
+    /* NXP phTalTama_Transceive(): a response status with MI (0x40) means the
+     * target chains more information. The host re-issues the exchange to
+     * drain the chain and concatenates the payload fragments in order; the
+     * final round carries a status without MI. A chain that never terminates
+     * is cut off after PN532_MI_MAX_CHAIN_ROUNDS rounds. */
+    for (unsigned round = 0; chaining_active; round++) {
+        if (round >= PN532_MI_MAX_CHAIN_ROUNDS) {
+            ESP_LOGE(TAG, "pn532_in_data_exchange: MI chain did not terminate within %u rounds",
+                     (unsigned)PN532_MI_MAX_CHAIN_ROUNDS);
+            pn532->session_opened = false;
+            if (response_len != NULL) {
+                *response_len = total_payload;
+            }
             return false;
         }
-        if (response != NULL && payload_len > 0) {
-            memcpy(response, raw_response + 1, payload_len);
+
+        size_t raw_response_len = sizeof(raw_response);
+        if (!pn532_execute_command(pn532, PN532_COMMAND_INDATAEXCHANGE, params, data_len + 1, raw_response,
+                                   &raw_response_len, timeout)) {
+            exchange_failed = true;
+            break;
         }
-        *response_len = payload_len;
+        if (raw_response_len == 0) {
+            ESP_LOGE(TAG, "pn532_in_data_exchange: empty response");
+            exchange_failed = true;
+            break;
+        }
+
+        uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
+        if (status != PN532_STATUS_OK) {
+            /*
+             * NXP's TAMA stack reports 0x01/0x13/0x14 as RF timeout style errors
+             * from transceive, but it does not discard the target handle there.
+             * Keep the listed target number and only mark the session as needing
+             * a fresh InSelect before the next exchange. Error codes live in the
+             * low 6 bits (ERROR_MASK 0x3F); MI (0x40) and NAD (0x80) are data
+             * flags, not errors.
+             */
+            if (pn532_status_requires_reselect(status)) {
+                if (status == PN532_STATUS_RF_TIMEOUT) {
+                    /* NXP's TAMA switches the field OFF after an RF_TIMEOUT to
+                     * keep PN53x/PN51x state consistent; mirror that with a
+                     * best-effort RFConfiguration (a failure here must not mask
+                     * the RF_TIMEOUT the caller sees). */
+                    pn532->is_rf_on               = false;
+                    const uint8_t rf_off_params[] = {0x01, 0x02};
+                    size_t        rf_response_len = 0;
+                    (void)pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, rf_off_params,
+                                                sizeof(rf_off_params), NULL, &rf_response_len,
+                                                (uint16_t)pn532->timeout_ms);
+                }
+                pn532->session_opened = false;
+            }
+            ESP_LOGD(TAG, "pn532_in_data_exchange: PN532 status 0x%02X", status);
+            exchange_failed = true;
+            break;
+        }
+
+        size_t payload_len = raw_response_len - 1;
+        if (raw_cursor != NULL && payload_len > 0) {
+            if (total_payload + payload_len > raw_capacity) {
+                capacity_exceeded = true;
+                total_payload += payload_len;
+                break;
+            }
+            memcpy(raw_cursor, raw_response + 1, payload_len);
+            raw_cursor += payload_len;
+        }
+        total_payload += payload_len;
+
+        chaining_active = (raw_response[0] & PN532_STATUS_MI_MASK) != 0;
     }
 
-    return true;
+    if (response_len != NULL) {
+        *response_len = total_payload;
+    }
+    if (capacity_exceeded) {
+        return false;
+    }
+    return !exchange_failed;
 }
 
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number)

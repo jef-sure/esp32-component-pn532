@@ -1,0 +1,2 @@
+source /home/anton/git/esp32-component-pn532/test_apps/polling/build/bootloader/gdbinit/symbols
+source /home/anton/git/esp32-component-pn532/test_apps/polling/build/bootloader/gdbinit/connect
