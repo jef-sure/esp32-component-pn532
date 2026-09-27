@@ -1,5 +1,9 @@
 # Changelog
 
+## v 0.3.2 - 2026-09-27
+
+- Documentation only: expanded the README with I2C and UART setup snippets, a complete MIFARE Classic read cycle (poll, select, key-A auth, data blocks, release), a Type 4 ISO-DEP example (NDEF AID, file select, READ BINARY), a full NTAG URI write cycle, `GetGeneralStatus` and `InCommunicateThru` usage examples, a troubleshooting section, and the ESP Component Registry badge.
+
 ## v 0.3.1 - 2026-09-27
 
 - Stripped the NAD byte from `InDataExchange` and `InCommunicateThru` responses when the status byte carries NAD (0x80), matching `phTalTama_Transceive()`. The driver never negotiates NAD, but a target sending it anyway no longer shifts the caller's payload by one byte. A NAD flag with an empty payload is rejected as a protocol error.
