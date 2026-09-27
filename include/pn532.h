@@ -375,6 +375,30 @@ bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *param
                            size_t *response_len, uint16_t timeout_ms);
 
 /**
+ * @brief Exchange raw ISO14443 bits with the currently activated target via
+ *        InCommunicateThru (command 0x42).
+ *
+ * Unlike pn532_execute_command(), which talks to the PN532 itself, and the
+ * DEP/MIFARE-wrapped pn532_in_data_exchange(), this helper forwards @p data
+ * verbatim over the RF interface: the firmware sends the bits as-is and
+ * returns the raw target reply. Use it for non-standard cards and commands
+ * outside the MIFARE / ISO14443-4 tables. The response status byte is checked
+ * against ERROR_MASK; MI-chained raw replies are drained and concatenated the
+ * same way as pn532_in_data_exchange().
+ *
+ * @param pn532 Device context.
+ * @param data Raw bytes to transmit over RF.
+ * @param data_len Length of @p data in bytes.
+ * @param response Optional output buffer for the raw target reply.
+ * @param response_len In: capacity of @p response. Out: received size.
+ * @param timeout_ms Response-phase timeout in milliseconds.
+ * @return true on success. On false with a too-small buffer, @p *response_len
+ *         carries the required size.
+ */
+bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
+                               size_t *response_len, uint16_t timeout_ms);
+
+/**
  * @brief Poll for ISO14443A targets with an explicit typed outcome.
  *
  * Before each InListPassiveTarget this ends a previously active target session

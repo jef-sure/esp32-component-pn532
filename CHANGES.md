@@ -1,5 +1,9 @@
 # Changelog
 
+## v 0.3.0 - 2026-09-27
+
+- Added `pn532_in_communicate_thru()` exposing the InCommunicateThru command (0x42): raw ISO14443 bit exchange with the currently activated target, without the DEP/MIFARE wrapping of InDataExchange. MI-chained raw replies are drained and concatenated; the API bump marks the new public raw-exchange surface.
+
 ## v 0.2.2 - 2026-09-27
 
 - Added `pn532_get_general_status()` exposing the GetGeneralStatus command (0x04): decoded error code, external RF field presence, detected target count, and the logical target / ISO14443-4 activation / CID / NAD bitmasks, mirroring the NXP TAL `PHHALNFC_IOCTL_PN53X_GET_STATUS` diagnostics probe.

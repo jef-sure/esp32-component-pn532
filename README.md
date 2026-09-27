@@ -329,6 +329,7 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - Retry tuning and raw commands: `pn532_set_max_retries()`, `pn532_set_passive_activation_retries()`, `pn532_set_ack_timeout()`, `pn532_execute_command()`
 - Diagnostics: `pn532_get_firmware_version()`, `pn532_get_general_status()`
 - Poll, select, and auth: `pn532_14443_get_all_uids_ex()`, `pn532_14443_get_all_uids()`, `pn532_release_target()`, `pn532_deselect_target()`, `pn532_14443_select_by_uid()`, `pn532_14443_authenticate()`
+- Raw target exchange: `pn532_in_communicate_thru()`
 - Selected-tag block access: `pn532_14443_block_read()`, `pn532_14443_block_write()`
 - Card metadata: `pn532_14443_detect_card_type_and_capacity()`, `pn532_14443_detect_selected_card_type_and_capacity()`
 - ISO-DEP and Type 4: `pn532_14443_4_transceive()`, `pn532_14443_4_select_file()`, `pn532_14443_4_read_binary()`

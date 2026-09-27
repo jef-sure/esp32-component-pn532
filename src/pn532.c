@@ -849,6 +849,79 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
     return !exchange_failed;
 }
 
+bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
+                               size_t *response_len, uint16_t timeout)
+{
+    if (pn532 == NULL || data == NULL || data_len == 0 || data_len + 1 > PN532_MAX_BUF_SIZE) {
+        return false;
+    }
+
+    /* NXP phTalTama_Transceive() raw-command path: InCommunicateThru sends
+     * raw ISO14443 bits to the target without the DEP/MIFARE wrapping of
+     * InDataExchange. The response status byte uses the same ERROR_MASK /
+     * MI layout, so MI-chained raw replies are drained here as well. */
+    uint8_t  raw_response[PN532_MAX_BUF_SIZE];
+    uint8_t *raw_cursor        = response;
+    size_t   raw_capacity      = (response != NULL && response_len != NULL) ? *response_len : 0;
+    size_t   total_payload     = 0;
+    bool     chaining_active   = true;
+    bool     exchange_failed   = false;
+    bool     capacity_exceeded = false;
+
+    for (unsigned round = 0; chaining_active; round++) {
+        if (round >= PN532_MI_MAX_CHAIN_ROUNDS) {
+            ESP_LOGE(TAG, "pn532_in_communicate_thru: MI chain did not terminate within %u rounds",
+                     (unsigned)PN532_MI_MAX_CHAIN_ROUNDS);
+            pn532->session_opened = false;
+            if (response_len != NULL) {
+                *response_len = total_payload;
+            }
+            return false;
+        }
+
+        size_t raw_response_len = sizeof(raw_response);
+        if (!pn532_execute_command(pn532, PN532_COMMAND_INCOMMUNICATETHRU, data, data_len, raw_response,
+                                   &raw_response_len, timeout)) {
+            exchange_failed = true;
+            break;
+        }
+        if (raw_response_len == 0) {
+            ESP_LOGE(TAG, "pn532_in_communicate_thru: empty response");
+            exchange_failed = true;
+            break;
+        }
+
+        uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
+        if (status != PN532_STATUS_OK) {
+            ESP_LOGD(TAG, "pn532_in_communicate_thru: PN532 status 0x%02X", status);
+            exchange_failed = true;
+            break;
+        }
+
+        size_t payload_len = raw_response_len - 1;
+        if (raw_cursor != NULL && payload_len > 0) {
+            if (total_payload + payload_len > raw_capacity) {
+                capacity_exceeded = true;
+                total_payload += payload_len;
+                break;
+            }
+            memcpy(raw_cursor, raw_response + 1, payload_len);
+            raw_cursor += payload_len;
+        }
+        total_payload += payload_len;
+
+        chaining_active = (raw_response[0] & PN532_STATUS_MI_MASK) != 0;
+    }
+
+    if (response_len != NULL) {
+        *response_len = total_payload;
+    }
+    if (capacity_exceeded) {
+        return false;
+    }
+    return !exchange_failed;
+}
+
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number)
 {
     const uint8_t params[]   = {target_number};

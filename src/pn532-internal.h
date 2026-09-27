@@ -29,6 +29,7 @@ struct pn532_bus_t
 #define PN532_COMMAND_GETGENERALSTATUS    (0x04)
 #define PN532_COMMAND_SAMCONFIGURATION    (0x14)
 #define PN532_COMMAND_RFCONFIGURATION     (0x32)
+#define PN532_COMMAND_INCOMMUNICATETHRU   (0x42)
 #define PN532_COMMAND_INLISTPASSIVETARGET (0x4A)
 #define PN532_COMMAND_INDATAEXCHANGE      (0x40)
 #define PN532_COMMAND_INRELEASE           (0x52)
@@ -54,6 +55,8 @@ bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *param
                            size_t *response_len, uint16_t timeout);
 bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                             size_t *response_len, uint16_t timeout);
+bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
+                               size_t *response_len, uint16_t timeout);
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number);
 bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number);
 void pn532_abort_current_command(pn532_t *pn532);

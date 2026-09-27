@@ -15,7 +15,8 @@ typedef enum
     MOCK_LIST_TRANSPORT_ERROR,
     MOCK_ACK_TIMEOUT,
     MOCK_PENDING_RESPONSE,
-    MOCK_EXCHANGE_MI
+    MOCK_EXCHANGE_MI,
+    MOCK_COMMUNICATE_THRU
 } mock_mode_t;
 
 typedef struct
@@ -157,6 +158,20 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
          * The driver must re-issue InDataExchange and concatenate both. */
         static const uint8_t first[]    = {0x40, 0x01, 0x02};
         static const uint8_t last[]     = {0x00, 0x03, 0x04, 0x05};
+        const uint8_t       *payload    = (mock->mi_round == 0) ? first : last;
+        size_t               payload_sz = (mock->mi_round == 0) ? sizeof(first) : sizeof(last);
+        if (!mock->exchange_loops_mi) {
+            mock->mi_round++;
+        }
+        mock_response_frame(mock->current_command, payload, payload_sz, buffer, len);
+        return true;
+    }
+
+    if (mock->mode == MOCK_COMMUNICATE_THRU && mock->current_command == PN532_COMMAND_INCOMMUNICATETHRU) {
+        /* Raw exchange: round 1 MI-fragments {0x11}, round 2 completes with
+         * {0x22, 0x33}. Exercises both the raw path and its MI drain. */
+        static const uint8_t first[]    = {0x40, 0x11};
+        static const uint8_t last[]     = {0x00, 0x22, 0x33};
         const uint8_t       *payload    = (mock->mi_round == 0) ? first : last;
         size_t               payload_sz = (mock->mi_round == 0) ? sizeof(first) : sizeof(last);
         if (!mock->exchange_loops_mi) {
@@ -521,6 +536,28 @@ TEST_CASE("get general status decodes diagnostics fields", "[pn532][status]")
     TEST_ASSERT_EQUAL_UINT16(0x0000, status.nad_mask);
 
     const uint8_t expected[] = {PN532_COMMAND_GETGENERALSTATUS};
+    assert_commands(&mock, expected, ARRAY_SIZE(expected));
+}
+
+TEST_CASE("in communicate thru forwards raw bits and drains MI", "[pn532][thru]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_COMMUNICATE_THRU, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    uint8_t rx[16];
+    size_t  rx_len = sizeof(rx);
+    TEST_ASSERT_TRUE(pn532_in_communicate_thru(&pn532, (const uint8_t *)"\xE0\x80", 2, rx, &rx_len, 100));
+    TEST_ASSERT_EQUAL(3, rx_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x11, 0x22, 0x33}), rx, 3);
+    TEST_ASSERT_TRUE(pn532.session_opened);
+    TEST_ASSERT_EQUAL(2, mock.command_count);
+
+    const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU, PN532_COMMAND_INCOMMUNICATETHRU};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
 }
 
