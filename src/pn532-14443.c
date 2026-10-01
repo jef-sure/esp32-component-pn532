@@ -275,7 +275,9 @@ static pn532_poll_status_t pn532_poll_command_error(const pn532_t *pn532)
 
 pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_status_t *status)
 {
-    uint8_t     response[64];
+    /* Two targets with long ATS can exceed any small buffer; a too-small one
+     * would surface as a misleading PN532_POLL_TRANSPORT_ERROR. */
+    uint8_t     response[PN532_MAX_BUF_SIZE];
     size_t      response_len = sizeof(response);
     uint8_t     targets_found;
     size_t      alloc_size;
@@ -379,7 +381,7 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532)
 
 bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
 {
-    uint8_t response[64];
+    uint8_t response[PN532_MAX_BUF_SIZE];
     uint8_t target_number = 0;
 
     if (pn532 == NULL || uid == NULL) {

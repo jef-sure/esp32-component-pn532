@@ -4,12 +4,14 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "hal/gpio_ll.h"
 
 static const char *TAG = "PN532-SPI";
 
@@ -51,20 +53,23 @@ static pn532_spi_bus_t *pn532_spi_bus(pn532_bus_t *bus)
     return (pn532_spi_bus_t *)bus;
 }
 
-static void pn532_spi_pre_transfer(spi_transaction_t *trans)
+/* Called from the SPI ISR, which may run with the flash cache disabled when the
+ * bus was initialised with ESP_INTR_FLAG_IRAM; gpio_set_level() lives in flash
+ * unless CONFIG_GPIO_CTRL_FUNC_IN_IRAM, so write the register directly. */
+static void IRAM_ATTR pn532_spi_pre_transfer(spi_transaction_t *trans)
 {
     pn532_spi_bus_t *bus = (pn532_spi_bus_t *)trans->user;
     if (bus != NULL) {
-        gpio_set_level(bus->nss, 0);
+        gpio_ll_set_level(&GPIO, bus->nss, 0);
         esp_rom_delay_us(100);
     }
 }
 
-static void pn532_spi_post_transfer(spi_transaction_t *trans)
+static void IRAM_ATTR pn532_spi_post_transfer(spi_transaction_t *trans)
 {
     pn532_spi_bus_t *bus = (pn532_spi_bus_t *)trans->user;
     if (bus != NULL) {
-        gpio_set_level(bus->nss, 1);
+        gpio_ll_set_level(&GPIO, bus->nss, 1);
     }
 }
 
@@ -224,10 +229,10 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
     }
 
     /*
-     * PN532 SPI wake-up: idle NSS high, then drive low to trigger the SPI
-     * wake-up source (PN532/C1 §8.5.6). Wait T1 = 2 ms max for the CPU clock
-     * to start before any SPI traffic. NSS stays low into the first
-     * transaction, which then drives CS itself.
+     * PN532 SPI wake-up: idle NSS high, then a low pulse triggers the SPI
+     * wake-up source (PN532/C1 §8.5.6); wait T1 = 2 ms max for the CPU clock.
+     * NSS must return high: on a shared bus a low NSS keeps this reader
+     * selected while another one is being initialised.
      */
     gpio_config_t nss_cfg = {
         .pin_bit_mask = (1ULL << nss),
@@ -244,6 +249,7 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
     vTaskDelay(pdMS_TO_TICKS(2));
     gpio_set_level(nss, 0);
     vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(nss, 1);
 
     spi_device_interface_config_t dev_config = {
         .command_bits   = 8,

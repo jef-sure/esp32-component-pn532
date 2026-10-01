@@ -1,5 +1,11 @@
 # Changelog
 
+## v 0.5.3 - 2026-10-01
+
+- SPI: the wake-up pulse in `pn532_spi_init()` / `pn532_spi_attach()` left NSS low until the device's first transaction. With two readers on one bus (both transports created before the first `pn532_init()`), reader B stayed selected during the whole init of reader A and could drive MISO in parallel. NSS now returns high right after the pulse; `pn532_reset()` still sends its own wake pulse and every transaction drives CS itself.
+- SPI: the CS `pre_cb`/`post_cb` callbacks are now `IRAM_ATTR` and toggle NSS with `gpio_ll_set_level()` instead of the flash-resident `gpio_set_level()`. They run from the SPI ISR, so on a bus initialised by the application with `ESP_INTR_FLAG_IRAM` (reachable through `pn532_spi_attach()`) a flash operation could previously crash them.
+- Polling and `pn532_14443_select_by_uid()` used a 64-byte `InListPassiveTarget` response buffer. Two ISO-DEP targets with long ATS could exceed it, and the "buffer too small" failure surfaced as `PN532_POLL_TRANSPORT_ERROR`, which the README recovery guidance turns into `pn532_recover()` calls. The buffers now hold the largest PN532 frame (`PN532_MAX_BUF_SIZE`); added a two-long-ATS regression test.
+
 ## v 0.5.2 - 2026-10-01
 
 - Documentation only: the README install command now references an existing registry version (0.5.0 was withdrawn).

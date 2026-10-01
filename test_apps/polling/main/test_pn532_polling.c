@@ -19,7 +19,8 @@ typedef enum
     MOCK_COMMUNICATE_THRU,
     MOCK_EXCHANGE_NAD,
     MOCK_TYPE4_APDU,
-    MOCK_STATUS_TARGET_NOT_KNOWN
+    MOCK_STATUS_TARGET_NOT_KNOWN,
+    MOCK_TWO_LONG_ATS
 } mock_mode_t;
 
 typedef struct
@@ -188,6 +189,24 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
     case PN532_COMMAND_INLISTPASSIVETARGET:
         payload     = mock->mode == MOCK_NO_CARD ? no_card : card;
         payload_len = mock->mode == MOCK_NO_CARD ? sizeof(no_card) : sizeof(card);
+        if (mock->mode == MOCK_TWO_LONG_ATS) {
+            /* NbTg=2; each: Tg ATQA(2) SAK=0x20 UIDLen=7 UID(7) ATS(TL=30): 85 bytes total. */
+            static uint8_t two_ats[1 + 2 * 42];
+            two_ats[0] = 2;
+            for (uint8_t t = 0; t < 2; t++) {
+                uint8_t *e = &two_ats[1 + t * 42];
+                e[0]       = (uint8_t)(t + 1);
+                e[1]       = 0x44;
+                e[2]       = 0x03;
+                e[3]       = 0x20;
+                e[4]       = 7;
+                memset(&e[5], 0x10 + t, 7);
+                e[12] = 30;
+                memset(&e[13], 0xA0, 29);
+            }
+            payload     = two_ats;
+            payload_len = sizeof(two_ats);
+        }
         break;
     default:
         payload     = ok;
@@ -1095,6 +1114,24 @@ TEST_CASE("HSU baud change is rejected on non-UART transports", "[pn532][uart][b
 
     TEST_ASSERT_FALSE(pn532_uart_set_baud_rate(&pn532, 921600));
     TEST_ASSERT_EQUAL(0, mock.command_count);
+}
+
+TEST_CASE("two targets with long ATS are polled, not reported as transport error", "[pn532][polling][ats]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_TWO_LONG_ATS, send_buf, recv_buf);
+
+    pn532_poll_status_t status;
+    pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(&pn532, &status);
+    TEST_ASSERT_EQUAL(PN532_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL_UINT8(2, uids->uids_count);
+    TEST_ASSERT_EQUAL_UINT8(2, uids->uids[1].tg);
+    TEST_ASSERT_EQUAL_INT8(7, uids->uids[1].uid_length);
+    free(uids);
 }
 
 void app_main(void)
