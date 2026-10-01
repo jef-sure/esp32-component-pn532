@@ -24,6 +24,7 @@ typedef struct
     spi_transaction_t  *trans;
     uint8_t            *tx_buffer;
     uint8_t            *rx_buffer;
+    bool                line_fault; /* last status byte was neither 0x00 nor 0x01 */
 } pn532_spi_bus_t;
 
 /* Hosts initialised by this driver and how many PN532 devices sit on each.
@@ -143,7 +144,20 @@ static bool pn532_spi_bus_is_ready(pn532_bus_t *bus)
         return false;
     }
 
-    return (spi_bus->trans->rx_data[0] & PN532_SPI_READY) == PN532_SPI_READY;
+    /* UM0701-02 §6.2.5: the status byte is exactly 0x00 or 0x01. Anything else
+     * (0xFF for an open or stuck-high MISO) means nothing is driving the line. */
+    uint8_t status = spi_bus->trans->rx_data[0];
+    bool    fault  = status != 0x00 && status != PN532_SPI_READY;
+    if (fault != spi_bus->line_fault) {
+        if (fault) {
+            ESP_LOGW(TAG, "NSS %d: invalid status 0x%02X, MISO not driven (wiring, power, I0/I1, or chip hung)",
+                     (int)spi_bus->nss, status);
+        } else {
+            ESP_LOGI(TAG, "NSS %d: status line valid again", (int)spi_bus->nss);
+        }
+        spi_bus->line_fault = fault;
+    }
+    return status == PN532_SPI_READY;
 }
 
 static void pn532_spi_bus_wake(pn532_bus_t *bus)

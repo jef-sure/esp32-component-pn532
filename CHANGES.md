@@ -1,5 +1,11 @@
 # Changelog
 
+## v 0.5.4 - 2026-10-01
+
+- SPI: the status byte is now compared with `0x01` exactly instead of testing only bit 0. UM0701-02 §6.2.5 allows only `0x00`/`0x01`; a disconnected or stuck-high MISO read as `0xFF` and looked permanently ready, so every command failed on a garbage ACK and the abort drain ran its full guard (~0.7 s per command at 1 MHz). It now fails on the ACK timeout as a transport error.
+- SPI: an invalid status byte is logged once when the line goes bad (`NSS n: invalid status 0x.., MISO not driven ...`) and once when it recovers, so a dead or miswired reader is identified by its NSS pin instead of only by repeated ACK timeouts.
+- The post-abort drain is capped at 8 reads instead of 280. Each read takes a full 280-byte frame, so one or two reads cover any real leftover response.
+
 ## v 0.5.3 - 2026-10-01
 
 - SPI: the wake-up pulse in `pn532_spi_init()` / `pn532_spi_attach()` left NSS low until the device's first transaction. With two readers on one bus (both transports created before the first `pn532_init()`), reader B stayed selected during the whole init of reader A and could drive MISO in parallel. NSS now returns high right after the pulse; `pn532_reset()` still sends its own wake pulse and every transaction drives CS itself.

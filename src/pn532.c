@@ -49,6 +49,7 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 #define PN532_STATUS_MI_MASK             0x40
 #define PN532_STATUS_ERROR_MASK          0x3F
 #define PN532_MI_MAX_CHAIN_ROUNDS        64
+#define PN532_ABORT_DRAIN_MAX_READS      8
 
 static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8_t *config_data,
                                    size_t config_data_len);
@@ -246,7 +247,7 @@ void pn532_abort_current_command(pn532_t *pn532)
      * would leave the tail in the FIFO and corrupt the next frame. */
     if (pn532->bus->is_ready != NULL && pn532->bus->read_data != NULL) {
         size_t guard = 0;
-        while (pn532->bus->is_ready(pn532->bus) && guard++ < PN532_MAX_BUF_SIZE) {
+        while (pn532->bus->is_ready(pn532->bus) && guard++ < PN532_ABORT_DRAIN_MAX_READS) {
             if (!pn532->bus->read_data(pn532->bus, pn532->recv_buf, PN532_MAX_BUF_SIZE)) {
                 break;
             }
