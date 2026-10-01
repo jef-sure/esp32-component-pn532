@@ -1,5 +1,34 @@
 # Changelog
 
+## v 0.5.0 - 2026-10-01
+
+New API:
+
+- `pn532_spi_attach()` and `pn532_i2c_attach()` attach a PN532 to a bus already created by the application (the I2C variant needs ESP-IDF >= 5.4). The bus stays owned by the caller; destroying the transport removes only the PN532 device.
+- `pn532_uart_set_baud_rate()` switches the PN532 and the host UART together via `SetSerialBaudRate` (0x10), committing the switch with the host ACK required by UM0701-02. Rate codes come from an explicit rate-to-code table.
+- `PN532_SPI_DEFAULT_CLOCK_HZ` (1 MHz), used when the SPI clock argument is non-positive (a warning is logged).
+
+Link reliability and recovery:
+
+- Corrupted response frames (bad length/data checksum, broken header or postamble, truncated UART frame) are now requested again with the UM0701-02 NACK frame (up to 2 times) instead of failing the command. The command itself is not re-executed, so non-idempotent operations (writes, RF exchanges) are safe.
+- Transports can re-negotiate a silent link through a generic `resync` hook. HSU uses it to probe all nine PN532 rates (including 1.288 Mbaud, BR `0x08` per UM0701-02 §7.2.8) when the module does not answer at the configured one; `pn532_init()` logs the rate it actually found.
+- With a wired IRQ pin, readiness is taken from the P70_IRQ level (low = response pending, UM0701-02 §6.3) before falling back to the bus check. On HSU this replaces the "at least 6 bytes buffered" heuristic with the chip's own signal.
+- `pn532_recover()` now verifies the link first (with transport resync) and only then re-applies SAM/retry configuration, so a module that power-cycled back to its default HSU rate is recovered instead of failing at SAM configuration.
+
+Transport fixes:
+
+- SPI: a host bus initialised by the driver is now freed when the last PN532 on it is destroyed (previously it was never freed). Buses initialised by the application are never freed by the driver.
+- I2C: fixed the wake-up added in v0.2.0 never reaching the bus. It used a zero-length `i2c_master_transmit()`, which ESP-IDF rejects with `ESP_ERR_INVALID_ARG` before any bus activity, so a PN532 in Power Down was not woken by `pn532_reset()`/`pn532_recover()`. Wake-up now uses `i2c_master_probe()` (START + own address + STOP), which is what the PN532 wake-up block recognises (PN532/C1 §8.3.2.6).
+- I2C: retries probe the status byte before reading data, and a NACK from a busy PN532 is retried like a `0x00` status instead of failing immediately. NACKs while polling readiness are logged at debug level.
+- HSU: responses are read by the length in the frame header instead of waiting for 20 ms of line silence; malformed headers fall back to the previous idle-based read.
+- Ready polling checks the bus every RTOS tick against a wall-clock deadline instead of in fixed 10 ms steps.
+- SPI: the 1-byte status read uses `spi_device_polling_transmit()`, avoiding interrupt and task-switch latency on every poll.
+- I2C: `scl_wait_us` is now 10 ms (was the IDF default of ~2 ms). Leaving Power Down the PN532 stretches SCL for T_osc_start (UM0701-02 §7.2.11); this is an upper bound, not a delay, and stays below the classic ESP32 hardware limit (~13 ms at 80 MHz).
+- Corrected UM0701-02 section references in source comments (InDeselect §7.3.10, InRelease §7.3.11, InSelect §7.3.12, wake-up conditions §7.2.11).
+- `pn532_deinit()` resets the IRQ and RST GPIOs after removing the ISR handler, so a subsequent `pn532_init()` on the same pins starts clean.
+
+Tests: added coverage for NACK retransmission, init/recover link resync and baud-change rejection on non-UART transports; the mock now answers `GetFirmwareVersion` with a real 4-byte payload, and Unity array asserts with compound literals were fixed to compile.
+
 ## v 0.4.5 - 2026-09-27
 
 - Fixed `pn532_get_general_status()` decoding the wrong response format. The invented "logical target / ISO14443-4 / CID / NAD bitmask" fields do not exist in the raw GetGeneralStatus reply; the code was actually reading `Tg1`, `BrRx1/BrTx1`, and `Type1 + Tg2` as masks (a confusion with the higher-level TAL `PN53X_GET_STATUS` abstraction, which passes the raw buffer through undecoded). The struct now models the real UM0701-02 layout `Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus` with per-target entries and the trailing SAM status byte; truncated target lists are rejected. The mock regression test now feeds a realistic chip-format frame instead of a self-consistent one.

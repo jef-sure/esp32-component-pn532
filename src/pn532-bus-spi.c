@@ -17,11 +17,34 @@ typedef struct
 {
     pn532_bus_t         base;
     spi_device_handle_t spi_handle;
+    spi_host_device_t   host_id;
     gpio_num_t          nss;
     spi_transaction_t  *trans;
     uint8_t            *tx_buffer;
     uint8_t            *rx_buffer;
 } pn532_spi_bus_t;
+
+/* Hosts initialised by this driver and how many PN532 devices sit on each.
+ * Init/destroy are expected from one task; there is no locking. */
+static struct
+{
+    bool    bus_owned;
+    uint8_t devices;
+} s_spi_hosts[SPI_HOST_MAX];
+
+static void pn532_spi_host_release(spi_host_device_t host_id)
+{
+    if (s_spi_hosts[host_id].devices > 0 || !s_spi_hosts[host_id].bus_owned) {
+        return;
+    }
+    esp_err_t err = spi_bus_free(host_id);
+    if (err != ESP_OK) {
+        /* Foreign devices are still attached; the application owns the rest. */
+        ESP_LOGW(TAG, "spi_bus_free(%d) failed (%s)", (int)host_id, esp_err_to_name(err));
+        return;
+    }
+    s_spi_hosts[host_id].bus_owned = false;
+}
 
 static pn532_spi_bus_t *pn532_spi_bus(pn532_bus_t *bus)
 {
@@ -107,7 +130,9 @@ static bool pn532_spi_bus_is_ready(pn532_bus_t *bus)
     spi_bus->trans->flags    = SPI_TRANS_USE_RXDATA;
     spi_bus->trans->user     = spi_bus;
 
-    esp_err_t err = spi_device_transmit(spi_bus->spi_handle, spi_bus->trans);
+    /* Polling avoids interrupt/task-switch latency for this 1-byte read,
+     * which wait_ready() issues every tick. */
+    esp_err_t err = spi_device_polling_transmit(spi_bus->spi_handle, spi_bus->trans);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "pn532_spi_bus_is_ready: failed (%s)", esp_err_to_name(err));
         return false;
@@ -144,6 +169,9 @@ static void pn532_spi_bus_destroy(pn532_bus_t *bus)
             esp_err_t err = spi_bus_remove_device(spi_bus->spi_handle);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "pn532_spi_bus_destroy: spi_bus_remove_device failed (%s)", esp_err_to_name(err));
+            } else if (s_spi_hosts[spi_bus->host_id].devices > 0) {
+                s_spi_hosts[spi_bus->host_id].devices--;
+                pn532_spi_host_release(spi_bus->host_id);
             }
         }
         free(spi_bus->trans);
@@ -179,11 +207,17 @@ static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_n
         ESP_LOGE(TAG, "pn532_spi_bus_init: spi_bus_initialize failed (%s)", esp_err_to_name(err));
         return false;
     }
+    s_spi_hosts[host_id].bus_owned = true;
     return true;
 }
 
-static pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz)
+static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz)
 {
+    if (clock_speed_hz <= 0) {
+        ESP_LOGW(TAG, "clock_speed_hz=%d, using default %d Hz", clock_speed_hz, PN532_SPI_DEFAULT_CLOCK_HZ);
+        clock_speed_hz = PN532_SPI_DEFAULT_CLOCK_HZ;
+    }
+
     pn532_spi_bus_t *spi_bus = calloc(1, sizeof(*spi_bus));
     if (spi_bus == NULL) {
         return NULL;
@@ -224,7 +258,7 @@ static pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, 
 
     if (spi_bus_add_device(host_id, &dev_config, &spi_bus->spi_handle) != ESP_OK) {
         free(spi_bus);
-        ESP_LOGE(TAG, "pn532_spi_attach: failed to add SPI device");
+        ESP_LOGE(TAG, "pn532_spi_add_device: failed to add SPI device");
         return NULL;
     }
 
@@ -237,11 +271,13 @@ static pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, 
         free(spi_bus->tx_buffer);
         free(spi_bus->rx_buffer);
         free(spi_bus);
-        ESP_LOGE(TAG, "pn532_spi_attach: failed to allocate SPI scratch buffers");
+        ESP_LOGE(TAG, "pn532_spi_add_device: failed to allocate SPI scratch buffers");
         return NULL;
     }
 
-    spi_bus->nss = nss;
+    spi_bus->host_id = host_id;
+    spi_bus->nss     = nss;
+    s_spi_hosts[host_id].devices++;
 
     spi_bus->base.write_command = pn532_spi_bus_write_command;
     spi_bus->base.read_data     = pn532_spi_bus_read_data;
@@ -255,8 +291,26 @@ static pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, 
 pn532_bus_t *pn532_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi, gpio_num_t nss,
                             int clock_speed_hz)
 {
+    if ((unsigned)host_id >= SPI_HOST_MAX) {
+        return NULL;
+    }
     if (!pn532_spi_bus_init(host_id, sck, miso, mosi)) {
         return NULL;
     }
-    return pn532_spi_attach(host_id, nss, clock_speed_hz);
+    pn532_bus_t *bus = pn532_spi_add_device(host_id, nss, clock_speed_hz);
+    if (bus == NULL) {
+        pn532_spi_host_release(host_id);
+    }
+    return bus;
+}
+
+pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz)
+{
+    size_t max_transaction_len;
+    if ((unsigned)host_id >= SPI_HOST_MAX ||
+        spi_bus_get_max_transaction_len(host_id, &max_transaction_len) != ESP_OK) {
+        ESP_LOGE(TAG, "pn532_spi_attach: SPI host %d is not initialised", (int)host_id);
+        return NULL;
+    }
+    return pn532_spi_add_device(host_id, nss, clock_speed_hz);
 }

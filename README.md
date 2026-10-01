@@ -2,161 +2,213 @@
 
 [![ESP Component Registry](https://components.espressif.com/components/jef-sure/pn532/badge.svg)](https://components.espressif.com/components/jef-sure/pn532/)
 
-ESP-IDF component for the PN532 NFC reader over SPI, I2C, or UART/HSU.
+ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read card UIDs, read and write NDEF (NTAG / Ultralight, MIFARE Classic, Type 4), and exchange APDUs with ISO14443A cards in reader mode.
 
-The driver is focused on reader mode for ISO14443A cards and is split into three public headers:
+- [Quick Start](#quick-start)
+- [Choosing A Transport](#choosing-a-transport)
+- [Common Tasks](#common-tasks)
+- [Multiple Readers And Shared Buses](#multiple-readers-and-shared-buses)
+- [Troubleshooting](#troubleshooting)
+- [Reliability And Recovery](#reliability-and-recovery)
+- [Reference](#reference)
 
-- `include/pn532.h`: transport creation, device lifetime, retry tuning, raw command access, ISO14443A polling/select, and ISO-DEP helpers
-- `include/pn532-mifare.h`: low-level MIFARE Classic and Ultralight read/write primitives
-- `include/pn532-ndef.h`: NDEF parsing, encoding, and card read/write helpers
+## Quick Start
 
-Most applications only need `pn532.h` plus `pn532-ndef.h`.
+### 1. Add the component
 
-## Features
+From the ESP Component Registry:
 
-- SPI, I2C, and UART/HSU transport backends
-- Optional IRQ-driven ready notifications when `pn532_init()` receives a wired IRQ GPIO
-- ISO14443A polling with support for up to two cards per scan
-- Card selection and MIFARE Classic authentication helpers
-- Raw block access for MIFARE Classic, Ultralight, and NTAG tags
-- 14443 block read/write compatibility helpers in `pn532.h`
-- ISO-DEP helpers for Type 4 style APDU exchange
-- MI-chained response reassembly and NAD byte stripping aligned with the NXP TAMA reference (`phTalTama_Transceive` behaviour)
-- `GetGeneralStatus` diagnostics (error code, field presence, per-target baud rate and modulation type)
-- Raw `InCommunicateThru` exchange for non-standard ISO14443A cards
-- Retry tuning helpers for ATR, PSL, and passive activation
-- Raw PN532 command access for commands without a dedicated helper
-- NDEF reading from Type 2 tags such as Ultralight and NTAG
-- NDEF reading from MIFARE Classic Mini, 1K, and 4K with MAD1-based NDEF sector discovery (and MAD2 on 4K cards that advertise it)
-- NDEF reading from Type 4 cards exposed through the PN532 ISO-DEP path
-- NDEF record builders (Text, URI, MIME, External), message encoding, and atomic TLV writing to already selected Type 2 / NTAG style tags
-- NDEF chunked-record (`CF`) reassembly into single logical records with malformed-sequence rejection
-
-Current scope is reader mode plus low-level NDEF encode/write helpers for already selected tags. Peer-to-peer, card emulation, and full card-formatting or one-shot write flows are not implemented here.
-
-## ISO-DEP and APDU API
-
-`pn532_14443_4_transceive()` is the low-level APDU exchange API. It uses the existing selected-target state and `InDataExchange` implementation, including MI chaining and NAD handling. Applications keep the normal `poll -> select -> exchange -> release` lifecycle.
-
-The APDU utilities are independent of that transport:
-
-```text
-Application
-    |-- APDU parser / response builder (stateless)
-    |
-    `-- pn532_14443_4_transceive()
-              |
-              `-- existing InDataExchange -> PN532 transport
+```sh
+idf.py add-dependency "jef-sure/pn532^0.5.0"
 ```
 
-`pn532_apdu_parse_command()` supports short APDU cases 1, 2S, 3S, and 4S. `pn532_apdu_parse_response()` separates response data from SW1/SW2, while `pn532_apdu_build_response()` writes `DATA SW1 SW2` into a caller-provided buffer. These helpers do not access PN532 hardware, allocate memory, or depend on a transport. Parsed data pointers refer directly to the caller-owned input buffer. Extended-length APDUs are not supported.
+Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
 
-The ISO-DEP lifecycle is:
+### 2. Wire the module
 
-1. Poll for a target and call `pn532_14443_select_by_uid()` to select it. A successful `InSelect` starts the session.
-2. Call `pn532_14443_4_transceive()` repeatedly while the target remains selected. It does not poll or select by UID. If the target is still listed but the session was deselected, it automatically issues `InSelect` for that target number before the exchange.
-3. End the session with `pn532_deselect_target()`, `pn532_release_target()`, or `pn532_set_rf_off()`. On success (`0x00`) deselect keeps the target listed for reactivation; release and RF off invalidate it. Deselect and release verify the returned status byte: `0x27` (target not known) means the chip already lost the target, and is treated as a successful close that clears both the session and the listed-target state — mirroring the NXP TAMA reference — so poll loops cannot wedge. Any other non-zero status fails, leaving the local state untouched. `pn532_in_select()` treats `0x27` as a hard error so callers re-poll.
-4. After target loss, RF timeout, or `pn532_recover()`, reacquire the card through polling and `pn532_14443_select_by_uid()` before continuing. A transceive with no listed target fails without starting a new discovery.
+PN532 boards select the host interface with two switches or jumpers, I0 and I1 (NXP AN10609):
 
-`pn532_14443_4_select_file()` and `pn532_14443_4_read_binary()` are convenience wrappers that construct their APDUs and delegate exchange to `pn532_14443_4_transceive()`; they do not implement a separate ISO-DEP path. In `pn532_14443_4_read_binary()`, encoded `Le = 0` requests the short-APDU maximum of 256 bytes.
+| Interface | I0 | I1 |
+|-----------|----|----|
+| UART (HSU) | 0 | 0 |
+| I2C        | 1 | 0 |
+| SPI        | 0 | 1 |
 
-## Requirements
+Change them only with the module powered off. For the SPI example below connect SCK → GPIO 18, MISO → GPIO 19, MOSI → GPIO 23, SS/NSS → GPIO 5, plus power and GND (ESP32 GPIOs are 3.3 V logic; check your board's supply range). IRQ and RST are optional.
 
-- ESP-IDF `>=5.2.0`
-- A PN532 breakout wired for one of the supported host transports
+### 3. Read cards
 
-The component uses the split ESP-IDF driver packages (`esp_driver_gpio`, `esp_driver_i2c`, `esp_driver_spi`, `esp_driver_uart`) and the modern I2C master API.
-
-## Add The Component To A Project
-
-### Local component
-
-Place the repository under your application's `components` directory.
-
-```text
-my_app/
-|- components/
-|  \- pn532/
-\- main/
-```
-
-The example project in this repository uses `REQUIRES pn532`, so the local component folder should be named `pn532`. If you keep a different folder name, update your consuming component's `REQUIRES` list to match.
-
-### Managed component metadata
-
-This repository also includes an `idf_component.yml` manifest for ESP-IDF Component Manager metadata.
-See `CHANGES.md` for release notes.
-
-## Sample App
-
-The maintained SPI demo lives in [`examples/simple`](examples/simple/README.md).
-
-It is now laid out as an ESP-IDF example project, with a project-level `CMakeLists.txt` and a separate `main` component under `examples/simple/main`.
-
-It shows how to:
-
-- initialize the PN532 over SPI
-- read and log the PN532 firmware identifier
-- poll for ISO14443A cards every 250 ms
-- print discovered UIDs
-- attempt an NDEF read first
-- fall back to raw block dumps by card family
-
-The example README covers wiring, project layout, and how to make the `pn532` component available when building the example directly.
-
-## Minimal Setup
+A complete `app_main()` that prints the UID of every card it sees and any URI stored on it:
 
 ```c
 #include <stdlib.h>
 
+#include "esp_log.h"
 #include "pn532.h"
+#include "pn532-ndef.h"
 
-pn532_bus_t *bus = pn532_spi_init(SPI3_HOST, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_23, GPIO_NUM_5, 1000000);
-if (bus == NULL) {
-    return;
+static const char *TAG = "nfc";
+
+void app_main(void)
+{
+    /* SCK, MISO, MOSI, NSS; clock 0 selects the 1 MHz default. */
+    pn532_bus_t *bus = pn532_spi_init(SPI2_HOST, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_23, GPIO_NUM_5, 0);
+    pn532_t     *nfc = bus ? pn532_init(bus, GPIO_NUM_NC, GPIO_NUM_NC) : NULL;
+    if (nfc == NULL) {
+        ESP_LOGE(TAG, "PN532 not found: check wiring and the I0/I1 switches");
+        pn532_bus_destroy(bus);
+        return;
+    }
+
+    for (;;) {
+        pn532_poll_status_t status;
+        pn532_uids_array_t *cards = pn532_14443_get_all_uids_ex(nfc, &status);
+
+        if (status == PN532_POLL_FOUND) {
+            pn532_uid_t *card = &cards->uids[0];
+            ESP_LOG_BUFFER_HEX(TAG, card->uid, card->uid_length);
+
+            ndef_message_parsed_t *msg = NULL;
+            if (pn532_ndef_read_card_auto(nfc, card, &msg) == NDEF_OK) {
+                for (size_t i = 0; i < msg->record_count; i++) {
+                    char uri[128];
+                    if (ndef_record_is_uri(&msg->records[i]) &&
+                        ndef_extract_uri(&msg->records[i], uri, sizeof(uri)) > 0) {
+                        ESP_LOGI(TAG, "URI: %s", uri);
+                    }
+                }
+                ndef_free_parsed_message(msg);
+            }
+            pn532_release_target(nfc);
+        } else if (status == PN532_POLL_TRANSPORT_ERROR) {
+            pn532_recover(nfc); /* the reader stopped answering */
+        }
+
+        free(cards);              /* NULL unless a card was found */
+        pn532_set_rf_off(nfc);    /* ends the cycle, lets the card reset */
+        pn532_delay_ms(250);
+    }
 }
-
-pn532_t *pn532 = pn532_init(bus, GPIO_NUM_NC, GPIO_NUM_NC);
-if (pn532 == NULL) {
-    pn532_bus_destroy(bus);
-    return;
-}
-
-uint32_t firmware = pn532_get_firmware_version(pn532);
-if (firmware == 0) {
-    pn532_deinit(pn532, true);
-    return;
-}
-
-/* ... use the device ... */
-
-pn532_deinit(pn532, true);
 ```
 
-Alternative transport constructors:
+The loop follows the lifecycle every application uses: **poll → read (optional) → release → RF off**. For UID-only access skip the read and the release. `pn532_ndef_read_card_auto()` selects the card itself and handles NTAG/Ultralight, MIFARE Classic (MAD, default keys), and Type 4 layouts.
 
-- `pn532_i2c_init(port, scl, sda, device_address, clock_speed_hz)`
-- `pn532_uart_init(uart_num, tx, rx, baud_rate)`
+All headers: `pn532.h` (transports, device, polling, ISO-DEP), `pn532-ndef.h` (NDEF read/write/parse), `pn532-mifare.h` (raw MIFARE primitives, rarely needed).
 
-For I2C, pass `0` as the address to use `PN532_I2C_DEFAULT_ADDRESS`. For UART, pass a non-positive baud rate to use `PN532_UART_DEFAULT_BAUD_RATE`.
+## Choosing A Transport
 
-I2C setup:
+| | SPI | I2C | UART (HSU) |
+|---|---|---|---|
+| Wires (plus power) | 4 | 2 | 2 |
+| Readiness | status register, deterministic | status byte | frame header (or IRQ pin) |
+| Speed / latency | best | good | good |
+| Shares the bus | several PN532 on one host | with any I2C device | no |
+| Pick it when | default choice | pins are scarce | SPI hosts are taken |
 
 ```c
+/* SPI: host, SCK, MISO, MOSI, NSS, clock (<= 0 selects PN532_SPI_DEFAULT_CLOCK_HZ = 1 MHz) */
+pn532_bus_t *bus = pn532_spi_init(SPI2_HOST, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_23, GPIO_NUM_5, 1000000);
+
+/* I2C: port, SCL, SDA, address (0 selects PN532_I2C_DEFAULT_ADDRESS = 0x24), clock */
 pn532_bus_t *bus = pn532_i2c_init(I2C_NUM_0, GPIO_NUM_22, GPIO_NUM_21, 0, 400000);
-pn532_t *pn532 = pn532_init(bus, GPIO_NUM_NC, GPIO_NUM_NC);
+
+/* UART: port, TX, RX, baud (<= 0 selects PN532_UART_DEFAULT_BAUD_RATE = 115200) */
+pn532_bus_t *bus = pn532_uart_init(UART_NUM_1, GPIO_NUM_17, GPIO_NUM_16, 115200);
 ```
 
-UART/HSU setup:
+Every transport is then used the same way: `pn532_init(bus, irq, rst)`, and finally `pn532_deinit(pn532, true)` to free both the device and the bus.
+
+- **IRQ pin (optional).** Pass the GPIO wired to the PN532 IRQ line to `pn532_init()`. The driver then waits on the interrupt instead of polling the bus, and readiness comes from the chip's own signal — most useful on UART. Pass `GPIO_NUM_NC` otherwise.
+- **RST pin (optional).** When passed, `pn532_reset()` and `pn532_recover()` pulse it for a hardware reset; without it the reset is logical only.
+- **SPI clock.** The PN532 accepts up to 5 MHz, but long wires and cheap modules often are not reliable above 1–2 MHz.
+- **UART baud rate.** If the module does not answer at the configured rate, `pn532_init()` probes all nine HSU rates (9600 to 1288000, UM0701-02 §7.2.8) and logs a warning with the rate it found. To run faster, switch both sides at once; the setting is volatile and the module returns to its power-on rate after a power cycle, which `pn532_recover()` detects and follows:
+
+  ```c
+  if (!pn532_uart_set_baud_rate(pn532, 921600)) {
+      /* Still on the previous rate; pn532_recover() re-synchronises if unsure. */
+  }
+  ```
+
+Buses created by your application can be shared; see [Multiple Readers And Shared Buses](#multiple-readers-and-shared-buses).
+
+## Sample App
+
+[`examples/simple`](examples/simple/README.md) is a complete SPI project: it logs the firmware version, polls every 250 ms, supports two cards per scan, reads NDEF first and falls back to raw block dumps by card family, and calls `pn532_recover()` after repeated transport failures. Its README covers wiring and building.
+
+## Common Tasks
+
+### Read NDEF
+
+`pn532_ndef_read_card_auto()` takes a UID from the current poll, selects the card, picks the right layout, and returns a heap-allocated parsed message:
 
 ```c
-pn532_bus_t *bus = pn532_uart_init(UART_NUM_1, GPIO_NUM_17, GPIO_NUM_16, 115200);
-pn532_t *pn532 = pn532_init(bus, GPIO_NUM_NC, GPIO_NUM_NC);
+#include "pn532-ndef.h"
+
+ndef_message_parsed_t *msg = NULL;
+ndef_result_t res = pn532_ndef_read_card_auto(pn532, &uids->uids[0], &msg);
+if (res == NDEF_OK) {
+    for (size_t i = 0; i < msg->record_count; i++) {
+        const ndef_record_t *rec = &msg->records[i];
+        if (ndef_record_is_text(rec)) {
+            const uint8_t *text = NULL;
+            size_t text_len = 0;
+            char lang[8] = {0};
+            bool utf16 = false;
+            if (ndef_extract_text(rec, &text, &text_len, lang, &utf16)) {
+                /* text remains valid until msg is freed */
+            }
+        }
+    }
+    ndef_free_parsed_message(msg);
+} else {
+    ESP_LOGW(TAG, "NDEF: %s", ndef_result_to_string(res));
+}
 ```
 
-`pn532_init(bus, irq, rst)` also accepts an optional IRQ GPIO. When the PN532 IRQ line is wired and passed here, the driver can use IRQ-ready notifications while waiting for ACK and response frames. Pass `GPIO_NUM_NC` when IRQ is not connected.
+Behavior by card family:
 
-## Poll, Select, And Inspect Cards
+- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed.
+- MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `NDEF_ERR_NO_NDEF`. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
+- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in MLe-sized chunks (capped at 250 bytes).
+
+The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `ndef_parse_message()`; the returned record storage remains valid until `ndef_free_parsed_message()`.
+
+### Write a URI to an NTAG
+
+```c
+pn532_poll_status_t status;
+pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(pn532, &status);
+if (status == PN532_POLL_FOUND && pn532_14443_select_by_uid(pn532, &uids->uids[0])) {
+    uint8_t         payload[64];
+    ndef_record_t   records[1];
+    ndef_message_t  message;
+
+    ndef_message_init(&message, records, 1);
+    /* abbreviate=true maps the https://www. prefix to URI identifier 0x01. */
+    if (ndef_make_uri_record(&records[0], "https://www.example.com", true,
+                             payload, sizeof(payload))) {
+        ndef_message_add(&message, &records[0]);
+        /* NTAG213: 4-byte pages, data starts at page 4, 36 writable pages left. */
+        ndef_result_t res = ndef_write_to_selected_card(pn532, &message, 4, 4, 36);
+        if (res == NDEF_OK) {
+            /* card now carries the URI record */
+        }
+    }
+    pn532_release_target(pn532);
+}
+free(uids);
+pn532_set_rf_off(pn532);
+```
+
+Text, MIME, and external records are built the same way with `ndef_make_text_record()`, `ndef_make_mime_record()`, and `ndef_make_external_record()`; several records can be added to one message.
+
+`ndef_write_to_selected_card()` writes a TLV-wrapped NDEF message to a Type 2 / NTAG style tag (`block_size = 4`) starting at the block you specify. The first block is staged with a hidden TLV length so a concurrent reader never sees a partially updated message; the real length is committed only after the trailing pages have been programmed. The helper is intentionally limited:
+
+- MIFARE Classic block sizes (`block_size = 16`) return `NDEF_ERR_UNSUPPORTED`. Writing Classic NDEF correctly requires MAD updates and sector-trailer handling, which are out of scope for the helper.
+- It does not format blank tags, write the capability container, or update sector trailers.
+- The caller must already have the target selected and authenticated where applicable.
+
+### Poll, select, and inspect cards
 
 ```c
 #include <stdlib.h>
@@ -291,9 +343,11 @@ if (pn532_apdu_parse_command(command_bytes, sizeof(command_bytes), &command) == 
 }
 ```
 
-## Two PN532 Devices On One SPI Bus
+## Multiple Readers And Shared Buses
 
-Call `pn532_spi_init()` once per PN532 with the same host and bus pins but a different NSS pin. ESP-IDF owns the shared host bus; each returned transport owns a separate `spi_device_handle_t` and controls its own NSS. A second call on an already initialized host is expected and does not log an error.
+### Two PN532 on one SPI bus
+
+Call `pn532_spi_init()` once per PN532 with the same host and bus pins but a different NSS pin. The first call initialises the host bus; the driver frees it when the last PN532 on that host is destroyed. Each returned transport owns a separate `spi_device_handle_t` and controls its own NSS. A second call on an already initialized host is expected and does not log an error.
 
 Poll devices sequentially and turn off one reader before polling the other. The driver inserts the RF settle delay after each RF off itself, so no manual post-off delay is needed:
 
@@ -320,7 +374,41 @@ for (;;) {
 
 For UID-only discovery the lifecycle is `poll -> RF off`. When card data is read, use `poll -> select/read -> release -> RF off`. Turning RF off successfully invalidates the local target and session state, so a later `pn532_release_target()` is a no-op and does not send stale `InRelease`.
 
-## Timeouts And Recovery
+### Sharing a bus with other devices
+
+`pn532_i2c_init()` and `pn532_spi_init()` create the bus themselves. When other devices live on the same port, create the bus in your application and attach the PN532 to it. Destroying the PN532 then removes only its device; the bus and its neighbours stay alive.
+
+```c
+i2c_master_bus_config_t cfg = {
+    .i2c_port = I2C_NUM_0, .sda_io_num = GPIO_NUM_21, .scl_io_num = GPIO_NUM_22,
+    .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = 1,
+};
+i2c_master_bus_handle_t i2c_bus;
+ESP_ERROR_CHECK(i2c_new_master_bus(&cfg, &i2c_bus));
+/* ... add other devices to i2c_bus ... */
+
+pn532_bus_t *bus = pn532_i2c_attach(I2C_NUM_0, 0, 400000); /* ESP-IDF >= 5.4 */
+pn532_t *pn532 = pn532_init(bus, GPIO_NUM_NC, GPIO_NUM_NC);
+```
+
+For SPI, initialise the host with `spi_bus_initialize()` and call `pn532_spi_attach(host, nss, clock_hz)`.
+
+## Troubleshooting
+
+- **`pn532_init()` returns NULL** — the chip never answered `GetFirmwareVersion`. Check the I0/I1 switches against the transport you initialise, power, ground, and the pin numbers. On SPI try a lower clock; on I2C check pull-ups.
+- **`module answers at N baud, not the configured M baud`** — the UART module runs at another rate (often after an earlier `pn532_uart_set_baud_rate()`); the driver found it and continues. Configure that rate to skip the probe on the next boot.
+- **`pn532_i2c_attach: requires ESP-IDF >= 5.4`** — attaching to an existing I2C bus needs `i2c_master_get_bus_handle()`; use `pn532_i2c_init()` on older ESP-IDF.
+- **`invalid frame header` / `corrupted response ..., requesting retransmission`** — noise or a desynchronised stream. Occasional retransmissions are handled automatically; if they persist, shorten the wires, lower the clock or baud rate, or call `pn532_recover()`.
+- **`no ACK for command ... within N ms`** — the transport is not responding at all: check wiring, NSS/address/baud rate, and power. Degrades to `PN532_POLL_TRANSPORT_ERROR` at the polling layer. Repeated occurrences → `pn532_recover()`.
+- **Alternating `PN532_POLL_FOUND` / `PN532_POLL_NO_TARGET` with a static card** — the card sits in HALT and does not power down before the next poll. Increase the RF settle delay (`pn532_set_rf_settle_delay()`); the 20 ms default fits a 250 ms two-reader cycle.
+- **Frequent `PN532_POLL_TIMEOUT` with a present card** — the response phase is too short for the card. Raise `pn532->timeout_ms` (default 500 ms). For Type 4 APDU exchanges the driver already applies a 1500 ms floor.
+- **`NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
+- **Two readers on one SPI bus interfere** — poll sequentially and finish each cycle with `pn532_set_rf_off()`; the settle delay is applied by the driver itself. Never poll both readers concurrently from different tasks.
+- **`pn532_in_select: status 0x27`** — the PN532 rejects the command in its current context, typically because the target number is no longer known (for example after an unexpected chip reset). Select fails so the caller re-polls. Deselect/release close the local session successfully on `0x27`; the log line `target already lost (0x27)` at debug level is informational.
+
+## Reliability And Recovery
+
+### Timeouts
 
 Every `pn532_execute_command()` runs in two phases with separate budgets:
 
@@ -335,6 +423,15 @@ pn532->timeout_ms = 800;          /* more headroom for slow cards */
 ```
 
 After a timeout the driver sends the UM0701-02 ACK-abort frame and drains the full PN532 buffer (an aborted two-card `InListPassiveTarget` can leave ~65 bytes behind; a short drain would corrupt the next frame with `invalid frame header`).
+
+### Unreliable links
+
+Long wires, noisy power, or a module that power-cycles on its own are handled in escalating steps:
+
+1. **Frame** — a response damaged on the line (bad checksum, broken header/postamble, truncated HSU frame) is requested again with the UM0701-02 NACK frame, up to two times. The command is not re-executed, so writes and RF exchanges are never applied twice. Logged as `corrupted response ..., requesting retransmission`.
+2. **Command** — a missing ACK or response triggers the ACK-abort and buffer drain described above; the call fails with a typed status.
+3. **Device** — `pn532_recover()` resets the chip, checks that it answers, lets the transport re-negotiate the link if it does not (HSU probes all rates), and re-applies the runtime configuration.
+4. **Application** — if `pn532_recover()` fails, destroy and re-create the transport, or power-cycle the module.
 
 ### pn532_recover()
 
@@ -351,106 +448,53 @@ if (status == PN532_POLL_TRANSPORT_ERROR) {
 }
 ```
 
-It aborts any in-flight command, resets target/session state, re-applies the SAM/retry configuration, verifies the firmware version, and leaves the RF field off.
+It aborts any in-flight command, resets target/session state, verifies that the chip answers (re-negotiating the link through the transport if it does not), re-applies the SAM/retry configuration, and leaves the RF field off.
 
 ### Bus wake-up
 
-The PN532 enters low-power after power-up and after PowerDown. Each transport implements the NXP `phTalTama_WakeUp` role in its own way: SPI wakes on the NSS falling edge, HSU on a `0x55 0x55` preamble, I2C on a START condition (a zero-length probe plus an oscillator start-up delay). `pn532_reset()` and `pn532_recover()` send the wake automatically — there is no per-command wake frame, so the SPI/HSU hot paths stay lean.
+The PN532 enters low-power after power-up and after PowerDown. Each transport implements the NXP `phTalTama_WakeUp` role in its own way: SPI wakes on the NSS falling edge, HSU on a `0x55 0x55` preamble, I2C on its own address being recognised (an address-only probe plus an oscillator start-up delay). `pn532_reset()` and `pn532_recover()` send the wake automatically — there is no per-command wake frame, so the SPI/HSU hot paths stay lean.
 
 ### RF settle delay
 
 `pn532_set_rf_off()` waits `pn532->rf_settle_delay_ms` (default `PN532_RF_SETTLE_DELAY_MS` = 20 ms) before returning, so a card sitting in HALT powers down and the next `InListPassiveTarget` re-activates it cleanly. With a static card and a 250 ms two-reader poll cycle this keeps every iteration at `PN532_POLL_FOUND` without alternating `FOUND`/`NO_TARGET`. Applications no longer need their own post-RF-off delay; tune or disable it with `pn532_set_rf_settle_delay()` (pass 0 to disable).
 
-### Soft deselect
+## Reference
 
-`pn532_deselect_target()` issues `InDeselect` (0x44): the card goes to HALT but stays listed inside the PN532, so a later select reactivates it without a field restart. Use `pn532_release_target()` when you are done with the card entirely. Both check the returned status byte per UM0701-02: `0x27` (target not known) closes the local session successfully and clears the listed-target handle like the NXP TAMA reference; other non-zero statuses fail.
+### Features and scope
 
-## Read NDEF
+- SPI, I2C, and UART/HSU transports; shared SPI/I2C buses via `pn532_spi_attach()` / `pn532_i2c_attach()`
+- Optional IRQ-driven readiness; optional hardware reset pin
+- ISO14443A polling with up to two cards per scan, typed poll status, selection by UID
+- MIFARE Classic authentication and block access; Ultralight / NTAG page access; value-block operations
+- ISO-DEP (Type 4) APDU exchange with MI chaining and NAD handling aligned with the NXP TAMA reference (`phTalTama_Transceive`)
+- Stateless ISO 7816-4 short APDU parser and response builder
+- NDEF reading from Type 2 (Ultralight, NTAG), MIFARE Classic Mini/1K/4K (MAD1/MAD2), and Type 4 cards; chunked-record reassembly
+- NDEF record builders (Text, URI, MIME, External), message encoding, and atomic TLV writing to selected Type 2 / NTAG tags
+- `GetGeneralStatus` diagnostics, raw `InCommunicateThru`, raw PN532 commands, retry tuning
+- Link recovery: NACK retransmission, HSU auto-baud, `pn532_recover()` with transport resync
 
-```c
-#include "pn532-ndef.h"
+Not implemented: peer-to-peer, card emulation, formatting blank tags, and writing NDEF to MIFARE Classic.
 
-ndef_message_parsed_t *msg = NULL;
-ndef_result_t res = pn532_ndef_read_card_auto(pn532, &uids->uids[0], &msg);
-if (res == NDEF_OK) {
-    for (size_t i = 0; i < msg->record_count; i++) {
-        const ndef_record_t *rec = &msg->records[i];
-        if (ndef_record_is_text(rec)) {
-            const uint8_t *text = NULL;
-            size_t text_len = 0;
-            char lang[8] = {0};
-            bool utf16 = false;
-            if (ndef_extract_text(rec, &text, &text_len, lang, &utf16)) {
-                /* text remains valid until msg is freed */
-            }
-        }
-    }
-    ndef_free_parsed_message(msg);
-}
-```
+Requirements: ESP-IDF 5.2 or newer (`pn532_i2c_attach()` needs 5.4). The component's CMakeLists selects `driver` or the split `esp_driver_*` components depending on the ESP-IDF version. Release notes are in [CHANGES.md](CHANGES.md).
 
-Behavior by card family:
+### Card session lifecycle
 
-- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed.
-- MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `NDEF_ERR_NO_NDEF`. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
-- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in MLe-sized chunks (capped at 250 bytes).
+1. Poll for a target and call `pn532_14443_select_by_uid()` to select it. A successful `InSelect` starts the session.
+2. Call `pn532_14443_4_transceive()` (or block/NDEF helpers) repeatedly while the target remains selected. If the target is still listed but the session was deselected, ISO-DEP exchange automatically issues `InSelect` for that target number first.
+3. End the session with `pn532_deselect_target()`, `pn532_release_target()`, or `pn532_set_rf_off()`. On success (`0x00`) deselect keeps the target listed for reactivation without a field restart; release and RF off invalidate it. Deselect and release verify the returned status byte: `0x27` means the chip already lost the target and is treated as a successful close that clears both the session and the listed-target state — mirroring the NXP TAMA reference — so poll loops cannot wedge. Any other non-zero status fails, leaving the local state untouched. `pn532_in_select()` treats `0x27` as a hard error so callers re-poll.
+4. After target loss, RF timeout, or `pn532_recover()`, reacquire the card through polling and `pn532_14443_select_by_uid()` before continuing. A transceive with no listed target fails without starting a new discovery.
 
-The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `ndef_parse_message()`; the returned record storage remains valid until `ndef_free_parsed_message()`.
+### APDU utilities
 
-## Build And Write NDEF
+`pn532_14443_4_transceive()` is the APDU exchange API. The APDU utilities are independent of it and of any hardware:
 
-`pn532-ndef.h` also exposes record builders, an encoder, and a low-level write helper for tags that are already selected and writable.
+- `pn532_apdu_parse_command()` supports short APDU cases 1, 2S, 3S, and 4S; extended-length APDUs are rejected.
+- `pn532_apdu_parse_response()` separates response data from SW1/SW2; `pn532_apdu_build_response()` writes `DATA SW1 SW2` into a caller-provided buffer.
+- They do not allocate memory; parsed data pointers refer directly to the caller-owned input buffer.
 
-```c
-#include "pn532-ndef.h"
+`pn532_14443_4_select_file()` and `pn532_14443_4_read_binary()` build their APDUs and delegate to `pn532_14443_4_transceive()`. In `pn532_14443_4_read_binary()`, encoded `Le = 0` requests the short-APDU maximum of 256 bytes.
 
-uint8_t text_payload[64];
-ndef_record_t records[1];
-ndef_message_t message;
-
-ndef_message_init(&message, records, 1);
-if (ndef_make_text_record(&records[0], "en", (const uint8_t *)"hello", 5, false, text_payload, sizeof(text_payload))) {
-    ndef_message_add(&message, &records[0]);
-    ndef_write_to_selected_card(pn532, &message, 4, 4, 64);
-}
-```
-
-`ndef_write_to_selected_card()` writes a TLV-wrapped NDEF message to a Type 2 / NTAG style tag (`block_size = 4`) starting at the block you specify. The first block is staged with a hidden TLV length so a concurrent reader never sees a partially updated message; the real length is committed only after the trailing pages have been programmed.
-
-A complete "write a URI to an NTAG" cycle:
-
-```c
-pn532_poll_status_t status;
-pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(pn532, &status);
-if (status == PN532_POLL_FOUND && pn532_14443_select_by_uid(pn532, &uids->uids[0])) {
-    uint8_t         payload[64];
-    ndef_record_t   records[1];
-    ndef_message_t  message;
-
-    ndef_message_init(&message, records, 1);
-    /* abbreviate=true maps the https://www. prefix to URI identifier 0x01. */
-    if (ndef_make_uri_record(&records[0], "https://www.example.com", true,
-                             payload, sizeof(payload))) {
-        ndef_message_add(&message, &records[0]);
-        /* NTAG213: 4-byte pages, data starts at page 4, 36 writable pages left. */
-        ndef_result_t res = ndef_write_to_selected_card(pn532, &message, 4, 4, 36);
-        if (res == NDEF_OK) {
-            /* card now carries the URI record */
-        }
-    }
-    pn532_release_target(pn532);
-}
-free(uids);
-pn532_set_rf_off(pn532);
-```
-
-The helper is intentionally limited:
-
-- MIFARE Classic block sizes (`block_size = 16`) return `NDEF_ERR_UNSUPPORTED`. Writing Classic NDEF correctly requires MAD updates and sector-trailer handling, which are out of scope for the helper.
-- It does not format blank tags, write the capability container, or update sector trailers.
-- The caller must already have the target selected and authenticated where applicable.
-
-## Low-Level MIFARE Access
+### Low-level MIFARE access
 
 Include `include/pn532-mifare.h` only when you need raw block or value operations. For an already selected ISO14443A target, `pn532_14443_block_read()` / `pn532_14443_block_write()` from `pn532.h` are the preferred entry points.
 
@@ -458,7 +502,7 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - `pn532_mifare_block_read()` reads one 16-byte MIFARE Classic block, or 16 bytes spanning four Type 2 pages.
 - Value-block helpers (`pn532_mifare_increment()`, `pn532_mifare_decrement()`, `pn532_mifare_restore()`, `pn532_mifare_transfer()`) stage the operation in the PN532 transfer buffer; `pn532_mifare_transfer()` commits it. `MIFARE_CMD_RESTORE` is preferred; `MIFARE_CMD_STORE` remains as a backward-compatible alias.
 
-## Advanced Driver Control
+### Advanced driver control
 
 `pn532.h` also exposes lower-level control helpers:
 
@@ -466,7 +510,7 @@ Include `include/pn532-mifare.h` only when you need raw block or value operation
 - `pn532_set_passive_activation_retries()` changes only the passive activation retry count while leaving ATR and PSL retries at their defaults.
 - `pn532_execute_command()` sends a raw PN532 command and returns the response payload without the PN532 frame wrapper, TFI byte, or response-code byte. Use it for commands that are not covered by a dedicated helper.
 
-### Diagnostics with GetGeneralStatus
+#### Diagnostics with GetGeneralStatus
 
 `pn532_get_general_status()` is a cheap health probe that does not disturb the RF field or the listed targets. It decodes the raw UM0701-02 response (`Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus`) into per-target entries:
 
@@ -485,7 +529,7 @@ if (pn532_get_general_status(pn532, &status)) {
 
 Use it after transport failures to see whether the chip still reports a sane state, or to inspect which logical targets the PN532 still holds listed.
 
-### Raw exchange with InCommunicateThru
+#### Raw exchange with InCommunicateThru
 
 `pn532_in_communicate_thru()` forwards bytes verbatim over the RF interface, without the DEP/MIFARE wrapping of `InDataExchange`. Use it for non-standard cards and vendor-specific commands:
 
@@ -500,20 +544,9 @@ if (pn532_in_communicate_thru(pn532, cmd, sizeof(cmd), rx, &rx_len, 500)) {
 
 The target must be selected first (see `pn532_14443_select_by_uid()`). Responses carrying MI (chaining) are drained and concatenated automatically; a NAD byte in the reply is stripped.
 
-## Troubleshooting
+### Ownership and lifetime
 
-Common log messages and what they mean:
-
-- **`invalid frame header`** — the PN532 response stream is desynchronised: the driver read a frame that does not start with the `00 00 FF` preamble. Historically caused by an aborted two-card `InListPassiveTarget` leaving a ~65-byte response in the FIFO (the abort drain now prevents this). If it persists, call `pn532_recover()`.
-- **`no ACK for command ... within N ms`** — the transport is not responding at all: check wiring, NSS/address/baud rate, and power. Degrades to `PN532_POLL_TRANSPORT_ERROR` at the polling layer. Repeated occurrences → `pn532_recover()`.
-- **Alternating `PN532_POLL_FOUND` / `PN532_POLL_NO_TARGET` with a static card** — the card sits in HALT and does not power down before the next poll. Increase the RF settle delay (`pn532_set_rf_settle_delay()`); the 20 ms default fits a 250 ms two-reader cycle.
-- **Frequent `PN532_POLL_TIMEOUT` with a present card** — the response phase is too short for the card. Raise `pn532->timeout_ms` (default 500 ms). For Type 4 APDU exchanges the driver already applies a 1500 ms floor.
-- **Two readers on one SPI bus interfere** — poll sequentially and finish each cycle with `pn532_set_rf_off()`; the settle delay is applied by the driver itself. Never poll both readers concurrently from different tasks.
-- **`pn532_in_select: status 0x27`** — the PN532 reports the target number as not known: the driver-side and chip-side target state have desynchronised (for example after an unexpected chip reset). Select fails so the caller re-polls. Deselect/release close the local session successfully on `0x27`; the log line `target already lost (0x27)` at debug level is informational.
-
-## Ownership And Lifetime
-
-- `pn532_spi_init()`, `pn532_i2c_init()`, and `pn532_uart_init()` return heap-allocated `pn532_bus_t *` handles.
+- `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_spi_attach()`, and `pn532_i2c_attach()` return heap-allocated `pn532_bus_t *` handles. The `*_attach()` variants never free the underlying bus.
 - `pn532_init()` returns a heap-allocated `pn532_t *` device context.
 - `pn532_deinit(pn532, true)` frees both the device and its bus.
 - `pn532_deinit(pn532, false)` frees only the device; destroy the bus separately with `pn532_bus_destroy()`.
@@ -524,9 +557,9 @@ Common log messages and what they mean:
 
 `pn532_t` is a public struct because the driver is split across multiple source files, but application code should treat it as an owned handle and not modify its fields directly.
 
-## API Map
+### API map
 
-- Transport and device lifecycle: `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_init()`, `pn532_deinit()`, `pn532_reset()`, `pn532_recover()`
+- Transport and device lifecycle: `pn532_spi_init()`, `pn532_i2c_init()`, `pn532_uart_init()`, `pn532_spi_attach()`, `pn532_i2c_attach()`, `pn532_uart_set_baud_rate()`, `pn532_init()`, `pn532_deinit()`, `pn532_reset()`, `pn532_recover()`
 - RF field control: `pn532_set_rf_field()`, `pn532_set_rf_on()`, `pn532_set_rf_off()`, `pn532_set_rf_settle_delay()`
 - Retry tuning and raw commands: `pn532_set_max_retries()`, `pn532_set_passive_activation_retries()`, `pn532_set_ack_timeout()`, `pn532_execute_command()`
 - Diagnostics: `pn532_get_firmware_version()`, `pn532_get_general_status()`

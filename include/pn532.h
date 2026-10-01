@@ -18,11 +18,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
-/** @brief Default 7-bit PN532 I2C address in ESP-IDF's left-shifted form. */
+/** @brief Default PN532 I2C address, 7-bit form as ESP-IDF expects (UM0701-02: 0x48 write / 0x49 read). */
 #define PN532_I2C_DEFAULT_ADDRESS (0x24)
 
 /** @brief Default HSU baud rate used when uart_init() receives a non-positive baud. */
 #define PN532_UART_DEFAULT_BAUD_RATE (115200)
+
+/** @brief SPI clock used when pn532_spi_init()/pn532_spi_attach() receive a non-positive clock. */
+#define PN532_SPI_DEFAULT_CLOCK_HZ (1000000)
 
 /** @brief ACK timeout in milliseconds applied by pn532_execute_command(). */
 #define PN532_ACK_TIMEOUT_MS (50)
@@ -135,12 +138,16 @@ void pn532_delay_ms(int ms);
  * The returned handle is heap-allocated. Destroy it with pn532_bus_destroy(),
  * or pass free_bus=true to pn532_deinit().
  *
+ * The host bus is initialised on first use and freed when the last PN532
+ * created by this driver on that host is destroyed. A host already
+ * initialised by application code is reused and never freed by the driver.
+ *
  * @param host_id SPI host that carries the PN532 device.
  * @param sck SPI clock GPIO used when initialising the host bus.
  * @param miso SPI MISO GPIO used when initialising the host bus.
  * @param mosi SPI MOSI GPIO used when initialising the host bus.
  * @param nss SPI chip-select GPIO for the PN532 device.
- * @param clock_speed_hz SPI device clock.
+ * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ.
  * @return Newly allocated transport handle, or NULL on failure.
  */
 pn532_bus_t *pn532_spi_init(         //
@@ -151,6 +158,19 @@ pn532_bus_t *pn532_spi_init(         //
     gpio_num_t        nss,           //
     int               clock_speed_hz //
 );
+
+/**
+ * @brief Attach a PN532 to an SPI host bus already initialised by the application.
+ *
+ * The bus stays owned by the caller: pn532_bus_destroy() removes only the
+ * PN532 device and never calls spi_bus_free().
+ *
+ * @param host_id Initialised SPI host.
+ * @param nss SPI chip-select GPIO for the PN532 device.
+ * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ.
+ * @return Newly allocated transport handle, or NULL when the host is not initialised or on failure.
+ */
+pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz);
 
 /**
  * @brief Create a PN532 I2C transport handle.
@@ -170,16 +190,43 @@ pn532_bus_t *pn532_i2c_init(       //
 );
 
 /**
+ * @brief Attach a PN532 to an I2C master bus already created by the application.
+ *
+ * Use this when the PN532 shares the port with other I2C devices. The bus
+ * handle is looked up with i2c_master_get_bus_handle() (ESP-IDF >= 5.4) and
+ * stays owned by the caller: pn532_bus_destroy() removes only the PN532
+ * device and never deletes the bus. If device_address is 0,
+ * PN532_I2C_DEFAULT_ADDRESS is used.
+ *
+ * @return Newly allocated transport handle, or NULL when no bus exists on port or on failure.
+ */
+pn532_bus_t *pn532_i2c_attach(i2c_port_num_t port, uint16_t device_address, uint32_t clock_speed_hz);
+
+/**
  * @brief Create a PN532 UART/HSU transport handle.
  *
  * The constructor installs and owns the UART driver for uart_num. If baud_rate
- * is non-positive, PN532_UART_DEFAULT_BAUD_RATE is used.
+ * is non-positive, PN532_UART_DEFAULT_BAUD_RATE is used. If the module does
+ * not answer at that rate, pn532_init() probes the other HSU rates and logs
+ * the rate the module actually uses.
  *
  * @return Newly allocated transport handle, or NULL on failure.
  */
 pn532_bus_t *pn532_uart_init(uart_port_t uart_num, gpio_num_t tx, gpio_num_t rx, int baud_rate);
 
-/** @brief Destroy a transport handle created by pn532_spi_init(), pn532_i2c_init(), or pn532_uart_init(). */
+/**
+ * @brief Switch PN532 and host UART to a new HSU baud rate (SetSerialBaudRate, 0x10).
+ *
+ * Supported rates: 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1288000.
+ * The setting is volatile: the PN532 returns to its power-on rate after a
+ * power cycle or hard reset.
+ *
+ * @return true when the PN532 accepted the rate and the host UART was switched;
+ *         false for non-UART transports, unsupported rates, or command failure.
+ */
+bool pn532_uart_set_baud_rate(pn532_t *pn532, uint32_t baud_rate);
+
+/** @brief Destroy a transport handle created by a pn532_*_init() or pn532_*_attach() constructor. */
 void pn532_bus_destroy(pn532_bus_t *bus);
 
 /**
@@ -482,9 +529,10 @@ int pn532_14443_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, 
  * @brief Infer card subtype, block count, and block size from ATQA/SAK.
  *
  * The helper updates uid->subtype, uid->blocks_count, and uid->block_size in
- * place and also returns the same values through the out parameters. When the
- * SAK is not recognised, subtype is left as PN532_MIFARE_UNKNOWN and the
- * geometry outputs are set to 0.
+ * place and also returns the same values through the out parameters. For
+ * DESFire, blocks_count is 0 because capacity cannot be inferred from SAK and
+ * block_size is 1 to represent byte-addressed ISO-DEP application files. When
+ * the SAK is not recognised, subtype and both geometry outputs are set to 0.
  */
 bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *blocks_count, uint16_t *block_size);
 

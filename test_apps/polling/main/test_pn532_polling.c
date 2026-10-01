@@ -38,9 +38,15 @@ typedef struct
     uint8_t     pending_frames;
     uint8_t     mi_round;
     bool        exchange_loops_mi;
+    uint32_t    host_baud; /* simulated link setting changed by resync */
+    uint32_t    chip_baud; /* 0: chip answers at any host setting */
+    size_t      resync_calls;
+    size_t      nack_count;
+    uint8_t     corrupt_responses; /* next N response frames get a broken DCS */
 } mock_bus_t;
 
-static const uint8_t ack_frame[] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+static const uint8_t ack_frame[]  = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+static const uint8_t nack_frame[] = {0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00};
 
 static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
 {
@@ -48,6 +54,12 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
 
     if (len == sizeof(ack_frame) && memcmp(buffer, ack_frame, sizeof(ack_frame)) == 0) {
         mock->abort_count++;
+        return true;
+    }
+    if (len == sizeof(nack_frame) && memcmp(buffer, nack_frame, sizeof(nack_frame)) == 0) {
+        /* The PN532 resends the last response without a new ACK. */
+        mock->nack_count++;
+        mock->read_phase = 1;
         return true;
     }
 
@@ -77,6 +89,20 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
     mock->current_command                 = command;
     mock->read_phase                      = 0;
     return true;
+}
+
+/* Transport-side re-negotiation stand-in: switch to the chip's setting, ask the core to probe. */
+static bool mock_resync(pn532_bus_t *bus, pn532_bus_probe_t probe, void *ctx)
+{
+    mock_bus_t *mock = (mock_bus_t *)bus;
+    uint32_t    original = mock->host_baud;
+    mock->resync_calls++;
+    mock->host_baud = mock->chip_baud;
+    if (probe(ctx)) {
+        return true;
+    }
+    mock->host_baud = original;
+    return false;
 }
 
 /*
@@ -145,6 +171,12 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
     case PN532_COMMAND_RFCONFIGURATION:
         payload_len = 0;
         break;
+    case PN532_COMMAND_GETFIRMWAREVERSION: {
+        static const uint8_t firmware[] = {0x32, 0x01, 0x06, 0x07};
+        payload                         = firmware;
+        payload_len                     = sizeof(firmware);
+        break;
+    }
     case PN532_COMMAND_GETGENERALSTATUS: {
         /* UM0701-02 format: Err Field NbTg [Tg BrRx BrTx Type]{NbTg} SAMstatus.
          * Two targets: Tg1 at 106 kbps ISO14443-3A, Tg2 at 212 kbps ISO14443-3A. */
@@ -229,12 +261,19 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
     }
 
     mock_response_frame(mock->current_command, payload, payload_len, buffer, len);
+    if (mock->corrupt_responses > 0) {
+        mock->corrupt_responses--;
+        buffer[7 + payload_len] ^= 0x5A; /* line noise in the DCS */
+    }
     return true;
 }
 
 static bool mock_ready(pn532_bus_t *bus)
 {
     mock_bus_t *mock = (mock_bus_t *)bus;
+    if (mock->chip_baud != 0 && mock->host_baud != mock->chip_baud) {
+        return false;
+    }
     if (mock->mode == MOCK_ACK_TIMEOUT) {
         return mock_ack_never_ready(bus);
     }
@@ -266,6 +305,24 @@ static void assert_commands(const mock_bus_t *mock, const uint8_t *expected, siz
 {
     TEST_ASSERT_EQUAL(count, mock->command_count);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, mock->commands, count);
+}
+
+TEST_CASE("DESFire detection reports unknown byte-addressed capacity", "[pn532][polling][desfire]")
+{
+    static const uint8_t desfire_saks[] = {0x20, 0x24};
+
+    for (size_t index = 0; index < ARRAY_SIZE(desfire_saks); index++) {
+        pn532_uid_t uid        = {.sak = desfire_saks[index]};
+        uint16_t    blocks     = UINT16_MAX;
+        uint16_t    block_size = UINT16_MAX;
+
+        TEST_ASSERT_TRUE(pn532_14443_detect_card_type_and_capacity(&uid, &blocks, &block_size));
+        TEST_ASSERT_EQUAL(PN532_MIFARE_DESFIRE, uid.subtype);
+        TEST_ASSERT_EQUAL_UINT16(0, blocks);
+        TEST_ASSERT_EQUAL_UINT16(1, block_size);
+        TEST_ASSERT_EQUAL_UINT16(0, uid.blocks_count);
+        TEST_ASSERT_EQUAL_UINT16(1, uid.block_size);
+    }
 }
 
 TEST_CASE("poll ends previous session and does not select a target", "[pn532][polling]")
@@ -525,10 +582,55 @@ TEST_CASE("recover restores runtime configuration without recreating the bus", "
     TEST_ASSERT_FALSE(pn532.is_rf_on);
     TEST_ASSERT_EQUAL(PN532_COMMAND_STATUS_OK, pn532.last_command_status);
 
-    /* SAM config, retries, firmware version, RF off — in that order. */
-    const uint8_t expected[] = {PN532_COMMAND_SAMCONFIGURATION, PN532_COMMAND_RFCONFIGURATION,
-                                PN532_COMMAND_GETFIRMWAREVERSION, PN532_COMMAND_RFCONFIGURATION};
+    /* Link check first (so a silent chip can be resynced), then SAM config,
+     * retries, RF off. */
+    const uint8_t expected[] = {PN532_COMMAND_GETFIRMWAREVERSION, PN532_COMMAND_SAMCONFIGURATION,
+                                PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_RFCONFIGURATION};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
+}
+
+TEST_CASE("recover re-negotiates a link that went silent", "[pn532][recover][resync]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.base.resync = mock_resync;
+    mock.host_baud   = 921600;
+    mock.chip_baud   = 115200; /* module power-cycled back to its default rate */
+
+    TEST_ASSERT_TRUE(pn532_recover(&pn532));
+    TEST_ASSERT_EQUAL(1, mock.resync_calls);
+    TEST_ASSERT_EQUAL_UINT32(115200, mock.host_baud);
+
+    /* Without a transport resync hook a silent chip fails recovery. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.host_baud = 921600;
+    mock.chip_baud = 115200;
+    TEST_ASSERT_FALSE(pn532_recover(&pn532));
+}
+
+TEST_CASE("corrupted response is recovered by NACK retransmission", "[pn532][nack]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.corrupt_responses = 1;
+
+    TEST_ASSERT_NOT_EQUAL(0, pn532_get_firmware_version(&pn532));
+    TEST_ASSERT_EQUAL(1, mock.nack_count);
+    /* The command itself is not re-executed. */
+    const uint8_t expected[] = {PN532_COMMAND_GETFIRMWAREVERSION};
+    assert_commands(&mock, expected, ARRAY_SIZE(expected));
+
+    /* Persistent corruption gives up after the bounded retries. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.corrupt_responses = 10;
+    TEST_ASSERT_EQUAL(0, pn532_get_firmware_version(&pn532));
+    TEST_ASSERT_EQUAL(2, mock.nack_count);
 }
 
 TEST_CASE("rf settle delay and ack timeout are configurable", "[pn532][rf]")
@@ -747,7 +849,7 @@ TEST_CASE("Type 4 helpers delegate APDUs to InDataExchange", "[pn532][exchange][
     size_t  data_len = sizeof(data);
     TEST_ASSERT_TRUE(pn532_14443_4_read_binary(&pn532, 0, sizeof(data), data, &data_len));
     TEST_ASSERT_EQUAL(3u, data_len);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, data, data_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x01, 0x02, 0x03}), data, data_len);
 
     const uint8_t expected[] = {PN532_COMMAND_INDATAEXCHANGE, PN532_COMMAND_INDATAEXCHANGE};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
@@ -883,7 +985,7 @@ TEST_CASE("APDU command parsing handles short cases and rejects malformed frames
     TEST_ASSERT_EQUAL_PTR(&case3s[5], command.data);
     TEST_ASSERT_EQUAL(3u, command.data_len);
     TEST_ASSERT_FALSE(command.has_le);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, command.data, 3);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x01, 0x02, 0x03}), command.data, 3);
 
     TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_command(case4s, sizeof(case4s), &command));
     TEST_ASSERT_EQUAL_PTR(&case4s[5], command.data);
@@ -924,7 +1026,7 @@ TEST_CASE("APDU response parsing and building preserve data and status word", "[
     TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_parse_response(raw, sizeof(raw), &response));
     TEST_ASSERT_EQUAL_PTR(raw, response.data);
     TEST_ASSERT_EQUAL(3u, response.data_len);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03}, response.data, 3);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x01, 0x02, 0x03}), response.data, 3);
     TEST_ASSERT_EQUAL_HEX16(PN532_APDU_SW_WRONG_P1P2, pn532_apdu_get_status(&response));
 
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_parse_response(raw, 1, &response));
@@ -935,7 +1037,7 @@ TEST_CASE("APDU response parsing and building preserve data and status word", "[
     size_t  out_len = 0;
     TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_build_response(out, sizeof(out), raw, 3, 0x90, 0x00, &out_len));
     TEST_ASSERT_EQUAL(5u, out_len);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t[]){0x01, 0x02, 0x03, 0x90, 0x00}, out, 5);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x01, 0x02, 0x03, 0x90, 0x00}), out, 5);
 
     TEST_ASSERT_EQUAL(ESP_OK, pn532_apdu_build_response(out, sizeof(out), NULL, 0, 0x90, 0x00, &out_len));
     TEST_ASSERT_EQUAL(2u, out_len);
@@ -947,6 +1049,52 @@ TEST_CASE("APDU response parsing and building preserve data and status word", "[
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_build_response(out, sizeof(out), NULL, 1, 0x90, 0x00, &out_len));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_build_response(NULL, sizeof(out), raw, 3, 0x90, 0x00, &out_len));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, pn532_apdu_build_response(out, sizeof(out), raw, 3, 0x90, 0x00, NULL));
+}
+
+TEST_CASE("init falls back to transport resync when the device stays silent", "[pn532][init][resync]")
+{
+    mock_bus_t mock;
+    memset(&mock, 0, sizeof(mock));
+    mock.base.write_command = mock_write;
+    mock.base.read_data     = mock_read;
+    mock.base.is_ready      = mock_ready;
+    mock.base.resync        = mock_resync;
+    mock.mode               = MOCK_CARD;
+    mock.host_baud          = 115200;
+    mock.chip_baud          = 57600;
+
+    pn532_t *pn532 = pn532_init(&mock.base, GPIO_NUM_NC, GPIO_NUM_NC);
+    TEST_ASSERT_NOT_NULL(pn532);
+    TEST_ASSERT_EQUAL(1, mock.resync_calls);
+    TEST_ASSERT_EQUAL_UINT32(57600, mock.host_baud);
+    pn532_deinit(pn532, false);
+
+    /* Resync is not consulted when the device answers right away. */
+    mock.command_count = 0;
+    mock.resync_calls  = 0;
+    pn532              = pn532_init(&mock.base, GPIO_NUM_NC, GPIO_NUM_NC);
+    TEST_ASSERT_NOT_NULL(pn532);
+    TEST_ASSERT_EQUAL(0, mock.resync_calls);
+    pn532_deinit(pn532, false);
+
+    /* Failed resync keeps the init failure. */
+    mock.command_count = 0;
+    mock.host_baud     = 115200;
+    mock.chip_baud     = 1;
+    mock.base.resync   = NULL;
+    TEST_ASSERT_NULL(pn532_init(&mock.base, GPIO_NUM_NC, GPIO_NUM_NC));
+}
+
+TEST_CASE("HSU baud change is rejected on non-UART transports", "[pn532][uart][baud]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+
+    TEST_ASSERT_FALSE(pn532_uart_set_baud_rate(&pn532, 921600));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
 }
 
 void app_main(void)

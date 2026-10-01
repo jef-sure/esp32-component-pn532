@@ -31,9 +31,11 @@ static void IRAM_ATTR pn532_irq_isr_handler(void *arg)
 }
 
 static const uint8_t pn532_ack[]         = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+static const uint8_t pn532_nack[]        = {0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00};
 static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 0x81, 0x00};
 
 #define PN532_DEFAULT_TIMEOUT_MS         500
+#define PN532_NACK_RETRIES               2
 #define PN532_SAM_MODE_NORMAL            0x01
 #define PN532_SAM_TIMEOUT_1S             0x14
 #define PN532_SAM_IRQ_ENABLE             0x01
@@ -176,12 +178,12 @@ static bool pn532_is_ready(pn532_t *pn532)
 static bool pn532_wait_ready(pn532_t *pn532, uint16_t timeout)
 {
     if (pn532 != NULL && pn532->isr_installed && pn532->irq_queue != NULL) {
-        /* Check the bus first: the IRQ line may already be asserted from
-         * before this call (e.g. SAM "ready" persisting after a previous
-         * command, or a level-low signal we never re-armed an edge for). In
-         * that case xQueueReceive would block until timeout — which, with
-         * timeout=0, means forever. */
-        if (pn532_is_ready(pn532)) {
+        /* Check the line first: the IRQ may already be asserted from before
+         * this call (an edge we never re-armed for). P70_IRQ low means a
+         * response is pending (UM0701-02 §6.3); the bus check stays as a
+         * fallback because IRQ is only driven once SAMConfiguration enables it.
+         * Without this pre-check xQueueReceive with timeout=0 blocks forever. */
+        if (gpio_get_level(pn532->irq) == 0 || pn532_is_ready(pn532)) {
             return true;
         }
         uint8_t    evt;
@@ -189,20 +191,20 @@ static bool pn532_wait_ready(pn532_t *pn532, uint16_t timeout)
         if (xQueueReceive(pn532->irq_queue, &evt, ticks) == pdTRUE) {
             return true;
         }
-        /* Final bus poll: covers the race where the edge fired between our
+        /* Final check: covers the race where the edge fired between the
          * pre-check and the queue wait but was consumed elsewhere. */
-        return pn532_is_ready(pn532);
+        return gpio_get_level(pn532->irq) == 0 || pn532_is_ready(pn532);
     }
 
-    uint16_t waited = 0;
+    /* Poll once per tick against a wall-clock deadline: readiness is seen
+     * within one tick instead of a fixed 10 ms step, and the timeout stays
+     * accurate regardless of CONFIG_FREERTOS_HZ. */
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout * 1000;
     while (!pn532_is_ready(pn532)) {
-        if (timeout != 0) {
-            waited += 10;
-            if (waited > timeout) {
-                return false;
-            }
+        if (timeout != 0 && esp_timer_get_time() > deadline_us) {
+            return false;
         }
-        pn532_delay_ms(10);
+        vTaskDelay(1);
     }
 
     return true;
@@ -261,23 +263,31 @@ static void pn532_recover_after_timeout(pn532_t *pn532, uint8_t command, const c
     ESP_LOGW(TAG, "pn532_execute_command: recovering after command 0x%02X %s timeout", command, phase);
     pn532_abort_current_command(pn532);
 }
-static bool pn532_read_response_frame(pn532_t *pn532, uint8_t expected_response, size_t *payload_offset,
-                                      size_t *payload_len)
+
+typedef enum
+{
+    PN532_FRAME_OK,
+    PN532_FRAME_CORRUPT,  /* damaged on the line: the PN532 can resend it on NACK */
+    PN532_FRAME_REJECTED, /* intact but not the expected answer */
+} pn532_frame_result_t;
+
+static pn532_frame_result_t pn532_read_response_frame(pn532_t *pn532, uint8_t expected_response,
+                                                      size_t *payload_offset, size_t *payload_len)
 {
     if (!pn532_read_data(pn532, pn532->recv_buf, PN532_MAX_BUF_SIZE)) {
-        return false;
+        return PN532_FRAME_CORRUPT;
     }
 
     if (memcmp(pn532->recv_buf, pn532_error_frame, sizeof(pn532_error_frame)) == 0) {
         ESP_LOGE(TAG, "pn532_read_response_frame: PN532 returned an error frame for command 0x%02X",
                  expected_response - 1);
-        return false;
+        return PN532_FRAME_REJECTED;
     }
 
     if (pn532->recv_buf[0] != PN532_PREAMBLE || pn532->recv_buf[1] != PN532_STARTCODE1 ||
         pn532->recv_buf[2] != PN532_STARTCODE2) {
         ESP_LOGE(TAG, "pn532_read_response_frame: invalid frame header");
-        return false;
+        return PN532_FRAME_CORRUPT;
     }
 
     size_t frame_header_len;
@@ -289,14 +299,14 @@ static bool pn532_read_response_frame(pn532_t *pn532, uint8_t expected_response,
         frame_payload_len = ((size_t)pn532->recv_buf[5] << 8) | pn532->recv_buf[6];
         if ((uint8_t)(pn532->recv_buf[5] + pn532->recv_buf[6] + pn532->recv_buf[7]) != 0) {
             ESP_LOGE(TAG, "pn532_read_response_frame: invalid extended length checksum");
-            return false;
+            return PN532_FRAME_CORRUPT;
         }
     } else {
         frame_header_len  = 5;
         frame_payload_len = pn532->recv_buf[3];
         if ((uint8_t)(pn532->recv_buf[3] + pn532->recv_buf[4]) != 0) {
             ESP_LOGE(TAG, "pn532_read_response_frame: invalid frame length checksum");
-            return false;
+            return PN532_FRAME_CORRUPT;
         }
     }
 
@@ -304,7 +314,7 @@ static bool pn532_read_response_frame(pn532_t *pn532, uint8_t expected_response,
     postamble_index = dcs_index + 1;
     if (postamble_index >= PN532_MAX_BUF_SIZE) {
         ESP_LOGE(TAG, "pn532_read_response_frame: frame length exceeds buffer");
-        return false;
+        return PN532_FRAME_CORRUPT;
     }
 
     uint8_t checksum = 0;
@@ -313,31 +323,31 @@ static bool pn532_read_response_frame(pn532_t *pn532, uint8_t expected_response,
     }
     if (checksum != 0) {
         ESP_LOGE(TAG, "pn532_read_response_frame: invalid data checksum");
-        return false;
+        return PN532_FRAME_CORRUPT;
     }
 
     if (pn532->recv_buf[postamble_index] != PN532_POSTAMBLE) {
         ESP_LOGE(TAG, "pn532_read_response_frame: invalid postamble");
-        return false;
+        return PN532_FRAME_CORRUPT;
     }
 
     if (frame_payload_len < 2) {
         ESP_LOGE(TAG, "pn532_read_response_frame: truncated payload");
-        return false;
+        return PN532_FRAME_REJECTED;
     }
     if (pn532->recv_buf[frame_header_len] != PN532_PN532TOHOST) {
         ESP_LOGE(TAG, "pn532_read_response_frame: invalid frame direction");
-        return false;
+        return PN532_FRAME_REJECTED;
     }
     if (pn532->recv_buf[frame_header_len + 1] != expected_response) {
         ESP_LOGE(TAG, "pn532_read_response_frame: unexpected response 0x%02X for command 0x%02X",
                  pn532->recv_buf[frame_header_len + 1], expected_response - 1);
-        return false;
+        return PN532_FRAME_REJECTED;
     }
 
     *payload_offset = frame_header_len + 2;
     *payload_len    = frame_payload_len - 2;
-    return true;
+    return PN532_FRAME_OK;
 }
 
 bool pn532_execute_command(      //
@@ -398,7 +408,20 @@ bool pn532_execute_command(      //
 
     size_t payload_offset = 0;
     size_t payload_len    = 0;
-    if (!pn532_read_response_frame(pn532, (uint8_t)(command + 1), &payload_offset, &payload_len)) {
+    pn532_frame_result_t frame =
+        pn532_read_response_frame(pn532, (uint8_t)(command + 1), &payload_offset, &payload_len);
+
+    /* UM0701-02 NACK: the PN532 resends its last response, so a frame damaged
+     * on the line is recovered without re-executing a non-idempotent command. */
+    for (int retry = 0; frame == PN532_FRAME_CORRUPT && retry < PN532_NACK_RETRIES; retry++) {
+        ESP_LOGW(TAG, "pn532_execute_command: corrupted response to 0x%02X, requesting retransmission", command);
+        if (!pn532->bus->write_command(pn532->bus, pn532_nack, sizeof(pn532_nack)) ||
+            !pn532_wait_ready(pn532, pn532->ack_timeout_ms)) {
+            break;
+        }
+        frame = pn532_read_response_frame(pn532, (uint8_t)(command + 1), &payload_offset, &payload_len);
+    }
+    if (frame != PN532_FRAME_OK) {
         return false;
     }
 
@@ -506,6 +529,18 @@ bool pn532_reset(pn532_t *pn532)
     return true;
 }
 
+static bool pn532_probe_firmware(void *ctx)
+{
+    return pn532_get_firmware_version((pn532_t *)ctx) != 0;
+}
+
+/* Last resort when the chip stays silent: let the transport re-negotiate the link. */
+static bool pn532_resync_link(pn532_t *pn532)
+{
+    pn532_bus_t *bus = pn532->bus;
+    return bus != NULL && bus->resync != NULL && bus->resync(bus, pn532_probe_firmware, pn532);
+}
+
 pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
 {
     if (bus == NULL) {
@@ -585,6 +620,9 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
         pn532_reset(pn532);
     }
     if (!fw_ok) {
+        fw_ok = pn532_resync_link(pn532);
+    }
+    if (!fw_ok) {
         ESP_LOGE(TAG, "pn532: failed to read firmware version during init");
         pn532_deinit(pn532, false);
         return NULL;
@@ -618,6 +656,13 @@ void pn532_deinit(pn532_t *pn532, bool free_bus)
     if (pn532->irq_queue != NULL) {
         vQueueDelete(pn532->irq_queue);
         pn532->irq_queue = NULL;
+    }
+    /* After the ISR handler is gone, so no handler can fire on a reset pin. */
+    if (pn532_gpio_is_valid(pn532->irq)) {
+        gpio_reset_pin(pn532->irq);
+    }
+    if (pn532_gpio_is_valid(pn532->rst)) {
+        gpio_reset_pin(pn532->rst);
     }
 
     pn532_bus_t *bus = pn532->bus;
@@ -730,7 +775,7 @@ bool pn532_release_target(pn532_t *pn532)
         return false;
     }
 
-    /* UM0701-02 §7.3.9: InRelease returns a status byte like InSelect and
+    /* UM0701-02 §7.3.11: InRelease returns a status byte like InSelect and
      * InDeselect. Only 0x00 means the target was released; 0x27 means the
      * target number is not known. Per the NXP TAMA reference (its release
      * path ignores the status and always closes the session) a release after
@@ -1009,7 +1054,7 @@ bool pn532_in_select(pn532_t *pn532, uint8_t target_number)
         pn532->session_opened = false;
         return false;
     }
-    /* UM0701-02 §7.3.7: InSelect returns 0x00 on success; 0x27 means the
+    /* UM0701-02 §7.3.12: InSelect returns 0x00 on success; 0x27 means the
      * target number is not known to the PN532 and is a hard error, not an
      * idempotent "already selected" confirmation. */
     if (status[0] != PN532_STATUS_OK) {
@@ -1037,7 +1082,7 @@ bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number)
         pn532->session_opened = false;
         return false;
     }
-    /* UM0701-02 §7.3.6: InDeselect returns 0x00 on success; 0x27 means the
+    /* UM0701-02 §7.3.10: InDeselect returns 0x00 on success; 0x27 means the
      * target is not attributed anymore. Like the NXP TAMA reference (which
      * closes the session on both 0x00 and 0x27), a target the chip already
      * lost is deselected as far as we are concerned. Unlike the 0x00 path —
@@ -1068,18 +1113,18 @@ bool pn532_recover(pn532_t *pn532)
     }
 
     /* Full software re-initialisation without tearing down the transport:
-     * abort anything in flight, drop target/session state, re-apply the
-     * SAM/retry runtime configuration, and leave the RF field off. */
+     * abort anything in flight, drop target/session state, verify the link
+     * (re-negotiating it if the chip went silent), re-apply the SAM/retry
+     * runtime configuration, and leave the RF field off. */
     pn532_abort_current_command(pn532);
     pn532_reset(pn532);
 
-    if (!pn532_restore_runtime_config(pn532)) {
+    if (pn532_get_firmware_version(pn532) == 0 && !pn532_resync_link(pn532)) {
+        ESP_LOGE(TAG, "pn532_recover: device does not answer");
         return false;
     }
 
-    uint32_t firmware = pn532_get_firmware_version(pn532);
-    if (firmware == 0) {
-        ESP_LOGE(TAG, "pn532_recover: firmware version read failed");
+    if (!pn532_restore_runtime_config(pn532)) {
         return false;
     }
 

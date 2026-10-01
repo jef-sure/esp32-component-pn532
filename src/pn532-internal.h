@@ -7,6 +7,8 @@ typedef bool (*pn532_bus_read_data_t)(pn532_bus_t *bus, uint8_t *buffer, size_t 
 typedef bool (*pn532_bus_is_ready_t)(pn532_bus_t *bus);
 typedef void (*pn532_bus_wake_t)(pn532_bus_t *bus);
 typedef void (*pn532_bus_destroy_t)(pn532_bus_t *bus);
+typedef bool (*pn532_bus_probe_t)(void *ctx);
+typedef bool (*pn532_bus_resync_t)(pn532_bus_t *bus, pn532_bus_probe_t probe, void *ctx);
 
 struct pn532_bus_t
 {
@@ -15,6 +17,7 @@ struct pn532_bus_t
     pn532_bus_is_ready_t      is_ready;
     pn532_bus_wake_t          wake;
     pn532_bus_destroy_t       destroy;
+    pn532_bus_resync_t        resync; /**< Optional link re-negotiation while probe() fails; NULL if none. */
 };
 
 #define PN532_PREAMBLE   (0x00)
@@ -27,6 +30,7 @@ struct pn532_bus_t
 
 #define PN532_COMMAND_GETFIRMWAREVERSION  (0x02)
 #define PN532_COMMAND_GETGENERALSTATUS    (0x04)
+#define PN532_COMMAND_SETSERIALBAUDRATE   (0x10)
 #define PN532_COMMAND_SAMCONFIGURATION    (0x14)
 #define PN532_COMMAND_RFCONFIGURATION     (0x32)
 #define PN532_COMMAND_INCOMMUNICATETHRU   (0x42)
