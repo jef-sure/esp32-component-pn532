@@ -92,9 +92,6 @@ static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid)
 #define TLV_NDEF       0x03
 #define TLV_TERMINATOR 0xFE
 
-typedef bool (*ndef_auth_callback_t)(pn532_t *pn532, int blockno, void *user_ctx);
-typedef int (*ndef_sector_id_callback_t)(int blockno, void *user_ctx);
-
 static size_t tlv_parse_length(const uint8_t *data, size_t data_len, size_t offset, size_t *value_offset)
 {
     if (offset >= data_len) {
@@ -800,26 +797,17 @@ bool ndef_make_external_record(ndef_record_t *rec, const char *type_name, const 
 
 /* ---- Read flow ---- */
 
-#define NDEF_DEFAULT_MAX_BLOCKS 256
-
-static bool classic_is_trailer_block(int blockno);
-
-static ndef_result_t ndef_read_from_selected_card(  //
-    pn532_t                  *pn532,                //
-    int                       start_block,          //
-    int                       block_size,           //
-    int                       max_blocks,           //
-    ndef_auth_callback_t      auth_cb,              //
-    ndef_sector_id_callback_t sector_cb,            //
-    void *user_ctx, ndef_message_parsed_t **out_msg //
-)
+/*
+ * Type 2 (Ultralight/NTAG) flat read: READ returns 16 bytes (4 pages) from the
+ * requested page, so the TLV area is scanned 4 pages per transaction. MIFARE
+ * Classic goes through classic_read_from_selected_sectors() instead.
+ */
+static ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pages, ndef_message_parsed_t **out_msg)
 {
-    if (pn532 == NULL || out_msg == NULL || block_size <= 0 || block_size > 16) {
+    if (pn532 == NULL || out_msg == NULL || max_pages <= 0) {
         return NDEF_ERR_INVALID_PARAM;
     }
     *out_msg = NULL;
-
-    int block_limit = (max_blocks > 0) ? max_blocks : NDEF_DEFAULT_MAX_BLOCKS;
 
     /* Grow-from-small buffer; pn532 has limited RAM. */
     size_t   capacity = 256;
@@ -828,34 +816,16 @@ static ndef_result_t ndef_read_from_selected_card(  //
         return NDEF_ERR_NO_MEMORY;
     }
 
-    size_t len              = 0;
-    size_t tlv_pos          = 0;
-    size_t ndef_offset      = 0;
-    size_t ndef_len         = 0;
-    bool   found            = false;
-    bool   read_ok          = true;
-    bool   have_last_sector = false;
-    int    last_sector_id   = 0;
+    size_t len         = 0;
+    size_t tlv_pos     = 0;
+    size_t ndef_offset = 0;
+    size_t ndef_len    = 0;
+    bool   found       = false;
+    bool   read_ok     = true;
 
-    /*
-     * Type 2 layout (Ultralight/NTAG): pn532 READ returns 16 bytes (4 pages)
-     * starting at the requested page. We step in groups of 4 pages so we get
-     * one transaction per 16 bytes of NDEF data.
-     */
-    int     read_stride = (block_size == 4) ? 4 : 1;
-    uint8_t scratch[16];
-
-    for (int block = start_block; (block - start_block) < block_limit; block += read_stride) {
-        if (read_stride == 1 && sector_cb != NULL && classic_is_trailer_block(block)) {
-            continue;
-        }
-
-        size_t chunk = (size_t)(block_size * read_stride);
-        if (len + chunk > capacity) {
-            size_t new_cap = capacity * 2;
-            while (new_cap < len + chunk) {
-                new_cap *= 2;
-            }
+    for (int page = start_page; (page - start_page) < max_pages; page += 4) {
+        if (len + 16 > capacity) {
+            size_t   new_cap = capacity * 2;
             uint8_t *new_buf = realloc(buf, new_cap);
             if (new_buf == NULL) {
                 free(buf);
@@ -865,39 +835,11 @@ static ndef_result_t ndef_read_from_selected_card(  //
             capacity = new_cap;
         }
 
-        if (auth_cb != NULL) {
-            bool call_auth = true;
-            if (sector_cb != NULL) {
-                int sector_id = sector_cb(block, user_ctx);
-                if (have_last_sector && sector_id == last_sector_id) {
-                    call_auth = false;
-                } else {
-                    have_last_sector = true;
-                    last_sector_id   = sector_id;
-                }
-            }
-            if (call_auth && !auth_cb(pn532, block, user_ctx)) {
-                read_ok = false;
-                break;
-            }
+        if (!pn532_14443_block_read(pn532, page, buf + len, 16)) {
+            read_ok = false;
+            break;
         }
-
-        if (read_stride == 4) {
-            /* Type 2: one READ -> 16 bytes covering pages [block .. block+3]. */
-            if (!pn532_14443_block_read(pn532, block, scratch, sizeof(scratch))) {
-                read_ok = false;
-                break;
-            }
-            memcpy(buf + len, scratch, sizeof(scratch));
-            len += sizeof(scratch);
-        } else {
-            /* Mifare Classic: one block per call. */
-            if (!pn532_14443_block_read(pn532, block, buf + len, (size_t)block_size)) {
-                read_ok = false;
-                break;
-            }
-            len += (size_t)block_size;
-        }
+        len += 16;
 
         if (ndef_tlv_find_ndef(buf, len, &tlv_pos, &ndef_offset, &ndef_len)) {
             if (ndef_offset + ndef_len <= len) {
@@ -1202,17 +1144,6 @@ static int classic_sector_block_count(int sector)
         return 16;
     }
     return 0;
-}
-
-static bool classic_is_trailer_block(int blockno)
-{
-    if (blockno < 0) {
-        return false;
-    }
-    if (blockno < 128) {
-        return (blockno % 4) == 3;
-    }
-    return ((blockno - 128) % 16) == 15;
 }
 
 static bool classic_auth_cb(pn532_t *pn532, int blockno, void *user_ctx)
@@ -1525,8 +1456,8 @@ ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, ndef_m
             return NDEF_ERR_READ_FAILED;
         }
         /* NDEF data starts at page 4, capability container at page 3. */
-        ndef_result_t res = ndef_read_from_selected_card(
-            pn532, 4, 4, (uid->blocks_count > 4) ? (uid->blocks_count - 4) : 60, NULL, NULL, NULL, out_msg);
+        int           max_pages = (uid->blocks_count > 4) ? (uid->blocks_count - 4) : 60;
+        ndef_result_t res       = type2_read_ndef(pn532, 4, max_pages, out_msg);
         if (res == NDEF_ERR_READ_FAILED) {
             if (!pn532_14443_select_by_uid(pn532, uid)) {
                 return res;
@@ -1534,8 +1465,8 @@ ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, ndef_m
             if (!pn532_type2_prepare_layout(pn532, uid)) {
                 return res;
             }
-            res = ndef_read_from_selected_card(pn532, 4, 4, (uid->blocks_count > 4) ? (uid->blocks_count - 4) : 60,
-                                               NULL, NULL, NULL, out_msg);
+            max_pages = (uid->blocks_count > 4) ? (uid->blocks_count - 4) : 60;
+            res       = type2_read_ndef(pn532, 4, max_pages, out_msg);
         }
         return res;
     }
