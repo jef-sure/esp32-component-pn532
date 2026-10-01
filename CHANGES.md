@@ -1,5 +1,9 @@
 # Changelog
 
+## v 0.5.2 - 2026-10-01
+
+- Documentation only: the README install command now references an existing registry version (0.5.0 was withdrawn).
+
 ## v 0.5.1 - 2026-10-01
 
 - Removed the dead MIFARE Classic branch (auth/sector callbacks, trailer skipping) from the flat NDEF reader, which is only used for Type 2 tags; Classic NDEF is read sector by sector via MAD. No behaviour change.
