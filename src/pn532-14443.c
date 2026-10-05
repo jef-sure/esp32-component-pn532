@@ -116,9 +116,13 @@ int pn532_14443_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, 
     return pn532_mifare_block_write(pn532, blockno, buffer, buffer_len);
 }
 
+/* ISO/IEC 14443-3 SAK bit 6 (0x20): the card is ISO/IEC 14443-4 compliant. The
+ * PN532 then sends RATS on its own and appends the ATS to the target entry,
+ * whatever the other SAK bits say (0x28/0x38 Classic emulation, 0x60 with
+ * NFC-DEP). */
 static bool pn532_target_has_ats(uint8_t sak)
 {
-    return ((sak & 0x40u) == 0u) && ((sak & 0x20u) != 0u) && ((sak & 0x28u) != 0x28u) && ((sak & 0x30u) != 0x30u);
+    return (sak & 0x20u) != 0u;
 }
 
 static bool pn532_parse_iso14443a_target( //
@@ -139,7 +143,7 @@ static bool pn532_parse_iso14443a_target( //
 
     memset(uid, 0, sizeof(*uid));
     uid->tg         = response[*offset];
-    uid->atqa       = (uint16_t)response[*offset + 1] | ((uint16_t)response[*offset + 2] << 8);
+    uid->atqa       = ((uint16_t)response[*offset + 1] << 8) | (uint16_t)response[*offset + 2];
     uid->sak        = response[*offset + 3];
     uid->uid_length = (int8_t)response[*offset + 4];
     if (uid->uid_length < 0 || (size_t)uid->uid_length > sizeof(uid->uid)) {
@@ -153,12 +157,10 @@ static bool pn532_parse_iso14443a_target( //
 
     memcpy(uid->uid, response + *offset + 5u, (size_t)uid->uid_length);
 
-    if (pn532_target_has_ats(uid->sak)) {
+    /* A last entry may end right after the UID: automatic RATS can be
+     * switched off with SetParameters, and then no ATS follows. */
+    if (pn532_target_has_ats(uid->sak) && *offset + entry_len < response_len) {
         uint8_t ats_len;
-
-        if (*offset + entry_len >= response_len) {
-            return false;
-        }
 
         ats_len = response[*offset + entry_len];
         if (ats_len == 0 || *offset + entry_len + ats_len > response_len) {
@@ -265,8 +267,16 @@ static bool pn532_list_passive_iso14443a_targets( //
 
 static pn532_poll_status_t pn532_poll_command_error(const pn532_t *pn532)
 {
-    if (pn532 != NULL && pn532->last_command_status == PN532_COMMAND_STATUS_TIMEOUT) {
-        return PN532_POLL_TIMEOUT;
+    if (pn532 != NULL) {
+        if (pn532->last_command_status == PN532_COMMAND_STATUS_TIMEOUT) {
+            return PN532_POLL_TIMEOUT;
+        }
+        if (pn532->last_command_status == PN532_COMMAND_STATUS_OK) {
+            /* The transport delivered a well-formed frame but the chip
+             * refused the command (non-zero poll/release status): a protocol
+             * problem, not a dead link. Recovery would be wasted effort. */
+            return PN532_POLL_PROTOCOL_ERROR;
+        }
     }
     /* ACK timeouts and hard transport failures both mean the PN532 is not
      * talking to us; report them as transport errors, not RF problems. */
@@ -313,6 +323,7 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
         return NULL;
     }
     pn532->is_rf_on = true;
+    pn532->tg_stale = false;
     if (response_len == 0) {
         if (status != NULL) {
             *status = PN532_POLL_PROTOCOL_ERROR;
@@ -391,7 +402,9 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
         return false;
     }
 
-    if (uid->tg != 0 && pn532->is_rf_on) {
+    /* A stale Tg (card dropped to IDLE after a failed exchange) takes the
+     * full path: only a new InListPassiveTarget reliably re-activates it. */
+    if (uid->tg != 0 && pn532->is_rf_on && !pn532->tg_stale) {
         return pn532_in_select(pn532, uid->tg);
     }
 
@@ -414,6 +427,7 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
         if (pn532_list_passive_iso14443a_targets(pn532, 1, uid->uid, (size_t)uid->uid_length, response, &response_len,
                                                  (uint16_t)pn532->timeout_ms)) {
             pn532->is_rf_on = true;
+            pn532->tg_stale = false;
             listed          = true;
             break;
         }
@@ -433,6 +447,7 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
             return false;
         }
         pn532->is_rf_on = true;
+        pn532->tg_stale = false;
 
         if (!pn532_find_listed_target_by_uid(response, response_len, uid, &target_number)) {
             (void)pn532_set_rf_off(pn532);
@@ -502,20 +517,19 @@ bool pn532_14443_4_transceive(pn532_t *pn532, const uint8_t *apdu, size_t apdu_l
     return pn532_in_data_exchange(pn532, apdu, apdu_len, rx, rx_len, timeout);
 }
 
-bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len)
+/* One SELECT exchange; *card_refused reports a well-formed error status word. */
+static bool pn532_14443_4_select(pn532_t *pn532, uint8_t p1, uint8_t p2, const uint8_t *file_id, size_t file_id_len,
+                                 bool *card_refused)
 {
-    if (pn532 == NULL || file_id == NULL || file_id_len == 0 || file_id_len > 16) {
-        return false;
-    }
-
     uint8_t apdu[5 + 16];
-    apdu[0] = 0x00;                     /* CLA */
-    apdu[1] = 0xA4;                     /* INS = SELECT */
-    apdu[2] = (file_id_len > 2) ? 0x04  /* by AID */
-                                : 0x00; /* by File ID */
-    apdu[3] = 0x00;                     /* P2: First or only, FCI returned */
-    apdu[4] = (uint8_t)file_id_len;     /* Lc */
+    apdu[0] = 0x00;                 /* CLA */
+    apdu[1] = 0xA4;                 /* INS = SELECT */
+    apdu[2] = p1;                   /* P1 */
+    apdu[3] = p2;                   /* P2 */
+    apdu[4] = (uint8_t)file_id_len; /* Lc */
     memcpy(&apdu[5], file_id, file_id_len);
+
+    *card_refused = false;
 
     uint8_t rx[64];
     size_t  rx_len = sizeof(rx);
@@ -530,13 +544,42 @@ bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t fi
     if (pn532_apdu_get_status(&response) == PN532_APDU_SW_SUCCESS) {
         return true;
     }
-    ESP_LOGD(TAG_T4, "SELECT failed SW=%02X%02X", response.sw1, response.sw2);
+    ESP_LOGD(TAG_T4, "SELECT P1=%02X P2=%02X failed SW=%02X%02X", p1, p2, response.sw1, response.sw2);
+    *card_refused = true;
     return false;
+}
+
+bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len)
+{
+    if (pn532 == NULL || file_id == NULL || file_id_len == 0 || file_id_len > 16) {
+        return false;
+    }
+
+    bool card_refused = false;
+    if (file_id_len > 2) {
+        /* By AID: first or only occurrence, FCI optional. */
+        return pn532_14443_4_select(pn532, 0x04, 0x00, file_id, file_id_len, &card_refused);
+    }
+
+    /* By file identifier. NFC Forum Type 4 Tag mapping 2.0 mandates P2=0x0C
+     * (no response data); mapping 1.0 cards expect P2=0x00, so that is tried
+     * once when the card itself refuses the first form. */
+    if (pn532_14443_4_select(pn532, 0x00, 0x0C, file_id, file_id_len, &card_refused)) {
+        return true;
+    }
+    return card_refused && pn532_14443_4_select(pn532, 0x00, 0x00, file_id, file_id_len, &card_refused);
 }
 
 bool pn532_14443_4_read_binary(pn532_t *pn532, uint16_t offset, uint8_t le, uint8_t *buffer, size_t *got)
 {
     if (pn532 == NULL || buffer == NULL || got == NULL) {
+        return false;
+    }
+    /* Short EF identifier mode encodes only bits 1..15 of the offset in
+     * P1/P2 (b8 of P1 must stay 0, ISO 7816-4 §5.1.1). Reject instead of
+     * silently wrapping offsets at/above 0x8000. */
+    if (offset > 0x7FFFu) {
+        ESP_LOGE(TAG_T4, "READ BINARY offset 0x%04X exceeds the 0x7FFF short-file limit", offset);
         return false;
     }
 
@@ -562,11 +605,16 @@ bool pn532_14443_4_read_binary(pn532_t *pn532, uint16_t offset, uint8_t le, uint
         return false;
     }
 
-    size_t data_len = response.data_len;
-    if (data_len > *got) {
-        data_len = *got;
+    if (response.data_len > *got) {
+        /* The R-APDU does not fit the caller's buffer. Report the required
+         * size so the caller can retry, instead of silently truncating a
+         * payload the contract promised to deliver whole. */
+        ESP_LOGE(TAG_T4, "READ BINARY @0x%04X: %u bytes arrived, buffer holds %u", offset, (unsigned)response.data_len,
+                 (unsigned)*got);
+        *got = response.data_len;
+        return false;
     }
-    memcpy(buffer, response.data, data_len);
-    *got = data_len;
+    memcpy(buffer, response.data, response.data_len);
+    *got = response.data_len;
     return true;
 }

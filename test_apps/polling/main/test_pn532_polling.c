@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "pn532-internal.h"
+#include "pn532-mifare.h"
 #include "pn532-ndef.h"
 #include "unity.h"
 
@@ -20,7 +21,10 @@ typedef enum
     MOCK_EXCHANGE_NAD,
     MOCK_TYPE4_APDU,
     MOCK_STATUS_TARGET_NOT_KNOWN,
-    MOCK_TWO_LONG_ATS
+    MOCK_RELEASE_PROTOCOL_ERROR,
+    MOCK_TWO_LONG_ATS,
+    MOCK_TYPE4_SELECT_V1,
+    MOCK_AUTH_ERROR
 } mock_mode_t;
 
 typedef struct
@@ -36,6 +40,9 @@ typedef struct
     uint8_t     list_initiator[16];
     size_t      list_initiator_len;
     bool        list_initiator_valid;
+    uint8_t     exchange_params[8][16]; /* per-round InDataExchange/Thru request params */
+    size_t      exchange_params_len[8];
+    size_t      exchange_rounds;
     uint8_t     pending_frames;
     uint8_t     mi_round;
     bool        exchange_loops_mi;
@@ -44,6 +51,7 @@ typedef struct
     size_t      resync_calls;
     size_t      nack_count;
     uint8_t     corrupt_responses; /* next N response frames get a broken DCS */
+    uint8_t     two_ats_sak[2];    /* MOCK_TWO_LONG_ATS SAK per target; 0 selects 0x20 */
 } mock_bus_t;
 
 static const uint8_t ack_frame[]  = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
@@ -55,6 +63,9 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
 
     if (len == sizeof(ack_frame) && memcmp(buffer, ack_frame, sizeof(ack_frame)) == 0) {
         mock->abort_count++;
+        /* The abort ACK is not a command: the drain that follows reads data
+         * frames directly, so skip the ACK-phase length assert. */
+        mock->read_phase = 1;
         return true;
     }
     if (len == sizeof(nack_frame) && memcmp(buffer, nack_frame, sizeof(nack_frame)) == 0) {
@@ -77,12 +88,31 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
         params_len -= 2u; /* payload = TF + CMD */
         if (params_len > 2u) {
             size_t initiator_len = params_len - 2u; /* MaxTg + BrTy */
-            const uint8_t *initiator = (buffer[3] == 0xFF) ? &buffer[10] : &buffer[7];
+            /* Short frame: preamble(3) LEN ~LEN TF CMD MaxTg BrTy data...;
+             * extended frame adds the two length bytes and their checksum. */
+            const uint8_t *initiator = (buffer[3] == 0xFF) ? &buffer[10] : &buffer[9];
             TEST_ASSERT_LESS_OR_EQUAL(sizeof(mock->list_initiator), initiator_len);
             memcpy(mock->list_initiator, initiator, initiator_len);
             mock->list_initiator_len   = initiator_len;
             mock->list_initiator_valid = true;
         }
+    }
+
+    /* Capture the full request parameters of each InDataExchange /
+     * InCommunicateThru round so tests can assert what the MI continuation
+     * re-sends (UM0701-02 §7.3.5: only the target number). Frames larger
+     * than the capture slot (frame-size tests) and rounds beyond the first
+     * few (MI loop tests) are counted but not stored. */
+    if (command == PN532_COMMAND_INDATAEXCHANGE || command == PN532_COMMAND_INCOMMUNICATETHRU) {
+        size_t params_len = (buffer[3] == 0xFF) ? (((size_t)buffer[5] << 8) | buffer[6]) : (size_t)buffer[3];
+        params_len -= 2u; /* payload = TF + CMD */
+        const uint8_t *params = (buffer[3] == 0xFF) ? &buffer[10] : &buffer[7];
+        if (mock->exchange_rounds < ARRAY_SIZE(mock->exchange_params) &&
+            params_len <= sizeof(mock->exchange_params[0])) {
+            memcpy(mock->exchange_params[mock->exchange_rounds], params, params_len);
+            mock->exchange_params_len[mock->exchange_rounds] = params_len;
+        }
+        mock->exchange_rounds++;
     }
 
     TEST_ASSERT_LESS_THAN(ARRAY_SIZE(mock->commands), mock->command_count);
@@ -170,6 +200,8 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
 
     switch (mock->current_command) {
     case PN532_COMMAND_RFCONFIGURATION:
+    case PN532_COMMAND_SAMCONFIGURATION:
+        /* UM0701-02 §7.2.10: the SAMConfiguration response carries no data. */
         payload_len = 0;
         break;
     case PN532_COMMAND_GETFIRMWAREVERSION: {
@@ -198,7 +230,7 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
                 e[0]       = (uint8_t)(t + 1);
                 e[1]       = 0x44;
                 e[2]       = 0x03;
-                e[3]       = 0x20;
+                e[3]       = mock->two_ats_sak[t] != 0 ? mock->two_ats_sak[t] : 0x20;
                 e[4]       = 7;
                 memset(&e[5], 0x10 + t, 7);
                 e[12] = 30;
@@ -250,6 +282,24 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         return true;
     }
 
+    if (mock->mode == MOCK_TYPE4_SELECT_V1 && mock->current_command == PN532_COMMAND_INDATAEXCHANGE) {
+        /* Mapping 1.0 style card: SELECT with P2=0x0C is refused with 6A86,
+         * any other APDU succeeds. Request params: Tg CLA INS P1 P2 ... */
+        static const uint8_t refused[]  = {0x00, 0x6A, 0x86};
+        static const uint8_t accepted[] = {0x00, 0x90, 0x00};
+        const uint8_t       *request    = mock->exchange_params[mock->exchange_rounds - 1];
+        bool                 is_v2      = request[2] == 0xA4 && request[4] == 0x0C;
+        mock_response_frame(mock->current_command, is_v2 ? refused : accepted, 3, buffer, len);
+        return true;
+    }
+
+    if (mock->mode == MOCK_AUTH_ERROR && mock->current_command == PN532_COMMAND_INDATAEXCHANGE) {
+        /* UM0701: 0x14 = MIFARE authentication error. */
+        static const uint8_t auth_error[] = {0x14};
+        mock_response_frame(mock->current_command, auth_error, sizeof(auth_error), buffer, len);
+        return true;
+    }
+
     if (mock->mode == MOCK_TYPE4_APDU && mock->current_command == PN532_COMMAND_INDATAEXCHANGE) {
         static const uint8_t apdu_response[] = {0x00, 0x01, 0x02, 0x03, 0x90, 0x00};
         mock_response_frame(mock->current_command, apdu_response, sizeof(apdu_response), buffer, len);
@@ -262,6 +312,14 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         (mock->current_command == PN532_COMMAND_INSELECT || mock->current_command == PN532_COMMAND_INDESELECT)) {
         static const uint8_t not_known[] = {0x27};
         mock_response_frame(mock->current_command, not_known, sizeof(not_known), buffer, len);
+        return true;
+    }
+
+    /* A well-formed frame refusing the command while the transport itself is
+     * healthy: exercises the protocol-error mapping of the poll path. */
+    if (mock->mode == MOCK_RELEASE_PROTOCOL_ERROR && mock->current_command == PN532_COMMAND_INRELEASE) {
+        static const uint8_t refused[] = {0x29};
+        mock_response_frame(mock->current_command, refused, sizeof(refused), buffer, len);
         return true;
     }
 
@@ -693,6 +751,15 @@ TEST_CASE("MI chained data is assembled across exchange rounds", "[pn532][exchan
     TEST_ASSERT_TRUE(pn532.session_opened);
     TEST_ASSERT_EQUAL(2, mock.command_count);
 
+    /* UM0701-02 §7.3.5: round 0 sends the target number plus the caller's
+     * data; the MI continuation must carry the target number only, so the
+     * APDU is not forwarded to the card twice. */
+    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+    TEST_ASSERT_EQUAL(3, mock.exchange_params_len[0]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x01, 0x30, 0x00}), mock.exchange_params[0], 3);
+    TEST_ASSERT_EQUAL(1, mock.exchange_params_len[1]);
+    TEST_ASSERT_EQUAL_UINT8(0x01, mock.exchange_params[1][0]);
+
     /* A chain that never clears MI is cut off instead of looping forever;
      * the session is dropped so the next exchange re-selects. The large rx
      * buffer keeps the round guard, not capacity, as the limiting factor. */
@@ -769,6 +836,12 @@ TEST_CASE("in communicate thru forwards raw bits and drains MI", "[pn532][thru]"
     TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x11, 0x22, 0x33}), rx, 3);
     TEST_ASSERT_TRUE(pn532.session_opened);
     TEST_ASSERT_EQUAL(2, mock.command_count);
+
+    /* Round 0 carries the raw bits; the MI continuation re-sends nothing. */
+    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+    TEST_ASSERT_EQUAL(2, mock.exchange_params_len[0]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0xE0, 0x80}), mock.exchange_params[0], 2);
+    TEST_ASSERT_EQUAL(0, mock.exchange_params_len[1]);
 
     const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU, PN532_COMMAND_INCOMMUNICATETHRU};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
@@ -1132,6 +1205,304 @@ TEST_CASE("two targets with long ATS are polled, not reported as transport error
     TEST_ASSERT_EQUAL_UINT8(2, uids->uids[1].tg);
     TEST_ASSERT_EQUAL_INT8(7, uids->uids[1].uid_length);
     free(uids);
+}
+
+TEST_CASE("reserved TNF is rejected by NDEF parsing", "[pn532][ndef][tnf]")
+{
+    static const uint8_t encoded[] = {
+        0xD7, 0x01, 0x01, 'U', 0x00, 'x', /* MB | ME | SR with TNF 0x07 (reserved) */
+    };
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(encoded, sizeof(encoded), &message));
+    TEST_ASSERT_NULL(message);
+}
+
+TEST_CASE("empty TNF record with payload or type is rejected", "[pn532][ndef][tnf]")
+{
+    /* TNF=0 with a type byte: structurally illegal per NFC RTD. */
+    static const uint8_t bad_type[] = {
+        0xD0, 0x01, 0x00, 'T', /* MB | ME | SR, TNF_EMPTY with a type */
+    };
+    /* TNF=0 with a payload byte. */
+    static const uint8_t bad_payload[] = {
+        0xD0, 0x00, 0x01, 'x', /* MB | ME | SR, TNF_EMPTY with a payload */
+    };
+    /* The only legal empty record: no type, no ID, no payload. */
+    static const uint8_t ok[] = {
+        0xD0, 0x00, 0x00, /* MB | ME | SR, TNF_EMPTY, fully empty */
+    };
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(bad_type, sizeof(bad_type), &message));
+    TEST_ASSERT_NULL(message);
+    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(bad_payload, sizeof(bad_payload), &message));
+    TEST_ASSERT_NULL(message);
+    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(ok, sizeof(ok), &message));
+    TEST_ASSERT_EQUAL(1, message->record_count);
+    TEST_ASSERT_EQUAL(NDEF_TNF_EMPTY, message->records[0].tnf);
+    ndef_free_parsed_message(message);
+}
+
+TEST_CASE("URI identifier 0x07 decodes and encodes the anonymous FTP prefix", "[pn532][ndef][uri]")
+{
+    /* Decoding: identifier 0x07 + "example.com" must expand to the full
+     * ftp://anonymous:anonymous@ prefix, not the old placeholder. */
+    static const uint8_t encoded[] = {
+        0xD1, 0x01, 0x0C, 'U', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm',
+    };
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(encoded, sizeof(encoded), &message));
+    TEST_ASSERT_NOT_NULL(message);
+    TEST_ASSERT_TRUE(ndef_record_is_uri(&message->records[0]));
+
+    char uri[64];
+    TEST_ASSERT_EQUAL(37, ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
+    TEST_ASSERT_EQUAL_STRING("ftp://anonymous:anonymous@example.com", uri);
+    ndef_free_parsed_message(message);
+
+    /* Encoding: the full prefix must compress back to identifier 0x07. */
+    ndef_record_t rec;
+    uint8_t       payload_buf[16];
+    TEST_ASSERT_TRUE(ndef_make_uri_record(&rec, "ftp://anonymous:anonymous@example.com", true, payload_buf,
+                                          sizeof(payload_buf)));
+    /* Encoded payload = 0x07 identifier + "example.com" (11 chars). */
+    TEST_ASSERT_EQUAL(12, rec.payload_len);
+    TEST_ASSERT_EQUAL_UINT8(0x07, rec.payload[0]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY("example.com", rec.payload + 1, 11);
+}
+
+TEST_CASE("READ BINARY rejects offsets above the short-file limit", "[pn532][t4][readbinary]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_TYPE4_APDU, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    uint8_t buf[16];
+    size_t  got = sizeof(buf);
+    /* Must fail before any transport traffic: the offset does not fit the
+     * short EF identifier encoding (P1 b8 must stay 0). */
+    TEST_ASSERT_FALSE(pn532_14443_4_read_binary(&pn532, 0x8000, sizeof(buf), buf, &got));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+
+    got = sizeof(buf);
+    TEST_ASSERT_FALSE(pn532_14443_4_read_binary(&pn532, 0xFFFF, sizeof(buf), buf, &got));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+}
+
+TEST_CASE("READ BINARY reports required size instead of truncating", "[pn532][t4][readbinary]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_TYPE4_APDU, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    /* MOCK_TYPE4_APDU returns 3 data bytes + SW after the exchange status is
+     * stripped. A 2-byte buffer cannot hold the reply; the call must fail and
+     * report 3 as the required size. */
+    uint8_t buf[2];
+    size_t  got = sizeof(buf);
+    TEST_ASSERT_FALSE(pn532_14443_4_read_binary(&pn532, 0, sizeof(buf), buf, &got));
+    TEST_ASSERT_EQUAL(3, got);
+}
+
+TEST_CASE("protocol-level poll failure maps to PN532_POLL_PROTOCOL_ERROR", "[pn532][polling][protocol]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_RELEASE_PROTOCOL_ERROR, send_buf, recv_buf);
+    pn532.inListedTag = 1;
+
+    /* Release fails with a well-formed 0x29 frame while the transport is
+     * healthy: the poll must surface a protocol error, not a transport
+     * error that would trigger needless pn532_recover() calls. */
+    pn532_poll_status_t status;
+    pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(&pn532, &status);
+    TEST_ASSERT_EQUAL(PN532_POLL_PROTOCOL_ERROR, status);
+    TEST_ASSERT_NULL(uids);
+}
+
+TEST_CASE("ATS follows every SAK with the ISO14443-4 bit, ATQA keeps the reported byte order",
+          "[pn532][polling][ats]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_TWO_LONG_ATS, send_buf, recv_buf);
+    /* Classic emulation on an ISO-DEP card, and ISO-DEP + NFC-DEP: the PN532
+     * appends the ATS to both, so the second entry starts after it. */
+    mock.two_ats_sak[0] = 0x28;
+    mock.two_ats_sak[1] = 0x60;
+
+    pn532_poll_status_t status;
+    pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(&pn532, &status);
+    TEST_ASSERT_EQUAL(PN532_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(2, uids->uids_count);
+    TEST_ASSERT_EQUAL_UINT8(0x28, uids->uids[0].sak);
+    TEST_ASSERT_EQUAL_UINT8(0x60, uids->uids[1].sak);
+    TEST_ASSERT_EQUAL_UINT8(2, uids->uids[1].tg);
+    TEST_ASSERT_EQUAL(7, uids->uids[1].uid_length);
+    TEST_ASSERT_EACH_EQUAL_UINT8(0x11, uids->uids[1].uid, 7);
+    /* SENS_RES bytes 0x44 0x03 as reported by the PN532. */
+    TEST_ASSERT_EQUAL_HEX16(0x4403, uids->uids[0].atqa);
+    free(uids);
+}
+
+TEST_CASE("NDEF record length that wraps the offset is rejected", "[pn532][ndef][bounds]")
+{
+    /* Long record whose payload length 0xFFFFFFFF wraps a 32-bit offset back
+     * onto its own type byte ('T' = 0x54 = ME|SR|TNF 4), which then parses as
+     * a closing record. Must not yield a 4 GiB Text record. */
+    static const uint8_t wrapping[] = {0x81, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x54, 0x00, 0x00};
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(wrapping, sizeof(wrapping), &message));
+    TEST_ASSERT_NULL(message);
+}
+
+static void assert_uri_round_trip(const char *uri, uint8_t expected_code)
+{
+    ndef_record_t rec;
+    uint8_t       payload_buf[64];
+    char          decoded[64];
+
+    TEST_ASSERT_TRUE(ndef_make_uri_record(&rec, uri, true, payload_buf, sizeof(payload_buf)));
+    TEST_ASSERT_EQUAL_HEX8(expected_code, rec.payload[0]);
+    TEST_ASSERT_EQUAL(strlen(uri), ndef_extract_uri(&rec, decoded, sizeof(decoded)));
+    TEST_ASSERT_EQUAL_STRING(uri, decoded);
+}
+
+TEST_CASE("URI identifier codes follow the NFC Forum URI RTD table", "[pn532][ndef][uri]")
+{
+    /* Decoding a foreign tag: 0x13 is "urn:", 0x1D is "file://". */
+    static const uint8_t urn[]  = {0xD1, 0x01, 0x07, 'U', 0x13, 'i', 's', 'b', 'n', ':', '1'};
+    static const uint8_t file[] = {0xD1, 0x01, 0x03, 'U', 0x1D, '/', 'a'};
+    char                 uri[32];
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(urn, sizeof(urn), &message));
+    TEST_ASSERT_EQUAL(10, ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
+    TEST_ASSERT_EQUAL_STRING("urn:isbn:1", uri);
+    ndef_free_parsed_message(message);
+
+    message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(file, sizeof(file), &message));
+    TEST_ASSERT_EQUAL(9, ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
+    TEST_ASSERT_EQUAL_STRING("file:///a", uri);
+    ndef_free_parsed_message(message);
+
+    /* Encoding picks the longest standard prefix and round-trips. */
+    assert_uri_round_trip("ftp://ftp.example.com/a", 0x08);
+    assert_uri_round_trip("ftp://ftpserver.com/a", 0x0D);
+    assert_uri_round_trip("urn:isbn:1", 0x13);
+    assert_uri_round_trip("urn:epc:id:sgtin:1", 0x1E);
+    assert_uri_round_trip("urn:epc:other", 0x22);
+    assert_uri_round_trip("https://www.example.com", 0x02);
+    /* Schemes without a standard code stay unabbreviated. */
+    assert_uri_round_trip("geo:1,2", 0x00);
+    assert_uri_round_trip("sms:+123", 0x00);
+}
+
+TEST_CASE("Type 4 file select uses P2=0x0C and falls back to P2=0x00", "[pn532][t4][select]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    static const uint8_t cc_file_id[]       = {0xE1, 0x03};
+    static const uint8_t ndef_aid[]         = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
+
+    mock_init(&mock, &pn532, MOCK_TYPE4_APDU, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    TEST_ASSERT_TRUE(pn532_14443_4_select_file(&pn532, cc_file_id, sizeof(cc_file_id)));
+    TEST_ASSERT_EQUAL(1, mock.exchange_rounds);
+    const uint8_t by_fid[] = {0x01, 0x00, 0xA4, 0x00, 0x0C, 0x02, 0xE1, 0x03};
+    TEST_ASSERT_EQUAL(sizeof(by_fid), mock.exchange_params_len[0]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(by_fid, mock.exchange_params[0], sizeof(by_fid));
+
+    TEST_ASSERT_TRUE(pn532_14443_4_select_file(&pn532, ndef_aid, sizeof(ndef_aid)));
+    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+    const uint8_t by_aid[] = {0x01, 0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
+    TEST_ASSERT_EQUAL(sizeof(by_aid), mock.exchange_params_len[1]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(by_aid, mock.exchange_params[1], sizeof(by_aid));
+
+    /* A card that refuses P2=0x0C gets one retry with P2=0x00. */
+    mock_init(&mock, &pn532, MOCK_TYPE4_SELECT_V1, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+
+    TEST_ASSERT_TRUE(pn532_14443_4_select_file(&pn532, cc_file_id, sizeof(cc_file_id)));
+    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+    TEST_ASSERT_EQUAL_HEX8(0x0C, mock.exchange_params[0][4]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, mock.exchange_params[1][4]);
+}
+
+TEST_CASE("failed MIFARE authentication forces a full re-list on the next select", "[pn532][polling][auth]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_AUTH_ERROR, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+    pn532.is_rf_on       = true;
+
+    pn532_uid_t uid = {.uid = {0xDE, 0xAD, 0xBE, 0xEF}, .uid_length = 4, .tg = 1, .subtype = PN532_MIFARE_CLASSIC_1K};
+    static const uint8_t key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    TEST_ASSERT_FALSE(pn532_14443_authenticate(&pn532, key, MIFARE_CMD_AUTH_A, &uid, 4));
+    TEST_ASSERT_TRUE(pn532.tg_stale);
+    TEST_ASSERT_FALSE(pn532.session_opened);
+    TEST_ASSERT_EQUAL_UINT8(1, pn532.inListedTag);
+
+    /* The card is back in IDLE while the PN532 still counts it as selected:
+     * the cached Tg must not be reused through a bare InSelect. */
+    mock.command_count = 0;
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &uid));
+    const uint8_t expected[] = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_INLISTPASSIVETARGET,
+                                PN532_COMMAND_INSELECT};
+    assert_commands(&mock, expected, ARRAY_SIZE(expected));
+    TEST_ASSERT_FALSE(pn532.tg_stale);
+    TEST_ASSERT_TRUE(pn532.session_opened);
+}
+
+TEST_CASE("NULL device pointers are rejected without crashing", "[pn532][args]")
+{
+    TEST_ASSERT_EQUAL_UINT32(0, pn532_get_firmware_version(NULL));
+    TEST_ASSERT_FALSE(pn532_set_rf_field(NULL, true));
+    TEST_ASSERT_FALSE(pn532_execute_command(NULL, PN532_COMMAND_GETFIRMWAREVERSION, NULL, 0, NULL, NULL, 10));
+    TEST_ASSERT_FALSE(pn532_reset(NULL));
+    TEST_ASSERT_FALSE(pn532_in_data_exchange(NULL, (const uint8_t *)"\x30\x00", 2, NULL, NULL, 10));
+
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    pn532.inListedTag = 1;
+
+    /* Out-of-range block numbers must fail instead of wrapping (256 -> 0
+     * would read the manufacturer block). */
+    uint8_t block[16];
+    TEST_ASSERT_FALSE(pn532_mifare_block_read(&pn532, 256, block, sizeof(block)));
+    TEST_ASSERT_FALSE(pn532_mifare_block_read(&pn532, -1, block, sizeof(block)));
+    TEST_ASSERT_EQUAL(-1, pn532_mifare_block_write(&pn532, 300, block, 16));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
 }
 
 void app_main(void)

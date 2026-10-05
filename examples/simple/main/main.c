@@ -558,7 +558,19 @@ void app_main(void)
             }
             if (status == PN532_POLL_TIMEOUT) {
                 ESP_LOGW(TAG, "PN532 poll timed out");
-            } else if (status != PN532_POLL_NO_TARGET) {
+                /* A timeout is an RF-side event with a healthy transport:
+                 * it must not accumulate toward link recovery. */
+                consecutive_failures = 0;
+            } else if (status == PN532_POLL_NO_TARGET) {
+                /* Ordinary quiet field, transport is fine. */
+                consecutive_failures = 0;
+            } else if (status == PN532_POLL_PROTOCOL_ERROR) {
+                /* The chip answered but refused the poll/release protocol;
+                 * re-initialising the link will not help, so it does not
+                 * count toward recovery either. */
+                ESP_LOGE(TAG, "PN532 poll protocol failure (status %d)", (int)status);
+                consecutive_failures = 0;
+            } else {
                 ESP_LOGE(TAG, "PN532 poll failed (status %d)", (int)status);
                 /* A dead transport is exactly what pn532_recover() is for:
                  * it re-initialises the chip without recreating the bus. */

@@ -8,6 +8,10 @@
 
 #include "pn532.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** @brief MIFARE Classic authenticate with Key A. */
 #define MIFARE_CMD_AUTH_A           (0x60)
 /** @brief MIFARE Classic authenticate with Key B. */
@@ -83,3 +87,7 @@ bool pn532_mifare_restore(pn532_t *pn532, uint8_t blockno);
 
 /** @brief Commit the current transfer buffer to a MIFARE Classic value block. */
 bool pn532_mifare_transfer(pn532_t *pn532, uint8_t blockno);
+
+#ifdef __cplusplus
+}
+#endif

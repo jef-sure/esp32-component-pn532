@@ -31,22 +31,24 @@ static void pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t
         return;
     }
     uid->block_size = 4;
+    /* CC[2] is the size of the NDEF data area in units of 8 bytes
+     * (NTAG/Ultralight CC layout, NFC Forum Type 2 Tag ODS). It excludes
+     * page 0..3 and the lock/config pages, so it — not the physical page
+     * count — bounds how far NDEF reads may go. */
+    uint16_t data_area_pages = (uint16_t)data[2] * 2u;
+    uid->blocks_count        = (uint16_t)(4u + data_area_pages);
     switch (data[2]) {
     case 0x06:
-        uid->subtype      = PN532_MIFARE_ULTRALIGHT;
-        uid->blocks_count = 16;
+        uid->subtype = PN532_MIFARE_ULTRALIGHT;
         break;
     case 0x12:
-        uid->subtype      = PN532_MIFARE_NTAG213;
-        uid->blocks_count = 45;
+        uid->subtype = PN532_MIFARE_NTAG213;
         break;
     case 0x3E:
-        uid->subtype      = PN532_MIFARE_NTAG215;
-        uid->blocks_count = 135;
+        uid->subtype = PN532_MIFARE_NTAG215;
         break;
     case 0x6D:
-        uid->subtype      = PN532_MIFARE_NTAG216;
-        uid->blocks_count = 231;
+        uid->subtype = PN532_MIFARE_NTAG216;
         break;
     default:
         break;
@@ -66,7 +68,7 @@ static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid)
             return false;
         }
     } else if (!pn532->session_opened) {
-        if (!pn532_in_select(pn532, pn532->inListedTag)) {
+        if (pn532->tg_stale || !pn532_in_select(pn532, pn532->inListedTag)) {
             if (!pn532_14443_select_by_uid(pn532, uid)) {
                 return false;
             }
@@ -163,6 +165,7 @@ static bool ndef_tlv_find_ndef(const uint8_t *data, size_t data_len, size_t *sea
 
 /* ---- URI prefix table ---- */
 
+/* NFC Forum URI RTD 1.0, table 3: URI identifier codes. */
 static const char *const uri_prefix_table[] = {
     "",                           /* 0x00 */
     "http://www.",                /* 0x01 */
@@ -175,58 +178,33 @@ static const char *const uri_prefix_table[] = {
     "ftp://ftp.",                 /* 0x08 */
     "ftps://",                    /* 0x09 */
     "sftp://",                    /* 0x0A */
-    "smsto:",                     /* 0x0B */
-    "sms:",                       /* 0x0C */
-    "mms:",                       /* 0x0D */
-    "mmsto:",                     /* 0x0E */
-    "_ndef/_rtd_",                /* 0x0F */
-    "_ndef/_urn_",                /* 0x10 */
-    "_ndef/_pop_",                /* 0x11 */
-    "_ndef/_sip_",                /* 0x12 */
-    "geo:",                       /* 0x13 */
-    "magnet:?",                   /* 0x14 */
-    "urn:",                       /* 0x15 */
-    "urn:epc:id:",                /* 0x16 */
-    "urn:epc:tag:",               /* 0x17 */
-    "urn:epc:pat:",               /* 0x18 */
-    "urn:epc:raw:",               /* 0x19 */
-    "urn:epc:",                   /* 0x1A */
-    "urn:nfc:",                   /* 0x1B */
+    "smb://",                     /* 0x0B */
+    "nfs://",                     /* 0x0C */
+    "ftp://",                     /* 0x0D */
+    "dav://",                     /* 0x0E */
+    "news:",                      /* 0x0F */
+    "telnet://",                  /* 0x10 */
+    "imap:",                      /* 0x11 */
+    "rtsp://",                    /* 0x12 */
+    "urn:",                       /* 0x13 */
+    "pop:",                       /* 0x14 */
+    "sip:",                       /* 0x15 */
+    "sips:",                      /* 0x16 */
+    "tftp:",                      /* 0x17 */
+    "btspp://",                   /* 0x18 */
+    "btl2cap://",                 /* 0x19 */
+    "btgoep://",                  /* 0x1A */
+    "tcpobex://",                 /* 0x1B */
+    "irdaobex://",                /* 0x1C */
+    "file://",                    /* 0x1D */
+    "urn:epc:id:",                /* 0x1E */
+    "urn:epc:tag:",               /* 0x1F */
+    "urn:epc:pat:",               /* 0x20 */
+    "urn:epc:raw:",               /* 0x21 */
+    "urn:epc:",                   /* 0x22 */
+    "urn:nfc:",                   /* 0x23 */
 };
 #define URI_PREFIX_COUNT (sizeof(uri_prefix_table) / sizeof(uri_prefix_table[0]))
-
-typedef struct
-{
-    uint8_t code;
-    uint8_t len;
-} uri_encode_order_entry_t;
-
-static const uri_encode_order_entry_t uri_encode_order[] = {
-    {0x07, 26},
-    {0x17, 12},
-    {0x18, 12},
-    {0x19, 12},
-    {0x02, 12},
-    {0x16, 11},
-    {0x01, 11},
-    {0x08, 9 },
-    {0x1A, 8 },
-    {0x1B, 8 },
-    {0x14, 8 },
-    {0x04, 8 },
-    {0x09, 7 },
-    {0x0A, 7 },
-    {0x06, 7 },
-    {0x03, 7 },
-    {0x0B, 6 },
-    {0x0E, 6 },
-    {0x05, 4 },
-    {0x0C, 4 },
-    {0x0D, 4 },
-    {0x13, 4 },
-    {0x15, 4 },
-};
-#define URI_ENCODE_ORDER_COUNT (sizeof(uri_encode_order) / sizeof(uri_encode_order[0]))
 
 /* ---- Record decoding ---- */
 
@@ -255,6 +233,11 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
     bool       il  = (hdr & NDEF_IL) != 0;
     ndef_tnf_t tnf = (ndef_tnf_t)(hdr & NDEF_TNF_MASK);
 
+    if (tnf == NDEF_TNF_RESERVED) {
+        /* NFC RTD: TNF 0x07 is reserved and must not appear in a message. */
+        return false;
+    }
+
     if (pos >= in_len) {
         return false;
     }
@@ -267,7 +250,7 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
         }
         payload_len = in[pos++];
     } else {
-        if (pos + 4 > in_len) {
+        if (in_len - pos < 4) {
             return false;
         }
         payload_len = ((uint32_t)in[pos] << 24) | ((uint32_t)in[pos + 1] << 16) | ((uint32_t)in[pos + 2] << 8) |
@@ -285,7 +268,7 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
 
     const uint8_t *type_ptr = NULL;
     if (type_len > 0) {
-        if (pos + type_len > in_len) {
+        if (type_len > in_len - pos) {
             return false;
         }
         type_ptr = &in[pos];
@@ -294,7 +277,7 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
 
     const uint8_t *id_ptr = NULL;
     if (id_len > 0) {
-        if (pos + id_len > in_len) {
+        if (id_len > in_len - pos) {
             return false;
         }
         id_ptr = &in[pos];
@@ -303,11 +286,17 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
 
     const uint8_t *payload_ptr = NULL;
     if (payload_len > 0) {
-        if ((size_t)pos + payload_len > in_len) {
+        /* Subtraction form: pos + payload_len wraps a 32-bit size_t. */
+        if (payload_len > in_len - pos) {
             return false;
         }
         payload_ptr = &in[pos];
         pos += payload_len;
+    }
+
+    if (tnf == NDEF_TNF_EMPTY && (type_len != 0 || id_len != 0 || payload_len != 0)) {
+        /* NFC RTD: an empty record must carry no type, ID, or payload. */
+        return false;
     }
 
     out_rec->tnf         = tnf;
@@ -687,25 +676,26 @@ size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_l
     return (size_t)(cursor - out);
 }
 
+/* Longest matching prefix wins, so "ftp://ftp." beats "ftp://" and
+ * "urn:epc:id:" beats "urn:epc:" and "urn:". */
 static uint8_t ndef_uri_prefix_code(const char *uri, size_t *prefix_len)
 {
-    for (size_t i = 0; i < URI_ENCODE_ORDER_COUNT; i++) {
-        uint8_t     code   = uri_encode_order[i].code;
-        const char *prefix = uri_prefix_table[code];
-        size_t      len    = uri_encode_order[i].len;
+    uint8_t best_code = 0x00;
+    size_t  best_len  = 0;
 
-        if (strncmp(uri, prefix, len) == 0) {
-            if (prefix_len != NULL) {
-                *prefix_len = len;
-            }
-            return code;
+    for (size_t code = 1; code < URI_PREFIX_COUNT; code++) {
+        size_t len = strlen(uri_prefix_table[code]);
+
+        if (len > best_len && strncmp(uri, uri_prefix_table[code], len) == 0) {
+            best_code = (uint8_t)code;
+            best_len  = len;
         }
     }
 
     if (prefix_len != NULL) {
-        *prefix_len = 0;
+        *prefix_len = best_len;
     }
-    return 0x00;
+    return best_code;
 }
 
 bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len, bool utf16,
@@ -989,7 +979,8 @@ static bool classic_try_auth_with_key( //
             return false;
         }
     } else if (!pn532->session_opened) {
-        if (!pn532_in_select(pn532, pn532->inListedTag) && !pn532_14443_select_by_uid(pn532, uid)) {
+        if ((pn532->tg_stale || !pn532_in_select(pn532, pn532->inListedTag)) &&
+            !pn532_14443_select_by_uid(pn532, uid)) {
             return false;
         }
     }
@@ -1396,10 +1387,17 @@ static ndef_result_t ndef_read_type4(pn532_t *pn532, ndef_message_parsed_t **out
         ESP_LOGD(TAG, "T4: bad CC TLV (T=%02X L=%02X)", cc[7], cc[8]);
         return NDEF_ERR_PARSE_FAILED;
     }
-    /* Cap chunk size: APDU response returns data + SW (2 bytes), and our READ BINARY
-     * helper uses a 260-byte buffer. Le is one byte (max 0xFF) and the PN532 InDataExchange
-     * buffer is 280; 250 is the safe limit. */
-    uint16_t chunk_max = (mle == 0 || mle > 250) ? 250u : mle;
+    /* Cap chunk size. MLe already counts data bytes only (SW1/SW2 are not
+     * part of it), so Le = MLe is legal; two bytes of headroom are kept
+     * anyway for cards that size MLe to their whole R-APDU buffer. Our READ
+     * BINARY helper uses a 260-byte buffer and Le is one byte, so 248 data
+     * bytes is the ceiling. */
+    uint16_t chunk_max;
+    if (mle <= 2 || mle > 250) {
+        chunk_max = 248u;
+    } else {
+        chunk_max = mle - 2u;
+    }
 
     if (!pn532_14443_4_select_file(pn532, ndef_fid_be, sizeof(ndef_fid_be))) {
         ESP_LOGD(TAG, "T4: SELECT NDEF file %02X%02X failed", ndef_fid_be[0], ndef_fid_be[1]);

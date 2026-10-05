@@ -50,6 +50,7 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 #define PN532_STATUS_ERROR_MASK          0x3F
 #define PN532_MI_MAX_CHAIN_ROUNDS        64
 #define PN532_ABORT_DRAIN_MAX_READS      8
+#define PN532_IRQ_FALLBACK_POLL_MS       10
 
 static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8_t *config_data,
                                    size_t config_data_len);
@@ -184,17 +185,33 @@ static bool pn532_wait_ready(pn532_t *pn532, uint16_t timeout)
          * response is pending (UM0701-02 §6.3); the bus check stays as a
          * fallback because IRQ is only driven once SAMConfiguration enables it.
          * Without this pre-check xQueueReceive with timeout=0 blocks forever. */
-        if (gpio_get_level(pn532->irq) == 0 || pn532_is_ready(pn532)) {
-            return true;
+        int64_t irq_deadline_us = esp_timer_get_time() + (int64_t)timeout * 1000;
+        for (;;) {
+            if (gpio_get_level(pn532->irq) == 0 || pn532_is_ready(pn532)) {
+                return true;
+            }
+            /* A queued edge is only a hint to look again, never proof of
+             * readiness: when the ACK asserted IRQ before the pre-check above,
+             * its edge stays queued and would otherwise satisfy the response
+             * wait while the chip is still busy. The wait is sliced so the bus
+             * fallback is also polled while the IRQ line is not driven. */
+            TickType_t ticks = pdMS_TO_TICKS(PN532_IRQ_FALLBACK_POLL_MS);
+            if (timeout != 0) {
+                int64_t remaining_us = irq_deadline_us - esp_timer_get_time();
+                if (remaining_us <= 0) {
+                    return false;
+                }
+                TickType_t remaining_ticks = pdMS_TO_TICKS((remaining_us + 999) / 1000);
+                if (remaining_ticks < ticks) {
+                    ticks = remaining_ticks;
+                }
+            }
+            if (ticks == 0) {
+                ticks = 1;
+            }
+            uint8_t evt;
+            (void)xQueueReceive(pn532->irq_queue, &evt, ticks);
         }
-        uint8_t    evt;
-        TickType_t ticks = (timeout == 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout);
-        if (xQueueReceive(pn532->irq_queue, &evt, ticks) == pdTRUE) {
-            return true;
-        }
-        /* Final check: covers the race where the edge fired between the
-         * pre-check and the queue wait but was consumed elsewhere. */
-        return gpio_get_level(pn532->irq) == 0 || pn532_is_ready(pn532);
     }
 
     /* Poll once per tick against a wall-clock deadline: readiness is seen
@@ -257,6 +274,7 @@ void pn532_abort_current_command(pn532_t *pn532)
     pn532->inListedTag    = 0;
     pn532->is_rf_on       = false;
     pn532->session_opened = false;
+    pn532->tg_stale       = false;
 }
 
 static void pn532_recover_after_timeout(pn532_t *pn532, uint8_t command, const char *phase)
@@ -361,9 +379,11 @@ bool pn532_execute_command(      //
     uint16_t       timeout       //
 )
 {
-    if (pn532 != NULL) {
-        pn532->last_command_status = PN532_COMMAND_STATUS_TRANSPORT_ERROR;
+    if (pn532 == NULL) {
+        ESP_LOGE(TAG, "pn532_execute_command: device pointer is NULL");
+        return false;
     }
+    pn532->last_command_status = PN532_COMMAND_STATUS_TRANSPORT_ERROR;
     if (response != NULL && response_len == NULL) {
         ESP_LOGE(TAG, "pn532_execute_command: response_len is required when response buffer is provided");
         return false;
@@ -371,7 +391,7 @@ bool pn532_execute_command(      //
 
     /* Drain any stale IRQ events queued from a previous command before issuing
      * a new one, so the upcoming wait_ready() blocks on the new edge. */
-    if (pn532 != NULL && pn532->isr_installed && pn532->irq_queue != NULL) {
+    if (pn532->isr_installed && pn532->irq_queue != NULL) {
         xQueueReset(pn532->irq_queue);
     }
 
@@ -445,6 +465,10 @@ bool pn532_execute_command(      //
 
 uint32_t pn532_get_firmware_version(pn532_t *pn532)
 {
+    if (pn532 == NULL) {
+        return 0;
+    }
+
     uint8_t response[4];
     size_t  response_len = sizeof(response);
     if (!pn532_execute_command(pn532, PN532_COMMAND_GETFIRMWAREVERSION, NULL, 0, response, &response_len,
@@ -510,6 +534,10 @@ bool pn532_get_general_status(pn532_t *pn532, pn532_general_status_t *status)
 
 bool pn532_reset(pn532_t *pn532)
 {
+    if (pn532 == NULL) {
+        return false;
+    }
+
     if (pn532_gpio_is_valid(pn532->rst)) {
         gpio_set_level(pn532->rst, 0);
         pn532_delay_ms(20);
@@ -520,6 +548,7 @@ bool pn532_reset(pn532_t *pn532)
     pn532->inListedTag    = 0;
     pn532->is_rf_on       = false;
     pn532->session_opened = false;
+    pn532->tg_stale       = false;
 
     /* Buses put the chip into low-power after reset/PowerDown: SPI wakes on
      * the NSS edge, HSU on the 0x55 0x55 preamble, I2C on a START condition.
@@ -571,13 +600,29 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
     pn532->ack_timeout_ms     = PN532_ACK_TIMEOUT_MS;
     pn532->rf_settle_delay_ms = PN532_RF_SETTLE_DELAY_MS;
 
+    /* gpio_config() also routes the pad to the GPIO function; gpio_set_direction()
+     * alone leaves pads that default to another function (e.g. JTAG) unusable. */
     if (pn532_gpio_is_valid(rst)) {
-        gpio_set_direction(rst, GPIO_MODE_OUTPUT);
+        const gpio_config_t rst_cfg = {
+            .pin_bit_mask = 1ULL << rst,
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_set_level(rst, 1);
+        gpio_config(&rst_cfg);
         gpio_set_level(rst, 1);
     }
     if (pn532_gpio_is_valid(irq)) {
-        gpio_set_direction(irq, GPIO_MODE_INPUT);
-        gpio_set_pull_mode(irq, GPIO_PULLUP_ONLY);
+        const gpio_config_t irq_cfg = {
+            .pin_bit_mask = 1ULL << irq,
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&irq_cfg);
         pn532->irq_queue = xQueueCreate(PN532_IRQ_QUEUE_DEPTH, sizeof(uint8_t));
         if (pn532->irq_queue == NULL) {
             ESP_LOGE(TAG, "pn532: failed to allocate IRQ queue");
@@ -678,6 +723,10 @@ void pn532_deinit(pn532_t *pn532, bool free_bus)
 
 bool pn532_set_rf_field(pn532_t *pn532, bool enabled)
 {
+    if (pn532 == NULL) {
+        return false;
+    }
+
     const uint8_t params[]     = {0x01, enabled ? 0x03 : 0x02};
     size_t        response_len = 0;
     bool ok = pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, params, sizeof(params), NULL, &response_len,
@@ -687,6 +736,7 @@ bool pn532_set_rf_field(pn532_t *pn532, bool enabled)
         if (!enabled) {
             pn532->inListedTag    = 0;
             pn532->session_opened = false;
+            pn532->tg_stale       = false;
             /* Let the collapsed field release a HALT-state card before the
              * next InListPassiveTarget restarts the field. */
             pn532_apply_rf_settle_delay(pn532);
@@ -825,7 +875,7 @@ bool pn532_deselect_target(pn532_t *pn532)
 bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                             size_t *response_len, uint16_t timeout)
 {
-    if (data == NULL || data_len == 0 || data_len + 1 > PN532_MAX_BUF_SIZE) {
+    if (pn532 == NULL || data == NULL || data_len == 0 || data_len + 1 > PN532_MAX_BUF_SIZE) {
         return false;
     }
 
@@ -849,8 +899,11 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
     /* NXP phTalTama_Transceive(): a response status with MI (0x40) means the
      * target chains more information. The host re-issues the exchange to
      * drain the chain and concatenates the payload fragments in order; the
-     * final round carries a status without MI. A chain that never terminates
-     * is cut off after PN532_MI_MAX_CHAIN_ROUNDS rounds. */
+     * final round carries a status without MI. Per UM0701-02 §7.3.5 the
+     * continuation request carries only the target number — the PN532 keeps
+     * the card-side chaining state, so re-sending the original payload would
+     * forward the APDU/command to the target a second time. A chain that
+     * never terminates is cut off after PN532_MI_MAX_CHAIN_ROUNDS rounds. */
     for (unsigned round = 0; chaining_active; round++) {
         if (round >= PN532_MI_MAX_CHAIN_ROUNDS) {
             ESP_LOGE(TAG, "pn532_in_data_exchange: MI chain did not terminate within %u rounds",
@@ -863,7 +916,10 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
         }
 
         size_t raw_response_len = sizeof(raw_response);
-        if (!pn532_execute_command(pn532, PN532_COMMAND_INDATAEXCHANGE, params, data_len + 1, raw_response,
+        /* Round 0 sends the caller's data; MI continuations send only the
+         * target number. */
+        size_t request_len = (round == 0) ? data_len + 1 : 1;
+        if (!pn532_execute_command(pn532, PN532_COMMAND_INDATAEXCHANGE, params, request_len, raw_response,
                                    &raw_response_len, timeout)) {
             exchange_failed = true;
             break;
@@ -902,6 +958,12 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
                     (void)pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, rf_off_params,
                                                 sizeof(rf_off_params), NULL, &rf_response_len,
                                                 (uint16_t)pn532->timeout_ms);
+                } else {
+                    /* 0x13/0x14 (framing / MIFARE authentication error): the
+                     * card fell back to IDLE, but the PN532 still counts the
+                     * target as selected, so a bare InSelect may not wake it.
+                     * pn532_14443_select_by_uid() re-lists instead. */
+                    pn532->tg_stale = true;
                 }
                 pn532->session_opened = false;
             }
@@ -986,8 +1048,10 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
         }
 
         size_t raw_response_len = sizeof(raw_response);
-        if (!pn532_execute_command(pn532, PN532_COMMAND_INCOMMUNICATETHRU, data, data_len, raw_response,
-                                   &raw_response_len, timeout)) {
+        /* Round 0 sends the caller's raw data; MI continuations send nothing
+         * — the PN532 keeps the target-side chaining state (UM0701-02). */
+        if (!pn532_execute_command(pn532, PN532_COMMAND_INCOMMUNICATETHRU, data, (round == 0) ? data_len : 0,
+                                   raw_response, &raw_response_len, timeout)) {
             exchange_failed = true;
             break;
         }
@@ -1042,6 +1106,10 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
 
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number)
 {
+    if (pn532 == NULL) {
+        return false;
+    }
+
     const uint8_t params[]   = {target_number};
     uint8_t       status[1]  = {0};
     size_t        status_len = sizeof(status);
@@ -1070,6 +1138,10 @@ bool pn532_in_select(pn532_t *pn532, uint8_t target_number)
 
 bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number)
 {
+    if (pn532 == NULL) {
+        return false;
+    }
+
     const uint8_t params[]   = {target_number};
     uint8_t       status[1]  = {0};
     size_t        status_len = sizeof(status);

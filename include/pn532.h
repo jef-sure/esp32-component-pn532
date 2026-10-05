@@ -18,8 +18,15 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** @brief Default PN532 I2C address, 7-bit form as ESP-IDF expects (UM0701-02: 0x48 write / 0x49 read). */
 #define PN532_I2C_DEFAULT_ADDRESS (0x24)
+
+/** @brief I2C clock used when pn532_i2c_init()/pn532_i2c_attach() receive a zero clock. */
+#define PN532_I2C_DEFAULT_CLOCK_HZ (100000)
 
 /** @brief Default HSU baud rate used when uart_init() receives a non-positive baud. */
 #define PN532_UART_DEFAULT_BAUD_RATE (115200)
@@ -61,8 +68,10 @@ typedef enum _pn532_nfc_subtype_t
  * @brief ISO14443A target description returned by polling helpers.
  *
  * The UID, target number (Tg), ATQA, and SAK come directly from PN532 polling
- * responses. Tg is valid while the current RF/list context remains active and
- * lets pn532_14443_select_by_uid() issue InSelect without polling again.
+ * responses. atqa holds the two SENS_RES bytes in the order the PN532 reports
+ * them, first byte in the high half (MIFARE Classic 1K reads 0x0004). Tg is
+ * valid while the current RF/list context remains active and lets
+ * pn532_14443_select_by_uid() issue InSelect without polling again.
  * subtype, block_size, and blocks_count are filled by the card-type detection
  * helpers.
  */
@@ -81,8 +90,10 @@ typedef struct
 /**
  * @brief Heap-allocated result of pn532_14443_get_all_uids().
  *
- * The structure uses a flexible trailing array. Free it with free() when no
- * longer needed.
+ * Holds one UID inline; additional UIDs follow the struct contiguously. The
+ * allocation is sized for uids_count entries by the producing API as
+ * sizeof(pn532_uids_array_t) + (uids_count - 1) * sizeof(pn532_uid_t).
+ * Access entries as uids[i]. Free it with free() when no longer needed.
  */
 typedef struct
 {
@@ -127,6 +138,7 @@ typedef struct _pn532_t
     uint8_t       last_command_status;
     QueueHandle_t irq_queue;     /**< Set when IRQ ISR is installed; NULL otherwise. */
     bool          isr_installed; /**< True when this device owns a GPIO ISR handler on irq. */
+    bool          tg_stale;      /**< Listed Tg needs a fresh InListPassiveTarget (card dropped to IDLE). */
 } pn532_t;
 
 /** @brief Sleep helper used by the driver and available to callers building retry loops. */
@@ -176,7 +188,8 @@ pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clo
  * @brief Create a PN532 I2C transport handle.
  *
  * The function creates an ESP-IDF I2C master bus and attaches the PN532 as a
- * device on it. If device_address is 0, PN532_I2C_DEFAULT_ADDRESS is used.
+ * device on it. If device_address is 0, PN532_I2C_DEFAULT_ADDRESS is used; if
+ * clock_speed_hz is 0, PN532_I2C_DEFAULT_CLOCK_HZ is used.
  * The returned handle is heap-allocated and owned by the caller.
  *
  * @return Newly allocated transport handle, or NULL on failure.
@@ -196,7 +209,8 @@ pn532_bus_t *pn532_i2c_init(       //
  * handle is looked up with i2c_master_get_bus_handle() (ESP-IDF >= 5.4) and
  * stays owned by the caller: pn532_bus_destroy() removes only the PN532
  * device and never deletes the bus. If device_address is 0,
- * PN532_I2C_DEFAULT_ADDRESS is used.
+ * PN532_I2C_DEFAULT_ADDRESS is used; if clock_speed_hz is 0,
+ * PN532_I2C_DEFAULT_CLOCK_HZ is used.
  *
  * @return Newly allocated transport handle, or NULL when no bus exists on port or on failure.
  */
@@ -560,9 +574,11 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
  * deselected, this function issues InSelect before exchanging the APDU.
  *
  * @param apdu Command APDU payload.
- * @param apdu_len Command length in bytes. The PN532 target byte and extended
- *                 host-frame overhead must also fit in PN532_MAX_BUF_SIZE;
- *                 with the current buffer size, at most 267 APDU bytes fit.
+ * @param apdu_len Command length in bytes. The driver rejects commands whose
+ *                 host frame exceeds PN532_MAX_BUF_SIZE (more than 267 APDU
+ *                 bytes); the PN532 firmware itself accepts at most 262 data
+ *                 bytes per InDataExchange and answers longer ones with an
+ *                 error frame.
  * @param rx Output buffer for the response APDU.
  * @param rx_len In: rx capacity. Out: received response size.
  */
@@ -626,15 +642,31 @@ esp_err_t pn532_apdu_parse_response(const uint8_t *buffer, size_t length, pn532_
 /** @brief Return SW1 and SW2 as a single 16-bit status word, or 0 for NULL. */
 uint16_t pn532_apdu_get_status(const pn532_apdu_response_t *response);
 
-/** @brief Issue ISO-DEP SELECT FILE by AID or file identifier. */
+/**
+ * @brief Issue ISO-DEP SELECT by AID or file identifier.
+ *
+ * More than two bytes select an application by AID (P1=0x04, P2=0x00). Two
+ * bytes or fewer select an elementary file by identifier with P2=0x0C (no
+ * response data), as NFC Forum Type 4 Tag mapping 2.0 requires; when the card
+ * refuses that with an error status word, the select is retried once with
+ * P2=0x00 for mapping 1.0 cards.
+ */
 bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len);
 
 /**
  * @brief Issue ISO-DEP READ BINARY on the currently selected file.
  *
- * @param offset File offset to read from.
+ * @param offset File offset to read from; offsets above 0x7FFF (short EF
+ *               identifier limit) are rejected.
  * @param le Encoded short Le; 0 requests 256 bytes.
  * @param buffer Output buffer.
- * @param got In: buffer capacity. Out: actual bytes returned.
+ * @param got In: buffer capacity. Out: actual bytes returned, or the
+ *            required size when the response does not fit (returns false).
+ * @return false when the card reports an error status, the offset exceeds
+ *         the short-file limit, or the response exceeds the buffer.
  */
 bool pn532_14443_4_read_binary(pn532_t *pn532, uint16_t offset, uint8_t le, uint8_t *buffer, size_t *got);
+
+#ifdef __cplusplus
+}
+#endif

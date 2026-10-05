@@ -172,6 +172,9 @@ static pn532_bus_t *pn532_i2c_add_device(i2c_master_bus_handle_t bus_handle, boo
     if (device_address == 0) {
         device_address = PN532_I2C_DEFAULT_ADDRESS;
     }
+    if (clock_speed_hz == 0) {
+        clock_speed_hz = PN532_I2C_DEFAULT_CLOCK_HZ;
+    }
 
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,

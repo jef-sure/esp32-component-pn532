@@ -65,21 +65,23 @@ void app_main(void)
         pn532_uids_array_t *cards = pn532_14443_get_all_uids_ex(nfc, &status);
 
         if (status == PN532_POLL_FOUND) {
-            pn532_uid_t *card = &cards->uids[0];
-            ESP_LOG_BUFFER_HEX(TAG, card->uid, card->uid_length);
+            for (uint8_t c = 0; c < cards->uids_count; c++) {
+                pn532_uid_t *card = &cards->uids[c];
+                ESP_LOG_BUFFER_HEX(TAG, card->uid, card->uid_length);
 
-            ndef_message_parsed_t *msg = NULL;
-            if (pn532_ndef_read_card_auto(nfc, card, &msg) == NDEF_OK) {
-                for (size_t i = 0; i < msg->record_count; i++) {
-                    char uri[128];
-                    if (ndef_record_is_uri(&msg->records[i]) &&
-                        ndef_extract_uri(&msg->records[i], uri, sizeof(uri)) > 0) {
-                        ESP_LOGI(TAG, "URI: %s", uri);
+                ndef_message_parsed_t *msg = NULL;
+                if (pn532_ndef_read_card_auto(nfc, card, &msg) == NDEF_OK) {
+                    for (size_t i = 0; i < msg->record_count; i++) {
+                        char uri[128];
+                        if (ndef_record_is_uri(&msg->records[i]) &&
+                            ndef_extract_uri(&msg->records[i], uri, sizeof(uri)) > 0) {
+                            ESP_LOGI(TAG, "URI: %s", uri);
+                        }
                     }
+                    ndef_free_parsed_message(msg);
                 }
-                ndef_free_parsed_message(msg);
+                pn532_release_target(nfc);
             }
-            pn532_release_target(nfc);
         } else if (status == PN532_POLL_TRANSPORT_ERROR) {
             pn532_recover(nfc); /* the reader stopped answering */
         }
@@ -184,7 +186,7 @@ if (status == PN532_POLL_FOUND && pn532_14443_select_by_uid(pn532, &uids->uids[0
     ndef_message_t  message;
 
     ndef_message_init(&message, records, 1);
-    /* abbreviate=true maps the https://www. prefix to URI identifier 0x01. */
+    /* abbreviate=true maps the https://www. prefix to URI identifier 0x02. */
     if (ndef_make_uri_record(&records[0], "https://www.example.com", true,
                              payload, sizeof(payload))) {
         ndef_message_add(&message, &records[0]);

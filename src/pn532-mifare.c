@@ -26,7 +26,11 @@ int16_t pn532_mifare_authenticate(pn532_t *pn532, uint8_t blockno, const uint8_t
 
 bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_t buffer_len)
 {
-    if (buffer == NULL || buffer_len == 0) {
+    if (pn532 == NULL || buffer == NULL || buffer_len == 0) {
+        return false;
+    }
+    if (blockno < 0 || blockno > 0xFF) {
+        ESP_LOGE(TAG, "pn532_mifare_block_read: block number %d out of range", blockno);
         return false;
     }
 
@@ -40,7 +44,11 @@ bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_
 
 int pn532_mifare_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, size_t buffer_len)
 {
-    if (buffer == NULL) {
+    if (pn532 == NULL || buffer == NULL) {
+        return -1;
+    }
+    if (blockno < 0 || blockno > 0xFF) {
+        ESP_LOGE(TAG, "pn532_mifare_block_write: block number %d out of range", blockno);
         return -1;
     }
 
