@@ -294,6 +294,12 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
         pos += payload_len;
     }
 
+    if (tnf == NDEF_TNF_UNKNOWN && type_len != 0) {
+        /* NDEF 1.0 §3.2.6: an unknown-type record carries no type (Android
+         * rejects it the same way). */
+        return false;
+    }
+
     if (tnf == NDEF_TNF_EMPTY && (type_len != 0 || id_len != 0 || payload_len != 0)) {
         /* NFC RTD: an empty record must carry no type, ID, or payload. */
         return false;

@@ -486,6 +486,26 @@ Requirements: ESP-IDF 5.2 or newer (`pn532_i2c_attach()` needs 5.4). The compone
 3. End the session with `pn532_deselect_target()`, `pn532_release_target()`, or `pn532_set_rf_off()`. On success (`0x00`) deselect keeps the target listed for reactivation without a field restart; release and RF off invalidate it. Deselect and release verify the returned status byte: `0x27` means the chip already lost the target and is treated as a successful close that clears both the session and the listed-target state — mirroring the NXP TAMA reference — so poll loops cannot wedge. Any other non-zero status fails, leaving the local state untouched. `pn532_in_select()` treats `0x27` as a hard error so callers re-poll.
 4. After target loss, RF timeout, or `pn532_recover()`, reacquire the card through polling and `pn532_14443_select_by_uid()` before continuing. A transceive with no listed target fails without starting a new discovery.
 
+### Cards with both MIFARE Classic and ISO-DEP
+
+Some cards (SmartMX, JCOP, and similar) emulate MIFARE Classic on top of an ISO14443-4 chip and report SAK `0x28` (1K) or `0x38` (4K). One activation can serve only one of the two sides: once the PN532 has sent RATS, the card speaks ISO-DEP and refuses MIFARE commands until the field is recycled.
+
+The poll reports such a card with a Classic subtype, and the driver follows the NXP reference stack in treating it as Classic by default: `pn532_14443_select_by_uid()` re-lists it with the PN532's automatic RATS switched off, so authentication, block access, and `pn532_ndef_read_card_auto()` work as on a native Classic card. The next poll switches automatic RATS back on; nothing has to be restored by hand.
+
+To use the ISO-DEP side instead, change the subtype in your copy of the `pn532_uid_t` before selecting. The subtype is the only thing that steers the choice:
+
+```c
+pn532_uid_t card = uids->uids[0];
+if ((card.sak & 0x20) != 0) {              /* ISO14443-4 capable */
+    card.subtype = PN532_MIFARE_DESFIRE;   /* treat as ISO-DEP / Type 4 */
+}
+if (pn532_14443_select_by_uid(pn532, &card)) {
+    /* pn532_14443_4_transceive(), pn532_14443_4_select_file(), ... */
+}
+```
+
+With that subtype `pn532_ndef_read_card_auto()` also takes the Type 4 path. To switch sides on a card that is already selected, call `pn532_14443_select_by_uid()` again with the other subtype: the driver recycles the field and re-lists the card in the other mode. Both sides cannot be open at the same time.
+
 ### APDU utilities
 
 `pn532_14443_4_transceive()` is the APDU exchange API. The APDU utilities are independent of it and of any hardware:

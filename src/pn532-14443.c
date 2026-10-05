@@ -11,7 +11,7 @@ static const char *TAG_T4 = "PN532-T4";
 #define PN532_MAX_PASSIVE_TARGETS_ISO14443A 2
 #define PN532_TYPE4_EXCHANGE_TIMEOUT_MS     1500
 
-static bool pn532_prepare_for_passive_target_list(pn532_t *pn532)
+static bool pn532_prepare_for_passive_target_list(pn532_t *pn532, bool auto_rats)
 {
     if (pn532 == NULL) {
         return false;
@@ -27,7 +27,27 @@ static bool pn532_prepare_for_passive_target_list(pn532_t *pn532)
         return false;
     }
     pn532->session_opened = false;
-    return true;
+
+    /* NXP pollPassive106A(): SetParameters precedes the list command.
+     * Automatic RATS is on for discovery and ISO14443-4 targets and off when
+     * a MIFARE Classic emulation card must stay at the ISO14443-3 level. */
+    return pn532_set_auto_rats(pn532, auto_rats);
+}
+
+/* MIFARE Classic emulation on an ISO14443-4 card (SAK 0x28/0x38): with
+ * automatic RATS the PN532 activates it as ISO-DEP and it no longer accepts
+ * MIFARE commands. The NXP reference lists such cards with RATS switched off
+ * in its MIFARE mode. */
+static bool pn532_uid_is_classic_emulation(const pn532_uid_t *uid)
+{
+    switch (uid->subtype) {
+    case PN532_MIFARE_CLASSIC_1K:
+    case PN532_MIFARE_CLASSIC_MINI:
+    case PN532_MIFARE_CLASSIC_4K:
+        return (uid->sak & 0x20u) != 0u;
+    default:
+        return false;
+    }
 }
 
 bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *blocks_count, uint16_t *block_size)
@@ -128,6 +148,7 @@ static bool pn532_target_has_ats(uint8_t sak)
 static bool pn532_parse_iso14443a_target( //
     const uint8_t *response,              //
     size_t         response_len,          //
+    bool           expect_ats,            //
     size_t        *offset,                //
     pn532_uid_t   *uid                    //
 )
@@ -157,9 +178,8 @@ static bool pn532_parse_iso14443a_target( //
 
     memcpy(uid->uid, response + *offset + 5u, (size_t)uid->uid_length);
 
-    /* A last entry may end right after the UID: automatic RATS can be
-     * switched off with SetParameters, and then no ATS follows. */
-    if (pn532_target_has_ats(uid->sak) && *offset + entry_len < response_len) {
+    /* No ATS follows while automatic RATS is switched off. */
+    if (expect_ats && pn532_target_has_ats(uid->sak) && *offset + entry_len < response_len) {
         uint8_t ats_len;
 
         ats_len = response[*offset + entry_len];
@@ -176,6 +196,7 @@ static bool pn532_parse_iso14443a_target( //
 static bool pn532_find_listed_target_by_uid( //
     const uint8_t     *response,             //
     size_t             response_len,         //
+    bool               expect_ats,           //
     const pn532_uid_t *wanted_uid,           //
     uint8_t           *target_number         //
 )
@@ -193,7 +214,7 @@ static bool pn532_find_listed_target_by_uid( //
     for (uint8_t index = 0; index < targets_found; index++) {
         pn532_uid_t parsed_uid;
 
-        if (!pn532_parse_iso14443a_target(response, response_len, &offset, &parsed_uid)) {
+        if (!pn532_parse_iso14443a_target(response, response_len, expect_ats, &offset, &parsed_uid)) {
             return false;
         }
 
@@ -308,7 +329,7 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
         return NULL;
     }
 
-    if (!pn532_prepare_for_passive_target_list(pn532)) {
+    if (!pn532_prepare_for_passive_target_list(pn532, true)) {
         if (status != NULL) {
             *status = pn532_poll_command_error(pn532);
         }
@@ -358,7 +379,7 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
         uint16_t blocks_count = 0;
         uint16_t block_size   = 0;
 
-        if (!pn532_parse_iso14443a_target(response, response_len, &offset, &parsed_uid)) {
+        if (!pn532_parse_iso14443a_target(response, response_len, true, &offset, &parsed_uid)) {
             free(uids);
             if (status != NULL) {
                 *status = PN532_POLL_PROTOCOL_ERROR;
@@ -403,8 +424,10 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
     }
 
     /* A stale Tg (card dropped to IDLE after a failed exchange) takes the
-     * full path: only a new InListPassiveTarget reliably re-activates it. */
-    if (uid->tg != 0 && pn532->is_rf_on && !pn532->tg_stale) {
+     * full path: only a new InListPassiveTarget reliably re-activates it. So
+     * does a card that was listed in the other RATS mode than it needs. */
+    bool plain_mifare = pn532_uid_is_classic_emulation(uid);
+    if (uid->tg != 0 && pn532->is_rf_on && !pn532->tg_stale && pn532->auto_rats_off == plain_mifare) {
         return pn532_in_select(pn532, uid->tg);
     }
 
@@ -417,7 +440,7 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
     size_t response_len;
     bool   listed = false;
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (!pn532_prepare_for_passive_target_list(pn532)) {
+        if (!pn532_prepare_for_passive_target_list(pn532, !plain_mifare)) {
             pn532->inListedTag    = 0;
             pn532->session_opened = false;
             return false;
@@ -432,8 +455,8 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
             break;
         }
     }
-    if (!listed || !pn532_find_listed_target_by_uid(response, response_len, uid, &target_number)) {
-        if (!pn532_prepare_for_passive_target_list(pn532)) {
+    if (!listed || !pn532_find_listed_target_by_uid(response, response_len, !plain_mifare, uid, &target_number)) {
+        if (!pn532_prepare_for_passive_target_list(pn532, !plain_mifare)) {
             pn532->inListedTag    = 0;
             pn532->session_opened = false;
             return false;
@@ -449,7 +472,7 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
         pn532->is_rf_on = true;
         pn532->tg_stale = false;
 
-        if (!pn532_find_listed_target_by_uid(response, response_len, uid, &target_number)) {
+        if (!pn532_find_listed_target_by_uid(response, response_len, !plain_mifare, uid, &target_number)) {
             (void)pn532_set_rf_off(pn532);
             pn532->inListedTag    = 0;
             pn532->session_opened = false;

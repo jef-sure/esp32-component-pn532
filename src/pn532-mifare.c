@@ -39,7 +39,8 @@ bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_
     if (!pn532_in_data_exchange(pn532, cmd, sizeof(cmd), buffer, &response_len, (uint16_t)pn532->timeout_ms)) {
         return false;
     }
-    return response_len == 16 || response_len == 4;
+    /* READ always answers 16 bytes: one Classic block or four Type 2 pages. */
+    return response_len == 16;
 }
 
 int pn532_mifare_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, size_t buffer_len)

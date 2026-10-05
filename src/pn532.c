@@ -40,6 +40,10 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 #define PN532_SAM_TIMEOUT_1S             0x14
 #define PN532_SAM_IRQ_ENABLE             0x01
 #define PN532_PASSIVE_ACTIVATION_RETRIES 0x05
+/* SetParameters flags as the NXP reference stack writes them: automatic
+ * ATR_RES always, automatic RATS for ISO14443-4 polling only. */
+#define PN532_PARAM_AUTOMATIC_ATR_RES    0x04
+#define PN532_PARAM_AUTOMATIC_RATS       0x10
 #define PN532_STATUS_OK                  0x00
 #define PN532_STATUS_RF_TIMEOUT          0x01
 #define PN532_STATUS_MIFARE_ERROR_13     0x13
@@ -56,6 +60,7 @@ static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8
                                    size_t config_data_len);
 static bool pn532_sam_configuration(pn532_t *pn532, uint8_t mode, uint8_t timeout, uint8_t irq_enable);
 static void pn532_apply_rf_settle_delay(pn532_t *pn532);
+static bool pn532_write_parameters(pn532_t *pn532, bool auto_rats);
 
 static bool pn532_status_requires_reselect(uint8_t status)
 {
@@ -82,6 +87,12 @@ static bool pn532_restore_runtime_config(pn532_t *pn532)
     }
     if (!pn532_set_passive_activation_retries(pn532, PN532_PASSIVE_ACTIVATION_RETRIES)) {
         ESP_LOGE(TAG, "pn532: failed to configure passive activation retries");
+        return false;
+    }
+    /* Without a reset pin the chip keeps its parameters across an MCU
+     * restart, so the automatic RATS state is written, not assumed. */
+    if (!pn532_write_parameters(pn532, true)) {
+        ESP_LOGE(TAG, "pn532: failed to set PN532 parameters");
         return false;
     }
     return true;
@@ -542,6 +553,8 @@ bool pn532_reset(pn532_t *pn532)
         gpio_set_level(pn532->rst, 0);
         pn532_delay_ms(20);
         gpio_set_level(pn532->rst, 1);
+        /* A hard reset restores the chip's default parameters. */
+        pn532->auto_rats_off = false;
     }
 
     pn532_delay_ms(100);
@@ -806,6 +819,32 @@ static bool pn532_sam_configuration(pn532_t *pn532, uint8_t mode, uint8_t timeou
     return pn532_execute_command(pn532, PN532_COMMAND_SAMCONFIGURATION, params, sizeof(params), NULL, &response_len,
                                  (uint16_t)pn532->timeout_ms) &&
            response_len == 0;
+}
+
+static bool pn532_write_parameters(pn532_t *pn532, bool auto_rats)
+{
+    const uint8_t params[] = {
+        (uint8_t)(PN532_PARAM_AUTOMATIC_ATR_RES | (auto_rats ? PN532_PARAM_AUTOMATIC_RATS : 0)),
+    };
+    size_t response_len = 0;
+    if (!pn532_execute_command(pn532, PN532_COMMAND_SETPARAMETERS, params, sizeof(params), NULL, &response_len,
+                               (uint16_t)pn532->timeout_ms) ||
+        response_len != 0) {
+        return false;
+    }
+    pn532->auto_rats_off = !auto_rats;
+    return true;
+}
+
+bool pn532_set_auto_rats(pn532_t *pn532, bool enabled)
+{
+    if (pn532 == NULL) {
+        return false;
+    }
+    if (pn532->auto_rats_off == !enabled) {
+        return true;
+    }
+    return pn532_write_parameters(pn532, enabled);
 }
 
 bool pn532_release_target(pn532_t *pn532)

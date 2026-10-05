@@ -31,6 +31,7 @@ struct pn532_bus_t
 #define PN532_COMMAND_GETFIRMWAREVERSION  (0x02)
 #define PN532_COMMAND_GETGENERALSTATUS    (0x04)
 #define PN532_COMMAND_SETSERIALBAUDRATE   (0x10)
+#define PN532_COMMAND_SETPARAMETERS       (0x12)
 #define PN532_COMMAND_SAMCONFIGURATION    (0x14)
 #define PN532_COMMAND_RFCONFIGURATION     (0x32)
 #define PN532_COMMAND_INCOMMUNICATETHRU   (0x42)
@@ -64,3 +65,6 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number);
 bool pn532_in_deselect(pn532_t *pn532, uint8_t target_number);
 void pn532_abort_current_command(pn532_t *pn532);
+/* Switch the PN532's automatic RATS on or off (SetParameters); a no-op when
+ * the chip is already in that mode. */
+bool pn532_set_auto_rats(pn532_t *pn532, bool enabled);

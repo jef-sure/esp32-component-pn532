@@ -52,6 +52,8 @@ typedef struct
     size_t      nack_count;
     uint8_t     corrupt_responses; /* next N response frames get a broken DCS */
     uint8_t     two_ats_sak[2];    /* MOCK_TWO_LONG_ATS SAK per target; 0 selects 0x20 */
+    uint8_t     card_sak;          /* MOCK_CARD SAK override; 0 selects 0x08 */
+    uint8_t     tama_params;       /* last SetParameters flags; 0: never written (chip default, RATS on) */
 } mock_bus_t;
 
 static const uint8_t ack_frame[]  = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
@@ -78,6 +80,10 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
     uint8_t command = buffer[3] == 0xFF ? buffer[9] : buffer[6];
     if (mock->mode == MOCK_LIST_TRANSPORT_ERROR && command == PN532_COMMAND_INLISTPASSIVETARGET) {
         return false;
+    }
+
+    if (command == PN532_COMMAND_SETPARAMETERS) {
+        mock->tama_params = buffer[7];
     }
 
     /* Short frame layout: preamble(3) LEN ~LEN TF CMD then params. Capture the
@@ -200,6 +206,7 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
 
     switch (mock->current_command) {
     case PN532_COMMAND_RFCONFIGURATION:
+    case PN532_COMMAND_SETPARAMETERS:
     case PN532_COMMAND_SAMCONFIGURATION:
         /* UM0701-02 §7.2.10: the SAMConfiguration response carries no data. */
         payload_len = 0;
@@ -221,6 +228,21 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
     case PN532_COMMAND_INLISTPASSIVETARGET:
         payload     = mock->mode == MOCK_NO_CARD ? no_card : card;
         payload_len = mock->mode == MOCK_NO_CARD ? sizeof(no_card) : sizeof(card);
+        if (mock->mode == MOCK_CARD && mock->card_sak != 0) {
+            /* Same card with another SAK. Like the chip, append an ATS only
+             * for an ISO14443-4 SAK while automatic RATS (0x10) is on. */
+            static uint8_t     custom[sizeof(card) + 5];
+            static const uint8_t ats[] = {0x05, 0x78, 0x80, 0x70, 0x02};
+            bool               rats    = mock->tama_params == 0 || (mock->tama_params & 0x10) != 0;
+            memcpy(custom, card, sizeof(card));
+            custom[4]   = mock->card_sak;
+            payload     = custom;
+            payload_len = sizeof(card);
+            if ((mock->card_sak & 0x20) != 0 && rats) {
+                memcpy(custom + sizeof(card), ats, sizeof(ats));
+                payload_len += sizeof(ats);
+            }
+        }
         if (mock->mode == MOCK_TWO_LONG_ATS) {
             /* NbTg=2; each: Tg ATQA(2) SAK=0x20 UIDLen=7 UID(7) ATS(TL=30): 85 bytes total. */
             static uint8_t two_ats[1 + 2 * 42];
@@ -662,7 +684,8 @@ TEST_CASE("recover restores runtime configuration without recreating the bus", "
     /* Link check first (so a silent chip can be resynced), then SAM config,
      * retries, RF off. */
     const uint8_t expected[] = {PN532_COMMAND_GETFIRMWAREVERSION, PN532_COMMAND_SAMCONFIGURATION,
-                                PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_RFCONFIGURATION};
+                                PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_SETPARAMETERS,
+                                PN532_COMMAND_RFCONFIGURATION};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
 }
 
@@ -1358,6 +1381,84 @@ TEST_CASE("ATS follows every SAK with the ISO14443-4 bit, ATQA keeps the reporte
     /* SENS_RES bytes 0x44 0x03 as reported by the PN532. */
     TEST_ASSERT_EQUAL_HEX16(0x4403, uids->uids[0].atqa);
     free(uids);
+}
+
+TEST_CASE("Classic emulation on an ISO-DEP card is re-listed without automatic RATS", "[pn532][polling][rats]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.card_sak = 0x28;
+
+    /* Discovery runs with the chip default (automatic RATS on): no
+     * SetParameters is needed and the ATS behind the UID is skipped. */
+    pn532_uids_array_t *uids = pn532_14443_get_all_uids(&pn532);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(1, uids->uids_count);
+    TEST_ASSERT_EQUAL(PN532_MIFARE_CLASSIC_1K, uids->uids[0].subtype);
+    const uint8_t poll[] = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_INLISTPASSIVETARGET};
+    assert_commands(&mock, poll, ARRAY_SIZE(poll));
+
+    /* The poll activated the card as ISO-DEP, so its Tg is not reused:
+     * field off, RATS off, targeted list, select. */
+    mock.command_count = 0;
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &uids->uids[0]));
+    const uint8_t select[] = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_SETPARAMETERS,
+                              PN532_COMMAND_INLISTPASSIVETARGET, PN532_COMMAND_INSELECT};
+    assert_commands(&mock, select, ARRAY_SIZE(select));
+    TEST_ASSERT_EQUAL_HEX8(0x04, mock.tama_params);
+    TEST_ASSERT_TRUE(pn532.auto_rats_off);
+    TEST_ASSERT_TRUE(pn532.session_opened);
+
+    /* A second select of the same card finds it listed in the right mode. */
+    pn532_uid_t listed = uids->uids[0];
+    listed.tg          = pn532.inListedTag;
+    mock.command_count = 0;
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &listed));
+    const uint8_t reselect[] = {PN532_COMMAND_INSELECT};
+    assert_commands(&mock, reselect, ARRAY_SIZE(reselect));
+    free(uids);
+
+    /* Overriding the subtype asks for the ISO-DEP side of the same card: it
+     * is listed in the wrong mode now, so RATS goes back on and it is
+     * re-listed. */
+    pn532_uid_t iso_dep = listed;
+    iso_dep.subtype     = PN532_MIFARE_DESFIRE;
+    mock.command_count  = 0;
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &iso_dep));
+    assert_commands(&mock, select, ARRAY_SIZE(select));
+    TEST_ASSERT_EQUAL_HEX8(0x14, mock.tama_params);
+    TEST_ASSERT_FALSE(pn532.auto_rats_off);
+
+    /* Back to the Classic side for the rest of the test. */
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &listed));
+    TEST_ASSERT_TRUE(pn532.auto_rats_off);
+
+    /* The next poll restores automatic RATS before listing. */
+    mock.command_count = 0;
+    uids               = pn532_14443_get_all_uids(&pn532);
+    TEST_ASSERT_NOT_NULL(uids);
+    const uint8_t repoll[] = {PN532_COMMAND_INRELEASE, PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_SETPARAMETERS,
+                              PN532_COMMAND_INLISTPASSIVETARGET};
+    assert_commands(&mock, repoll, ARRAY_SIZE(repoll));
+    TEST_ASSERT_EQUAL_HEX8(0x14, mock.tama_params);
+    TEST_ASSERT_FALSE(pn532.auto_rats_off);
+    free(uids);
+}
+
+TEST_CASE("unknown TNF record with a type is rejected", "[pn532][ndef][tnf]")
+{
+    static const uint8_t with_type[] = {0xD5, 0x01, 0x01, 'x', 0xAA};
+    static const uint8_t no_type[]   = {0xD5, 0x00, 0x01, 0xAA};
+
+    ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(with_type, sizeof(with_type), &message));
+    TEST_ASSERT_NULL(message);
+    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(no_type, sizeof(no_type), &message));
+    TEST_ASSERT_EQUAL(NDEF_TNF_UNKNOWN, message->records[0].tnf);
+    ndef_free_parsed_message(message);
 }
 
 TEST_CASE("NDEF record length that wraps the offset is rejected", "[pn532][ndef][bounds]")

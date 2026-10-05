@@ -1,5 +1,11 @@
 # Changelog
 
+## v 0.6.1 - 2026-10-05
+
+- **MIFARE Classic emulation on ISO14443-4 cards (SAK `0x28`/`0x38`) is usable as Classic** (`pn532-14443.c`, `pn532.c`). With the PN532's automatic RATS such a card is activated as ISO-DEP and refuses MIFARE commands. Like the NXP reference stack in its MIFARE mode, `pn532_14443_select_by_uid()` now re-lists a Classic-subtype card that has SAK bit `0x20` with automatic RATS switched off (SetParameters `0x04`); the next poll switches it back on (`0x14`). `pn532_init()` / `pn532_recover()` write SetParameters `0x14` once, since a chip without a reset pin keeps its parameters across an MCU restart. New state field `pn532_t.auto_rats_off`. To open the ISO-DEP side of such a card instead, set `subtype` to `PN532_MIFARE_DESFIRE` in your copy of the `pn532_uid_t` before selecting (README, "Cards with both MIFARE Classic and ISO-DEP").
+- `pn532_mifare_block_read()` accepts only the 16-byte READ answer (a 4-byte answer was tolerated but would have left 12 bytes of the NDEF scan buffer unset).
+- NDEF parsing rejects a TNF-unknown (`0x05`) record that carries a type, as NDEF 1.0 and Android do.
+
 ## v 0.6.0 - 2026-10-05
 
 - **InDataExchange/InCommunicateThru MI continuations no longer re-send the RF payload** (`pn532.c`). UM0701-02 §7.3.5 continuation requests carry only the target number (InDataExchange) or nothing (InCommunicateThru); re-sending the original data forwarded the APDU/command to the card a second time. The mock now captures per-round request parameters, and the MI regression tests assert the continuation shape.

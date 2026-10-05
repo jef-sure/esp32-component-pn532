@@ -139,6 +139,7 @@ typedef struct _pn532_t
     QueueHandle_t irq_queue;     /**< Set when IRQ ISR is installed; NULL otherwise. */
     bool          isr_installed; /**< True when this device owns a GPIO ISR handler on irq. */
     bool          tg_stale;      /**< Listed Tg needs a fresh InListPassiveTarget (card dropped to IDLE). */
+    bool          auto_rats_off; /**< Automatic RATS is switched off (MIFARE Classic emulation card in use). */
 } pn532_t;
 
 /** @brief Sleep helper used by the driver and available to callers building retry loops. */
@@ -503,6 +504,17 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532);
  * When the UID came from the current poll and its Tg is still valid, the helper
  * selects that target directly. Otherwise it performs a targeted passive-list
  * command and falls back to an untargeted scan plus UID match when necessary.
+ *
+ * A MIFARE Classic emulation on an ISO14443-4 card (Classic subtype with SAK
+ * bit 0x20, e.g. SAK 0x28/0x38) is always re-listed with the PN532's automatic
+ * RATS switched off, as the NXP reference stack does for its MIFARE mode: the
+ * card then stays at the ISO14443-3 level and accepts MIFARE commands. The
+ * next poll switches automatic RATS back on.
+ *
+ * uid->subtype alone steers that choice. To open the ISO14443-4 side of such
+ * a card instead, set subtype to PN532_MIFARE_DESFIRE in your copy of the
+ * pn532_uid_t before the call; calling again with the other subtype re-lists
+ * the card in the other mode. Both sides cannot be open at once.
  */
 bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid);
 
