@@ -1,5 +1,11 @@
 # Changelog
 
+## v 0.6.2 - 2026-10-06
+
+- **SPI wake-up pulse is 2 ms at any tick rate** (`pn532-bus-spi.c`). `vTaskDelay(pdMS_TO_TICKS(2))` is zero ticks at `CONFIG_FREERTOS_HZ=100`, which left a microsecond NSS pulse without the T1 settle time of PN532/C1 §8.5.6. The pulse now waits on wall-clock time through `pn532_delay_ms()`.
+- **SPI wake-up pulse holds the bus** (`pn532-bus-spi.c`). The pulse drives NSS outside a transaction; with a second reader on the same host polled from another task, both chips could be selected at once. `pn532_spi_init()` / `pn532_spi_attach()` and the wake-up after `pn532_reset()` now take the bus with `spi_device_acquire_bus()` for the pulse. Readers driven from one task were not affected.
+- **`pn532_14443_select_by_uid()` no longer reuses a Tg that belongs to another card** (`pn532-14443.c`). The PN532 numbers targets from 1 on every InListPassiveTarget, so a `pn532_uid_t` kept from an earlier poll could carry the Tg of the card listed after it, and the bare InSelect opened that card instead. The driver keeps the UID behind each Tg of the latest listing (`pn532_t.listed_uid`, `listed_uid_len`) and takes the InSelect shortcut only when it matches; otherwise the card is re-listed by its UID.
+
 ## v 0.6.1 - 2026-10-05
 
 - **MIFARE Classic emulation on ISO14443-4 cards (SAK `0x28`/`0x38`) is usable as Classic** (`pn532-14443.c`, `pn532.c`). With the PN532's automatic RATS such a card is activated as ISO-DEP and refuses MIFARE commands. Like the NXP reference stack in its MIFARE mode, `pn532_14443_select_by_uid()` now re-lists a Classic-subtype card that has SAK bit `0x20` with automatic RATS switched off (SetParameters `0x04`); the next poll switches it back on (`0x14`). `pn532_init()` / `pn532_recover()` write SetParameters `0x14` once, since a chip without a reset pin keeps its parameters across an MCU restart. New state field `pn532_t.auto_rats_off`. To open the ISO-DEP side of such a card instead, set `subtype` to `PN532_MIFARE_DESFIRE` in your copy of the `pn532_uid_t` before selecting (README, "Cards with both MIFARE Classic and ISO-DEP").

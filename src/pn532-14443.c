@@ -228,6 +228,43 @@ static bool pn532_find_listed_target_by_uid( //
     return false;
 }
 
+/* The PN532 numbers targets from 1 again on every InListPassiveTarget, so a
+ * Tg kept in an older pn532_uid_t may by now belong to another card. Keep the
+ * UID behind each Tg of the latest listing to tell the two apart. */
+static void pn532_remember_listed_targets(pn532_t *pn532, const uint8_t *response, size_t response_len)
+{
+    if (response_len == 0) {
+        return;
+    }
+
+    size_t  offset        = 1;
+    uint8_t targets_found = response[0];
+    if (targets_found > PN532_MAX_PASSIVE_TARGETS_ISO14443A) {
+        targets_found = PN532_MAX_PASSIVE_TARGETS_ISO14443A;
+    }
+
+    for (uint8_t index = 0; index < targets_found; index++) {
+        pn532_uid_t parsed_uid;
+
+        if (!pn532_parse_iso14443a_target(response, response_len, !pn532->auto_rats_off, &offset, &parsed_uid)) {
+            return;
+        }
+        if (parsed_uid.tg >= 1 && parsed_uid.tg <= PN532_MAX_PASSIVE_TARGETS_ISO14443A) {
+            memcpy(pn532->listed_uid[parsed_uid.tg - 1], parsed_uid.uid, (size_t)parsed_uid.uid_length);
+            pn532->listed_uid_len[parsed_uid.tg - 1] = (uint8_t)parsed_uid.uid_length;
+        }
+    }
+}
+
+static bool pn532_tg_holds_uid(const pn532_t *pn532, const pn532_uid_t *uid)
+{
+    if (uid->tg < 1 || uid->tg > PN532_MAX_PASSIVE_TARGETS_ISO14443A) {
+        return false;
+    }
+    return pn532->listed_uid_len[uid->tg - 1] == (uint8_t)uid->uid_length &&
+           memcmp(pn532->listed_uid[uid->tg - 1], uid->uid, (size_t)uid->uid_length) == 0;
+}
+
 static bool pn532_list_passive_iso14443a_targets( //
     pn532_t       *pn532,                         //
     uint8_t        max_targets,                   //
@@ -282,8 +319,13 @@ static bool pn532_list_passive_iso14443a_targets( //
         params_len += cascaded_len;
     }
 
-    return pn532_execute_command(pn532, PN532_COMMAND_INLISTPASSIVETARGET, params, params_len, response, response_len,
-                                 timeout);
+    memset(pn532->listed_uid_len, 0, sizeof(pn532->listed_uid_len));
+    if (!pn532_execute_command(pn532, PN532_COMMAND_INLISTPASSIVETARGET, params, params_len, response, response_len,
+                               timeout)) {
+        return false;
+    }
+    pn532_remember_listed_targets(pn532, response, *response_len);
+    return true;
 }
 
 static pn532_poll_status_t pn532_poll_command_error(const pn532_t *pn532)
@@ -425,9 +467,11 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
 
     /* A stale Tg (card dropped to IDLE after a failed exchange) takes the
      * full path: only a new InListPassiveTarget reliably re-activates it. So
-     * does a card that was listed in the other RATS mode than it needs. */
+     * does a card that was listed in the other RATS mode than it needs, and a
+     * Tg that a later poll gave to another card. */
     bool plain_mifare = pn532_uid_is_classic_emulation(uid);
-    if (uid->tg != 0 && pn532->is_rf_on && !pn532->tg_stale && pn532->auto_rats_off == plain_mifare) {
+    if (pn532_tg_holds_uid(pn532, uid) && pn532->is_rf_on && !pn532->tg_stale &&
+        pn532->auto_rats_off == plain_mifare) {
         return pn532_in_select(pn532, uid->tg);
     }
 

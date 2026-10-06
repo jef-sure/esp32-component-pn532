@@ -160,6 +160,36 @@ static bool pn532_spi_bus_is_ready(pn532_bus_t *bus)
     return status == PN532_SPI_READY;
 }
 
+/*
+ * PN532/C1 §8.5.6 wake-up: NSS high → low edge with T1 (max 2 ms) settle
+ * before any SPI traffic. Do NOT send a host→PN532 ACK here — that would
+ * abort the very next command (e.g. GetFirmwareVersion in init).
+ * NSS must return high: on a shared bus a low NSS keeps this reader selected
+ * while another one is being addressed.
+ */
+static void pn532_spi_wake_pulse(pn532_spi_bus_t *spi_bus)
+{
+    /* The pulse drives NSS outside a transaction. Hold the bus meanwhile, or
+     * a reader polled from another task ends up selected together with this
+     * one. */
+    esp_err_t err = spi_device_acquire_bus(spi_bus->spi_handle, portMAX_DELAY);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NSS %d: wake-up without bus lock (%s)", (int)spi_bus->nss, esp_err_to_name(err));
+    }
+
+    /* pn532_delay_ms() waits on wall-clock time: pdMS_TO_TICKS(2) is zero
+     * ticks at CONFIG_FREERTOS_HZ=100. */
+    gpio_set_level(spi_bus->nss, 1);
+    pn532_delay_ms(2);
+    gpio_set_level(spi_bus->nss, 0);
+    pn532_delay_ms(2);
+    gpio_set_level(spi_bus->nss, 1);
+
+    if (err == ESP_OK) {
+        spi_device_release_bus(spi_bus->spi_handle);
+    }
+}
+
 static void pn532_spi_bus_wake(pn532_bus_t *bus)
 {
     pn532_spi_bus_t *spi_bus = pn532_spi_bus(bus);
@@ -167,16 +197,7 @@ static void pn532_spi_bus_wake(pn532_bus_t *bus)
     if (spi_bus == NULL) {
         return;
     }
-    /*
-     * PN532/C1 §8.5.6 wake-up: NSS high → low edge with T1 (max 2 ms) settle
-     * before any SPI traffic. Do NOT send a host→PN532 ACK here — that would
-     * abort the very next command (e.g. GetFirmwareVersion in init).
-     */
-    gpio_set_level(spi_bus->nss, 1);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(spi_bus->nss, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(spi_bus->nss, 1);
+    pn532_spi_wake_pulse(spi_bus);
 }
 
 static void pn532_spi_bus_destroy(pn532_bus_t *bus)
@@ -242,12 +263,7 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         return NULL;
     }
 
-    /*
-     * PN532 SPI wake-up: idle NSS high, then a low pulse triggers the SPI
-     * wake-up source (PN532/C1 §8.5.6); wait T1 = 2 ms max for the CPU clock.
-     * NSS must return high: on a shared bus a low NSS keeps this reader
-     * selected while another one is being initialised.
-     */
+    /* Idle NSS high before the device joins the bus. */
     gpio_config_t nss_cfg = {
         .pin_bit_mask = (1ULL << nss),
         .mode         = GPIO_MODE_OUTPUT,
@@ -260,10 +276,8 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         return NULL;
     }
     gpio_set_level(nss, 1);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(nss, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    gpio_set_level(nss, 1);
+    spi_bus->host_id = host_id;
+    spi_bus->nss     = nss;
 
     spi_device_interface_config_t dev_config = {
         .command_bits   = 8,
@@ -281,6 +295,7 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         ESP_LOGE(TAG, "pn532_spi_add_device: failed to add SPI device");
         return NULL;
     }
+    pn532_spi_wake_pulse(spi_bus);
 
     spi_bus->trans     = heap_caps_malloc(sizeof(*spi_bus->trans), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     spi_bus->tx_buffer = spi_bus_dma_memory_alloc(host_id, PN532_MAX_BUF_SIZE + 2, 0);
@@ -295,8 +310,6 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         return NULL;
     }
 
-    spi_bus->host_id = host_id;
-    spi_bus->nss     = nss;
     s_spi_hosts[host_id].devices++;
 
     spi_bus->base.write_command = pn532_spi_bus_write_command;

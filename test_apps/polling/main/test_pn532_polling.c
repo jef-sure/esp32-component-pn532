@@ -1582,6 +1582,41 @@ TEST_CASE("failed MIFARE authentication forces a full re-list on the next select
     TEST_ASSERT_TRUE(pn532.session_opened);
 }
 
+TEST_CASE("a Tg that now belongs to another card is not reused", "[pn532][polling][tg]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+
+    pn532_uids_array_t *uids = pn532_14443_get_all_uids(&pn532);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL_UINT8(1, uids->uids[0].tg);
+
+    /* A descriptor kept from an earlier poll: same Tg, another card. A bare
+     * InSelect would open the card in the field under the old card's name. */
+    pn532_uid_t removed = uids->uids[0];
+    removed.uid[0] ^= 0xFF;
+    mock.command_count = 0;
+    TEST_ASSERT_FALSE(pn532_14443_select_by_uid(&pn532, &removed));
+    TEST_ASSERT_TRUE(mock.command_count > 0);
+    for (size_t i = 0; i < mock.command_count; i++) {
+        TEST_ASSERT_NOT_EQUAL(PN532_COMMAND_INSELECT, mock.commands[i]);
+    }
+    TEST_ASSERT_EQUAL_UINT8(0, pn532.inListedTag);
+
+    /* The card that is in the field still takes the short path after a new poll. */
+    free(uids);
+    uids = pn532_14443_get_all_uids(&pn532);
+    TEST_ASSERT_NOT_NULL(uids);
+    mock.command_count = 0;
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &uids->uids[0]));
+    const uint8_t expected[] = {PN532_COMMAND_INSELECT};
+    assert_commands(&mock, expected, ARRAY_SIZE(expected));
+    free(uids);
+}
+
 TEST_CASE("NULL device pointers are rejected without crashing", "[pn532][args]")
 {
     TEST_ASSERT_EQUAL_UINT32(0, pn532_get_firmware_version(NULL));

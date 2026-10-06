@@ -71,7 +71,9 @@ typedef enum _pn532_nfc_subtype_t
  * responses. atqa holds the two SENS_RES bytes in the order the PN532 reports
  * them, first byte in the high half (MIFARE Classic 1K reads 0x0004). Tg is
  * valid while the current RF/list context remains active and lets
- * pn532_14443_select_by_uid() issue InSelect without polling again.
+ * pn532_14443_select_by_uid() issue InSelect without polling again; a Tg
+ * that a later poll handed to another card is ignored and the card is
+ * re-listed by its UID.
  * subtype, block_size, and blocks_count are filled by the card-type detection
  * helpers.
  */
@@ -140,6 +142,8 @@ typedef struct _pn532_t
     bool          isr_installed; /**< True when this device owns a GPIO ISR handler on irq. */
     bool          tg_stale;      /**< Listed Tg needs a fresh InListPassiveTarget (card dropped to IDLE). */
     bool          auto_rats_off; /**< Automatic RATS is switched off (MIFARE Classic emulation card in use). */
+    uint8_t       listed_uid[2][10]; /**< UIDs behind Tg 1 and 2 of the latest InListPassiveTarget. */
+    uint8_t       listed_uid_len[2]; /**< UID lengths for listed_uid; 0 when that Tg is not listed. */
 } pn532_t;
 
 /** @brief Sleep helper used by the driver and available to callers building retry loops. */
