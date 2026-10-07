@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.6.2"
+idf.py add-dependency "jef-sure/pn532^0.7.0"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -69,16 +69,16 @@ void app_main(void)
                 pn532_uid_t *card = &cards->uids[c];
                 ESP_LOG_BUFFER_HEX(TAG, card->uid, card->uid_length);
 
-                ndef_message_parsed_t *msg = NULL;
-                if (pn532_ndef_read_card_auto(nfc, card, &msg) == NDEF_OK) {
+                pn532_ndef_message_parsed_t *msg = NULL;
+                if (pn532_ndef_read_card_auto(nfc, card, &msg) == PN532_NDEF_OK) {
                     for (size_t i = 0; i < msg->record_count; i++) {
                         char uri[128];
-                        if (ndef_record_is_uri(&msg->records[i]) &&
-                            ndef_extract_uri(&msg->records[i], uri, sizeof(uri)) > 0) {
+                        if (pn532_ndef_record_is_uri(&msg->records[i]) &&
+                            pn532_ndef_extract_uri(&msg->records[i], uri, sizeof(uri)) > 0) {
                             ESP_LOGI(TAG, "URI: %s", uri);
                         }
                     }
-                    ndef_free_parsed_message(msg);
+                    pn532_ndef_free_parsed_message(msg);
                 }
                 pn532_release_target(nfc);
             }
@@ -146,34 +146,34 @@ Buses created by your application can be shared; see [Multiple Readers And Share
 ```c
 #include "pn532-ndef.h"
 
-ndef_message_parsed_t *msg = NULL;
-ndef_result_t res = pn532_ndef_read_card_auto(pn532, &uids->uids[0], &msg);
-if (res == NDEF_OK) {
+pn532_ndef_message_parsed_t *msg = NULL;
+pn532_ndef_result_t res = pn532_ndef_read_card_auto(pn532, &uids->uids[0], &msg);
+if (res == PN532_NDEF_OK) {
     for (size_t i = 0; i < msg->record_count; i++) {
-        const ndef_record_t *rec = &msg->records[i];
-        if (ndef_record_is_text(rec)) {
+        const pn532_ndef_record_t *rec = &msg->records[i];
+        if (pn532_ndef_record_is_text(rec)) {
             const uint8_t *text = NULL;
             size_t text_len = 0;
             char lang[8] = {0};
             bool utf16 = false;
-            if (ndef_extract_text(rec, &text, &text_len, lang, &utf16)) {
+            if (pn532_ndef_extract_text(rec, &text, &text_len, lang, &utf16)) {
                 /* text remains valid until msg is freed */
             }
         }
     }
-    ndef_free_parsed_message(msg);
+    pn532_ndef_free_parsed_message(msg);
 } else {
-    ESP_LOGW(TAG, "NDEF: %s", ndef_result_to_string(res));
+    ESP_LOGW(TAG, "NDEF: %s", pn532_ndef_result_to_string(res));
 }
 ```
 
 Behavior by card family:
 
-- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed.
-- MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `NDEF_ERR_NO_NDEF`. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
-- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in MLe-sized chunks (capped at 250 bytes).
+- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed. A tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after that one read; the scan never leaves the data area the container describes.
+- MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `PN532_NDEF_ERR_NO_NDEF`, and so does a directory whose CRC does not match its content. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
+- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in MLe-sized chunks (capped at 250 bytes). A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file `PN532_NDEF_ERR_PARSE_FAILED`.
 
-The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `ndef_parse_message()`; the returned record storage remains valid until `ndef_free_parsed_message()`.
+The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `pn532_ndef_parse_message()`; the returned record storage remains valid until `pn532_ndef_free_parsed_message()`.
 
 ### Write a URI to an NTAG
 
@@ -182,17 +182,17 @@ pn532_poll_status_t status;
 pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(pn532, &status);
 if (status == PN532_POLL_FOUND && pn532_14443_select_by_uid(pn532, &uids->uids[0])) {
     uint8_t         payload[64];
-    ndef_record_t   records[1];
-    ndef_message_t  message;
+    pn532_ndef_record_t   records[1];
+    pn532_ndef_message_t  message;
 
-    ndef_message_init(&message, records, 1);
+    pn532_ndef_message_init(&message, records, 1);
     /* abbreviate=true maps the https://www. prefix to URI identifier 0x02. */
-    if (ndef_make_uri_record(&records[0], "https://www.example.com", true,
+    if (pn532_ndef_make_uri_record(&records[0], "https://www.example.com", true,
                              payload, sizeof(payload))) {
-        ndef_message_add(&message, &records[0]);
+        pn532_ndef_message_add(&message, &records[0]);
         /* NTAG213: 4-byte pages, data starts at page 4, 36 writable pages left. */
-        ndef_result_t res = ndef_write_to_selected_card(pn532, &message, 4, 4, 36);
-        if (res == NDEF_OK) {
+        pn532_ndef_result_t res = pn532_ndef_write_to_selected_card(pn532, &message, 4, 4, 36);
+        if (res == PN532_NDEF_OK) {
             /* card now carries the URI record */
         }
     }
@@ -202,11 +202,11 @@ free(uids);
 pn532_set_rf_off(pn532);
 ```
 
-Text, MIME, and external records are built the same way with `ndef_make_text_record()`, `ndef_make_mime_record()`, and `ndef_make_external_record()`; several records can be added to one message.
+Text, MIME, and external records are built the same way with `pn532_ndef_make_text_record()`, `pn532_ndef_make_mime_record()`, and `pn532_ndef_make_external_record()`; several records can be added to one message.
 
-`ndef_write_to_selected_card()` writes a TLV-wrapped NDEF message to a Type 2 / NTAG style tag (`block_size = 4`) starting at the block you specify. The first block is staged with a hidden TLV length so a concurrent reader never sees a partially updated message; the real length is committed only after the trailing pages have been programmed. The helper is intentionally limited:
+`pn532_ndef_write_to_selected_card()` writes a TLV-wrapped NDEF message to a Type 2 / NTAG style tag (`block_size = 4`) starting at the block you specify. The first block is staged with a hidden TLV length so a concurrent reader never sees a partially updated message; the real length is committed only after the trailing pages have been programmed. The helper is intentionally limited:
 
-- MIFARE Classic block sizes (`block_size = 16`) return `NDEF_ERR_UNSUPPORTED`. Writing Classic NDEF correctly requires MAD updates and sector-trailer handling, which are out of scope for the helper.
+- MIFARE Classic block sizes (`block_size = 16`) return `PN532_NDEF_ERR_UNSUPPORTED`. Writing Classic NDEF correctly requires MAD updates and sector-trailer handling, which are out of scope for the helper.
 - It does not format blank tags, write the capability container, or update sector trailers.
 - The caller must already have the target selected and authenticated where applicable.
 
@@ -259,7 +259,7 @@ Notes:
 - Before reading a discovered card, select it with `pn532_14443_select_by_uid()`. After a selected-card operation, finish with `pn532_release_target()` followed by `pn532_set_rf_off()`.
 - `pn532_14443_select_by_uid()` is the right way to reacquire a card after an auth or read failure.
 - `pn532_14443_detect_card_type_and_capacity()` is a metadata helper that updates `uid->subtype`, `uid->blocks_count`, and `uid->block_size` in place.
-- `pn532_14443_detect_selected_card_type_and_capacity()` currently mirrors the same local detection and always sets `needs_reselect` to `false`.
+- `pn532_14443_detect_selected_card_type_and_capacity()` additionally asks a selected SAK `0x00` card what it is: GET_VERSION tells Ultralight EV1 and NTAG210/212/213/215/216 apart, and a card without GET_VERSION that answers AUTHENTICATE (`1A`) with a challenge is an Ultralight C. A refused probe resets the card, so when `needs_reselect` comes back `true`, call `pn532_14443_select_by_uid()` before the next exchange. An SAK that is not listed but has the ISO14443-4 bit (`0x20`) set, such as `0x60`, is reported as `PN532_MIFARE_DESFIRE` by both helpers.
 
 ### Read MIFARE Classic blocks
 
@@ -404,7 +404,7 @@ For SPI, initialise the host with `spi_bus_initialize()` and call `pn532_spi_att
 - **`no ACK for command ... within N ms`** — the transport is not responding at all: check wiring, NSS/address/baud rate, and power. Degrades to `PN532_POLL_TRANSPORT_ERROR` at the polling layer. Repeated occurrences → `pn532_recover()`.
 - **Alternating `PN532_POLL_FOUND` / `PN532_POLL_NO_TARGET` with a static card** — the card sits in HALT and does not power down before the next poll. Increase the RF settle delay (`pn532_set_rf_settle_delay()`); the 20 ms default fits a 250 ms two-reader cycle.
 - **Frequent `PN532_POLL_TIMEOUT` with a present card** — the response phase is too short for the card. Raise `pn532->timeout_ms` (default 500 ms). For Type 4 APDU exchanges the driver already applies a 1500 ms floor.
-- **`NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
+- **`PN532_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the card uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
 - **Two readers on one SPI bus interfere** — poll sequentially and finish each cycle with `pn532_set_rf_off()`; the settle delay is applied by the driver itself. Never poll both readers concurrently from different tasks.
 - **`pn532_in_select: status 0x27`** — the PN532 rejects the command in its current context, typically because the target number is no longer known (for example after an unexpected chip reset). Select fails so the caller re-polls. Deselect/release close the local session successfully on `0x27`; the log line `target already lost (0x27)` at debug level is informational.
 
@@ -516,13 +516,23 @@ With that subtype `pn532_ndef_read_card_auto()` also takes the Type 4 path. To s
 
 `pn532_14443_4_select_file()` and `pn532_14443_4_read_binary()` build their APDUs and delegate to `pn532_14443_4_transceive()`. In `pn532_14443_4_read_binary()`, encoded `Le = 0` requests the short-APDU maximum of 256 bytes.
 
+### Tests
+
+The tests in [`test_apps/polling`](test_apps/polling) drive the driver core through a mock bus, with simulated Type 2, MIFARE Classic, and Type 4 cards behind it. They build as an ESP-IDF Unity app for a board, and run on the host without hardware under AddressSanitizer:
+
+```sh
+make -C host_test test IDF_PATH=<path to esp-idf>
+```
+
+The host run takes the Unity sources from the ESP-IDF checkout and leaves out the bus transports (`src/pn532-bus-*.c`).
+
 ### Low-level MIFARE access
 
 Include `include/pn532-mifare.h` only when you need raw block or value operations. For an already selected ISO14443A target, `pn532_14443_block_read()` / `pn532_14443_block_write()` from `pn532.h` are the preferred entry points.
 
 - Prefer `pn532_14443_authenticate()` over `pn532_mifare_authenticate()` unless you already have the exact 4-byte UID fragment required by the on-card auth primitive.
 - `pn532_mifare_block_read()` reads one 16-byte MIFARE Classic block, or 16 bytes spanning four Type 2 pages.
-- Value-block helpers (`pn532_mifare_increment()`, `pn532_mifare_decrement()`, `pn532_mifare_restore()`, `pn532_mifare_transfer()`) stage the operation in the PN532 transfer buffer; `pn532_mifare_transfer()` commits it. `MIFARE_CMD_RESTORE` is preferred; `MIFARE_CMD_STORE` remains as a backward-compatible alias.
+- Value-block helpers (`pn532_mifare_increment()`, `pn532_mifare_decrement()`, `pn532_mifare_restore()`, `pn532_mifare_transfer()`) stage the operation in the PN532 transfer buffer; `pn532_mifare_transfer()` commits it. `PN532_MIFARE_CMD_RESTORE` is preferred; `PN532_MIFARE_CMD_STORE` remains as a backward-compatible alias.
 
 ### Advanced driver control
 
@@ -574,8 +584,8 @@ The target must be selected first (see `pn532_14443_select_by_uid()`). Responses
 - `pn532_deinit(pn532, false)` frees only the device; destroy the bus separately with `pn532_bus_destroy()`.
 - `pn532_14443_get_all_uids_ex()` writes a typed status and, on discovery, returns a heap-allocated `pn532_uids_array_t *`. Release it with `free()`.
 - `pn532_14443_get_all_uids()` preserves the legacy nullable return contract.
-- `pn532_ndef_read_card_auto()` returns a heap-allocated `ndef_message_parsed_t *`. Release it with `ndef_free_parsed_message()`.
-- `ndef_parse_message()` follows the same ownership contract and copies the encoded input into the parsed message.
+- `pn532_ndef_read_card_auto()` returns a heap-allocated `pn532_ndef_message_parsed_t *`. Release it with `pn532_ndef_free_parsed_message()`.
+- `pn532_ndef_parse_message()` follows the same ownership contract and copies the encoded input into the parsed message.
 
 `pn532_t` is a public struct because the driver is split across multiple source files, but application code should treat it as an owned handle and not modify its fields directly.
 
@@ -592,4 +602,4 @@ The target must be selected first (see `pn532_14443_select_by_uid()`). Responses
 - ISO-DEP and Type 4: `pn532_14443_4_transceive()`, `pn532_14443_4_select_file()`, `pn532_14443_4_read_binary()`
 - APDU utilities: `pn532_apdu_parse_command()`, `pn532_apdu_parse_response()`, `pn532_apdu_build_response()`, `pn532_apdu_get_status()`
 - MIFARE raw access: `pn532_mifare_block_read()`, `pn532_mifare_block_write()`, value operations
-- NDEF: `pn532_ndef_read_card_auto()`, `ndef_parse_message()`, `ndef_message_init()`, `ndef_message_add()`, `ndef_record_init()`, `ndef_make_text_record()`, `ndef_make_uri_record()`, `ndef_make_mime_record()`, `ndef_make_external_record()`, `ndef_encode_message()`, `ndef_write_to_selected_card()`, `ndef_extract_text()`, `ndef_extract_uri()`, `ndef_get_record_type()`, `ndef_decode_smartposter()`, `ndef_free_parsed_message()`, `ndef_result_to_string()`
+- NDEF: `pn532_ndef_read_card_auto()`, `pn532_ndef_parse_message()`, `pn532_ndef_message_init()`, `pn532_ndef_message_add()`, `pn532_ndef_record_init()`, `pn532_ndef_make_text_record()`, `pn532_ndef_make_uri_record()`, `pn532_ndef_make_mime_record()`, `pn532_ndef_make_external_record()`, `pn532_ndef_encode_message()`, `pn532_ndef_write_to_selected_card()`, `pn532_ndef_extract_text()`, `pn532_ndef_extract_uri()`, `pn532_ndef_get_record_type()`, `pn532_ndef_decode_smartposter()`, `pn532_ndef_free_parsed_message()`, `pn532_ndef_result_to_string()`

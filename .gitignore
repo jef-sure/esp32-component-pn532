@@ -61,6 +61,7 @@ build/*
 examples/simple/sdkconfig
 examples/simple/dependencies.lock
 test_apps/*/build/
+host_test/build/
 test_apps/*/sdkconfig
 test_apps/*/sdkconfig.old
 test_apps/*/dependencies.lock

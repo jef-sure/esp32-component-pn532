@@ -7,6 +7,7 @@
 #include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -100,9 +101,19 @@ static bool pn532_restore_runtime_config(pn532_t *pn532)
 
 void pn532_delay_ms(int ms)
 {
-    int64_t start = esp_timer_get_time();
-    while ((esp_timer_get_time() - start) < (ms * 1000)) {
+    if (ms <= 0) {
+        return;
+    }
+    /* Whole ticks are slept and the remainder is a busy wait, so a delay
+     * shorter than a tick is not stretched to the next tick boundaries. */
+    int64_t end     = esp_timer_get_time() + (int64_t)ms * 1000;
+    int64_t tick_us = (int64_t)portTICK_PERIOD_MS * 1000;
+    while (end - esp_timer_get_time() > tick_us) {
         vTaskDelay(1);
+    }
+    int64_t remaining = end - esp_timer_get_time();
+    if (remaining > 0) {
+        esp_rom_delay_us((uint32_t)remaining);
     }
 }
 

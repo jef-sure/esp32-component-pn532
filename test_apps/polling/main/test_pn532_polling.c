@@ -24,10 +24,19 @@ typedef enum
     MOCK_RELEASE_PROTOCOL_ERROR,
     MOCK_TWO_LONG_ATS,
     MOCK_TYPE4_SELECT_V1,
-    MOCK_AUTH_ERROR
+    MOCK_AUTH_ERROR,
+    MOCK_SIM_CARD
 } mock_mode_t;
 
-typedef struct
+typedef struct mock_bus_t mock_bus_t;
+
+/* Simulated card for MOCK_SIM_CARD: gets the request parameters of one
+ * InDataExchange (Tg first) or InCommunicateThru and writes the response
+ * payload, PN532 status byte first. */
+typedef size_t (*mock_sim_card_t)(mock_bus_t *mock, uint8_t command, const uint8_t *request, size_t request_len,
+                                  uint8_t *response);
+
+struct mock_bus_t
 {
     pn532_bus_t base;
     mock_mode_t mode;
@@ -54,7 +63,20 @@ typedef struct
     uint8_t     two_ats_sak[2];    /* MOCK_TWO_LONG_ATS SAK per target; 0 selects 0x20 */
     uint8_t     card_sak;          /* MOCK_CARD SAK override; 0 selects 0x08 */
     uint8_t     tama_params;       /* last SetParameters flags; 0: never written (chip default, RATS on) */
-} mock_bus_t;
+    mock_sim_card_t sim_card;          /* MOCK_SIM_CARD: the card behind the PN532 */
+    uint8_t         sim_request[32];
+    size_t          sim_request_len;
+    uint8_t        *sim_memory;    /* Type 2 pages or Classic blocks */
+    size_t          sim_units;     /* number of pages / blocks in sim_memory */
+    size_t          sim_reads;     /* READ commands the card answered */
+    const uint8_t  *sim_version;   /* Type 2: 8-byte GET_VERSION answer, NULL when not supported */
+    bool            sim_ulc;       /* Type 2: answers AUTHENTICATE (1Ah) like an Ultralight C */
+    const uint8_t  *sim_cc_file;   /* Type 4: capability container file (15 bytes) */
+    const uint8_t  *sim_ndef_file; /* Type 4: NDEF file, NLEN first */
+    size_t          sim_ndef_file_len;
+    const uint8_t  *sim_file; /* Type 4: selected file */
+    size_t          sim_file_len;
+};
 
 static const uint8_t ack_frame[]  = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
 static const uint8_t nack_frame[] = {0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00};
@@ -119,6 +141,8 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
             mock->exchange_params_len[mock->exchange_rounds] = params_len;
         }
         mock->exchange_rounds++;
+        mock->sim_request_len = params_len < sizeof(mock->sim_request) ? params_len : sizeof(mock->sim_request);
+        memcpy(mock->sim_request, params, mock->sim_request_len);
     }
 
     TEST_ASSERT_LESS_THAN(ARRAY_SIZE(mock->commands), mock->command_count);
@@ -278,6 +302,15 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         if (mock->pending_frames > 0) {
             mock->pending_frames--;
         }
+        return true;
+    }
+
+    if (mock->mode == MOCK_SIM_CARD && (mock->current_command == PN532_COMMAND_INDATAEXCHANGE ||
+                                        mock->current_command == PN532_COMMAND_INCOMMUNICATETHRU)) {
+        uint8_t sim_response[1 + 256];
+        size_t  sim_len =
+            mock->sim_card(mock, mock->current_command, mock->sim_request, mock->sim_request_len, sim_response);
+        mock_response_frame(mock->current_command, sim_response, sim_len, buffer, len);
         return true;
     }
 
@@ -1028,15 +1061,15 @@ TEST_CASE("NDEF CF chunks are assembled into one logical record", "[pn532][ndef]
         0x56, 0x00, 0x02, 'l', 'o',           /* ME | SR, TNF_UNCHANGED */
     };
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(encoded, sizeof(encoded), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_parse_message(encoded, sizeof(encoded), &message));
     TEST_ASSERT_NOT_NULL(message);
     TEST_ASSERT_EQUAL(1, message->record_count);
-    TEST_ASSERT_EQUAL(NDEF_TNF_WELL_KNOWN, message->records[0].tnf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_TNF_WELL_KNOWN, message->records[0].tnf);
     TEST_ASSERT_EQUAL_UINT8('T', message->records[0].type[0]);
     TEST_ASSERT_EQUAL(5, message->records[0].payload_len);
     TEST_ASSERT_EQUAL_UINT8_ARRAY("hello", message->records[0].payload, 5);
-    ndef_free_parsed_message(message);
+    pn532_ndef_free_parsed_message(message);
 }
 
 TEST_CASE("NDEF chunk sequence can precede another record", "[pn532][ndef][chunk]")
@@ -1048,13 +1081,13 @@ TEST_CASE("NDEF chunk sequence can precede another record", "[pn532][ndef][chunk
         0x51, 0x01, 0x02, 'U', 0x00, 'x'  /* ME | SR, normal record */
     };
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(encoded, sizeof(encoded), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_parse_message(encoded, sizeof(encoded), &message));
     TEST_ASSERT_EQUAL(2, message->record_count);
     TEST_ASSERT_EQUAL_UINT8_ARRAY("hello", message->records[0].payload, 5);
     TEST_ASSERT_EQUAL_UINT8('U', message->records[1].type[0]);
     TEST_ASSERT_EQUAL(2, message->records[1].payload_len);
-    ndef_free_parsed_message(message);
+    pn532_ndef_free_parsed_message(message);
 }
 
 TEST_CASE("NDEF orphan continuation chunk is rejected", "[pn532][ndef][chunk]")
@@ -1063,8 +1096,8 @@ TEST_CASE("NDEF orphan continuation chunk is rejected", "[pn532][ndef][chunk]")
         0xD6, 0x00, 0x01, 'x', /* MB | ME | SR, TNF_UNCHANGED without first chunk */
     };
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(encoded, sizeof(encoded), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED, pn532_ndef_parse_message(encoded, sizeof(encoded), &message));
     TEST_ASSERT_NULL(message);
 }
 
@@ -1200,6 +1233,7 @@ TEST_CASE("init falls back to transport resync when the device stays silent", "[
     TEST_ASSERT_NULL(pn532_init(&mock.base, GPIO_NUM_NC, GPIO_NUM_NC));
 }
 
+#ifndef PN532_HOST_TEST /* needs the UART transport, which the host build leaves out */
 TEST_CASE("HSU baud change is rejected on non-UART transports", "[pn532][uart][baud]")
 {
     mock_bus_t mock;
@@ -1211,6 +1245,7 @@ TEST_CASE("HSU baud change is rejected on non-UART transports", "[pn532][uart][b
     TEST_ASSERT_FALSE(pn532_uart_set_baud_rate(&pn532, 921600));
     TEST_ASSERT_EQUAL(0, mock.command_count);
 }
+#endif
 
 TEST_CASE("two targets with long ATS are polled, not reported as transport error", "[pn532][polling][ats]")
 {
@@ -1236,8 +1271,8 @@ TEST_CASE("reserved TNF is rejected by NDEF parsing", "[pn532][ndef][tnf]")
         0xD7, 0x01, 0x01, 'U', 0x00, 'x', /* MB | ME | SR with TNF 0x07 (reserved) */
     };
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(encoded, sizeof(encoded), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED, pn532_ndef_parse_message(encoded, sizeof(encoded), &message));
     TEST_ASSERT_NULL(message);
 }
 
@@ -1256,15 +1291,16 @@ TEST_CASE("empty TNF record with payload or type is rejected", "[pn532][ndef][tn
         0xD0, 0x00, 0x00, /* MB | ME | SR, TNF_EMPTY, fully empty */
     };
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(bad_type, sizeof(bad_type), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED, pn532_ndef_parse_message(bad_type, sizeof(bad_type), &message));
     TEST_ASSERT_NULL(message);
-    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(bad_payload, sizeof(bad_payload), &message));
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED,
+                      pn532_ndef_parse_message(bad_payload, sizeof(bad_payload), &message));
     TEST_ASSERT_NULL(message);
-    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(ok, sizeof(ok), &message));
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_parse_message(ok, sizeof(ok), &message));
     TEST_ASSERT_EQUAL(1, message->record_count);
-    TEST_ASSERT_EQUAL(NDEF_TNF_EMPTY, message->records[0].tnf);
-    ndef_free_parsed_message(message);
+    TEST_ASSERT_EQUAL(PN532_NDEF_TNF_EMPTY, message->records[0].tnf);
+    pn532_ndef_free_parsed_message(message);
 }
 
 TEST_CASE("URI identifier 0x07 decodes and encodes the anonymous FTP prefix", "[pn532][ndef][uri]")
@@ -1275,21 +1311,21 @@ TEST_CASE("URI identifier 0x07 decodes and encodes the anonymous FTP prefix", "[
         0xD1, 0x01, 0x0C, 'U', 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm',
     };
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(encoded, sizeof(encoded), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_parse_message(encoded, sizeof(encoded), &message));
     TEST_ASSERT_NOT_NULL(message);
-    TEST_ASSERT_TRUE(ndef_record_is_uri(&message->records[0]));
+    TEST_ASSERT_TRUE(pn532_ndef_record_is_uri(&message->records[0]));
 
     char uri[64];
-    TEST_ASSERT_EQUAL(37, ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
+    TEST_ASSERT_EQUAL(37, pn532_ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
     TEST_ASSERT_EQUAL_STRING("ftp://anonymous:anonymous@example.com", uri);
-    ndef_free_parsed_message(message);
+    pn532_ndef_free_parsed_message(message);
 
     /* Encoding: the full prefix must compress back to identifier 0x07. */
-    ndef_record_t rec;
+    pn532_ndef_record_t rec;
     uint8_t       payload_buf[16];
-    TEST_ASSERT_TRUE(ndef_make_uri_record(&rec, "ftp://anonymous:anonymous@example.com", true, payload_buf,
-                                          sizeof(payload_buf)));
+    TEST_ASSERT_TRUE(pn532_ndef_make_uri_record(&rec, "ftp://anonymous:anonymous@example.com", true, payload_buf,
+                                                sizeof(payload_buf)));
     /* Encoded payload = 0x07 identifier + "example.com" (11 chars). */
     TEST_ASSERT_EQUAL(12, rec.payload_len);
     TEST_ASSERT_EQUAL_UINT8(0x07, rec.payload[0]);
@@ -1453,12 +1489,12 @@ TEST_CASE("unknown TNF record with a type is rejected", "[pn532][ndef][tnf]")
     static const uint8_t with_type[] = {0xD5, 0x01, 0x01, 'x', 0xAA};
     static const uint8_t no_type[]   = {0xD5, 0x00, 0x01, 0xAA};
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(with_type, sizeof(with_type), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED, pn532_ndef_parse_message(with_type, sizeof(with_type), &message));
     TEST_ASSERT_NULL(message);
-    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(no_type, sizeof(no_type), &message));
-    TEST_ASSERT_EQUAL(NDEF_TNF_UNKNOWN, message->records[0].tnf);
-    ndef_free_parsed_message(message);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_parse_message(no_type, sizeof(no_type), &message));
+    TEST_ASSERT_EQUAL(PN532_NDEF_TNF_UNKNOWN, message->records[0].tnf);
+    pn532_ndef_free_parsed_message(message);
 }
 
 TEST_CASE("NDEF record length that wraps the offset is rejected", "[pn532][ndef][bounds]")
@@ -1468,20 +1504,20 @@ TEST_CASE("NDEF record length that wraps the offset is rejected", "[pn532][ndef]
      * a closing record. Must not yield a 4 GiB Text record. */
     static const uint8_t wrapping[] = {0x81, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x54, 0x00, 0x00};
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_ERR_PARSE_FAILED, ndef_parse_message(wrapping, sizeof(wrapping), &message));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED, pn532_ndef_parse_message(wrapping, sizeof(wrapping), &message));
     TEST_ASSERT_NULL(message);
 }
 
 static void assert_uri_round_trip(const char *uri, uint8_t expected_code)
 {
-    ndef_record_t rec;
+    pn532_ndef_record_t rec;
     uint8_t       payload_buf[64];
     char          decoded[64];
 
-    TEST_ASSERT_TRUE(ndef_make_uri_record(&rec, uri, true, payload_buf, sizeof(payload_buf)));
+    TEST_ASSERT_TRUE(pn532_ndef_make_uri_record(&rec, uri, true, payload_buf, sizeof(payload_buf)));
     TEST_ASSERT_EQUAL_HEX8(expected_code, rec.payload[0]);
-    TEST_ASSERT_EQUAL(strlen(uri), ndef_extract_uri(&rec, decoded, sizeof(decoded)));
+    TEST_ASSERT_EQUAL(strlen(uri), pn532_ndef_extract_uri(&rec, decoded, sizeof(decoded)));
     TEST_ASSERT_EQUAL_STRING(uri, decoded);
 }
 
@@ -1492,17 +1528,17 @@ TEST_CASE("URI identifier codes follow the NFC Forum URI RTD table", "[pn532][nd
     static const uint8_t file[] = {0xD1, 0x01, 0x03, 'U', 0x1D, '/', 'a'};
     char                 uri[32];
 
-    ndef_message_parsed_t *message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(urn, sizeof(urn), &message));
-    TEST_ASSERT_EQUAL(10, ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
+    pn532_ndef_message_parsed_t *message = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_parse_message(urn, sizeof(urn), &message));
+    TEST_ASSERT_EQUAL(10, pn532_ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
     TEST_ASSERT_EQUAL_STRING("urn:isbn:1", uri);
-    ndef_free_parsed_message(message);
+    pn532_ndef_free_parsed_message(message);
 
     message = NULL;
-    TEST_ASSERT_EQUAL(NDEF_OK, ndef_parse_message(file, sizeof(file), &message));
-    TEST_ASSERT_EQUAL(9, ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_parse_message(file, sizeof(file), &message));
+    TEST_ASSERT_EQUAL(9, pn532_ndef_extract_uri(&message->records[0], uri, sizeof(uri)));
     TEST_ASSERT_EQUAL_STRING("file:///a", uri);
-    ndef_free_parsed_message(message);
+    pn532_ndef_free_parsed_message(message);
 
     /* Encoding picks the longest standard prefix and round-trips. */
     assert_uri_round_trip("ftp://ftp.example.com/a", 0x08);
@@ -1566,7 +1602,7 @@ TEST_CASE("failed MIFARE authentication forces a full re-list on the next select
     pn532_uid_t uid = {.uid = {0xDE, 0xAD, 0xBE, 0xEF}, .uid_length = 4, .tg = 1, .subtype = PN532_MIFARE_CLASSIC_1K};
     static const uint8_t key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-    TEST_ASSERT_FALSE(pn532_14443_authenticate(&pn532, key, MIFARE_CMD_AUTH_A, &uid, 4));
+    TEST_ASSERT_FALSE(pn532_14443_authenticate(&pn532, key, PN532_MIFARE_CMD_AUTH_A, &uid, 4));
     TEST_ASSERT_TRUE(pn532.tg_stale);
     TEST_ASSERT_FALSE(pn532.session_opened);
     TEST_ASSERT_EQUAL_UINT8(1, pn532.inListedTag);
@@ -1639,6 +1675,485 @@ TEST_CASE("NULL device pointers are rejected without crashing", "[pn532][args]")
     TEST_ASSERT_FALSE(pn532_mifare_block_read(&pn532, -1, block, sizeof(block)));
     TEST_ASSERT_EQUAL(-1, pn532_mifare_block_write(&pn532, 300, block, 16));
     TEST_ASSERT_EQUAL(0, mock.command_count);
+}
+
+/* ---- Simulated cards (MOCK_SIM_CARD) ---- */
+
+/* UM0701-02: 0x01 = RF timeout (the card stays silent), 0x13 = framing error. */
+#define SIM_STATUS_TIMEOUT 0x01
+
+/* Type 2 tag: READ through InDataExchange, GET_VERSION / AUTHENTICATE through InCommunicateThru. */
+static size_t sim_type2_card(mock_bus_t *mock, uint8_t command, const uint8_t *request, size_t request_len,
+                             uint8_t *response)
+{
+    response[0] = SIM_STATUS_TIMEOUT;
+    if (command == PN532_COMMAND_INCOMMUNICATETHRU) {
+        if (request_len == 1 && request[0] == 0x60 && mock->sim_version != NULL) {
+            response[0] = 0x00;
+            memcpy(&response[1], mock->sim_version, 8);
+            return 9;
+        }
+        if (request_len == 2 && request[0] == 0x1A && mock->sim_ulc) {
+            response[0] = 0x00;
+            response[1] = 0xAF;
+            memset(&response[2], 0x5A, 8);
+            return 10;
+        }
+        return 1;
+    }
+    if (request_len == 3 && request[1] == PN532_MIFARE_CMD_READ && request[2] < mock->sim_units) {
+        /* Four pages, wrapping around to page 0 at the end of the memory. */
+        response[0] = 0x00;
+        for (size_t i = 0; i < 4; i++) {
+            size_t page = (request[2] + i) % mock->sim_units;
+            memcpy(&response[1 + i * 4], &mock->sim_memory[page * 4], 4);
+        }
+        mock->sim_reads++;
+        return 17;
+    }
+    return 1;
+}
+
+/* MIFARE Classic: every authentication succeeds, READ returns one block. */
+static size_t sim_classic_card(mock_bus_t *mock, uint8_t command, const uint8_t *request, size_t request_len,
+                               uint8_t *response)
+{
+    (void)command;
+    response[0] = SIM_STATUS_TIMEOUT;
+    if (request_len >= 3 && (request[1] == PN532_MIFARE_CMD_AUTH_A || request[1] == PN532_MIFARE_CMD_AUTH_B)) {
+        response[0] = 0x00;
+        return 1;
+    }
+    if (request_len == 3 && request[1] == PN532_MIFARE_CMD_READ && request[2] < mock->sim_units) {
+        response[0] = 0x00;
+        memcpy(&response[1], &mock->sim_memory[(size_t)request[2] * 16], 16);
+        mock->sim_reads++;
+        return 17;
+    }
+    return 1;
+}
+
+/* Type 4 tag: NDEF application with a capability container file and one NDEF file. */
+static size_t sim_type4_card(mock_bus_t *mock, uint8_t command, const uint8_t *request, size_t request_len,
+                             uint8_t *response)
+{
+    (void)command;
+    const uint8_t *apdu     = request + 1; /* skip Tg */
+    size_t         apdu_len = request_len - 1;
+    size_t         out      = 1;
+
+    response[0] = 0x00;
+    if (apdu_len >= 5 && apdu[1] == 0xA4) {
+        bool ok = false;
+        if (apdu[2] == 0x04) {
+            ok = true; /* by AID */
+        } else if (apdu_len >= 7 && apdu[5] == 0xE1 && apdu[6] == 0x03) {
+            mock->sim_file     = mock->sim_cc_file;
+            mock->sim_file_len = 15;
+            ok                 = true;
+        } else if (apdu_len >= 7 && apdu[5] == mock->sim_cc_file[9] && apdu[6] == mock->sim_cc_file[10]) {
+            mock->sim_file     = mock->sim_ndef_file;
+            mock->sim_file_len = mock->sim_ndef_file_len;
+            ok                 = true;
+        }
+        response[out++] = ok ? 0x90 : 0x6A;
+        response[out++] = ok ? 0x00 : 0x82;
+        return out;
+    }
+    if (apdu_len == 5 && apdu[1] == 0xB0 && mock->sim_file != NULL) {
+        size_t offset = ((size_t)apdu[2] << 8) | apdu[3];
+        size_t le     = apdu[4];
+        if (offset + le <= mock->sim_file_len) {
+            memcpy(&response[out], mock->sim_file + offset, le);
+            out += le;
+            mock->sim_reads++;
+            response[out++] = 0x90;
+            response[out++] = 0x00;
+            return out;
+        }
+    }
+    response[out++] = 0x6A;
+    response[out++] = 0x86;
+    return out;
+}
+
+/* Starts a test on a simulated card that is already listed and selected as Tg 1. */
+static void sim_init(mock_bus_t *mock, pn532_t *pn532, mock_sim_card_t card, uint8_t *send_buf, uint8_t *recv_buf)
+{
+    mock_init(mock, pn532, MOCK_SIM_CARD, send_buf, recv_buf);
+    mock->sim_card        = card;
+    pn532->inListedTag    = 1;
+    pn532->session_opened = true;
+    pn532->is_rf_on       = true;
+}
+
+/* NDEF message with one Text record "a". */
+static const uint8_t sim_ndef_text[] = {0xD1, 0x01, 0x04, 'T', 0x02, 'e', 'n', 'a'};
+
+TEST_CASE("an unlisted SAK with the ISO14443-4 bit is an ISO-DEP card", "[pn532][polling][sak]")
+{
+    uint16_t blocks     = UINT16_MAX;
+    uint16_t block_size = UINT16_MAX;
+
+    pn532_uid_t iso_dep = {.sak = 0x60};
+    TEST_ASSERT_TRUE(pn532_14443_detect_card_type_and_capacity(&iso_dep, &blocks, &block_size));
+    TEST_ASSERT_EQUAL(PN532_MIFARE_DESFIRE, iso_dep.subtype);
+    TEST_ASSERT_EQUAL_UINT16(0, blocks);
+    TEST_ASSERT_EQUAL_UINT16(1, block_size);
+
+    pn532_uid_t unknown = {.sak = 0x40};
+    TEST_ASSERT_TRUE(pn532_14443_detect_card_type_and_capacity(&unknown, &blocks, &block_size));
+    TEST_ASSERT_EQUAL(PN532_MIFARE_UNKNOWN, unknown.subtype);
+    TEST_ASSERT_EQUAL_UINT16(0, blocks);
+    TEST_ASSERT_EQUAL_UINT16(0, block_size);
+}
+
+TEST_CASE("Type 2 tag without a capability container is not scanned", "[pn532][ndef][t2]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[16 * 4]               = {0};
+
+    /* An NDEF TLV in the data area, but no CC magic in page 3. */
+    memory[16] = 0x03;
+    memory[17] = sizeof(sim_ndef_text);
+    memcpy(&memory[18], sim_ndef_text, sizeof(sim_ndef_text));
+
+    for (int variant = 0; variant < 2; variant++) {
+        sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+        mock.sim_memory = memory;
+        mock.sim_units  = 16;
+        if (variant == 1) {
+            /* CC magic present, but an empty data area. */
+            memory[12] = 0xE1;
+            memory[13] = 0x10;
+            memory[14] = 0x00;
+        }
+
+        pn532_uid_t uid = {
+            .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+            .uid_length   = 4,
+            .tg           = 1,
+            .sak          = 0x00,
+            .subtype      = PN532_MIFARE_ULTRALIGHT,
+            .block_size   = 4,
+            .blocks_count = 16
+        };
+        pn532_ndef_message_parsed_t *msg = NULL;
+        TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+        TEST_ASSERT_NULL(msg);
+        TEST_ASSERT_EQUAL(1, mock.sim_reads);
+    }
+}
+
+TEST_CASE("Type 2 NDEF read stays inside the data area", "[pn532][ndef][t2]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[16 * 4]               = {0};
+
+    /* CC: 40 bytes of data area, pages 4..13. Pages 14 and 15 are outside it
+     * and hold bytes that look like an NDEF TLV; the last READ (page 12)
+     * returns them, and they must not be taken for a message. */
+    memory[12] = 0xE1;
+    memory[13] = 0x10;
+    memory[14] = 0x05;
+    memory[56] = 0x03;
+    memory[57] = sizeof(sim_ndef_text);
+    memcpy(&memory[58], sim_ndef_text, 6);
+
+    sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+    mock.sim_memory = memory;
+    mock.sim_units  = 16;
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x00,
+        .subtype      = PN532_MIFARE_ULTRALIGHT,
+        .block_size   = 4,
+        .blocks_count = 16
+    };
+    pn532_ndef_message_parsed_t *msg = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NULL(msg);
+    TEST_ASSERT_EQUAL_UINT16(14, uid.blocks_count);
+
+    /* The same TLV inside the data area is read. */
+    memset(&memory[56], 0, 8);
+    memory[16] = 0x03;
+    memory[17] = sizeof(sim_ndef_text);
+    memcpy(&memory[18], sim_ndef_text, sizeof(sim_ndef_text));
+    memory[18 + sizeof(sim_ndef_text)] = 0xFE;
+
+    sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+    mock.sim_memory = memory;
+    mock.sim_units  = 16;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_EQUAL(1, msg->record_count);
+    TEST_ASSERT_TRUE(pn532_ndef_record_is_text(&msg->records[0]));
+    pn532_ndef_free_parsed_message(msg);
+}
+
+TEST_CASE("Ultralight family members are told apart on the selected card", "[pn532][polling][ultralight]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint16_t   blocks                       = 0;
+    uint16_t   block_size                   = 0;
+    bool       needs_reselect               = true;
+
+    static const uint8_t ntag215[]  = {0x00, 0x04, 0x04, 0x02, 0x01, 0x00, 0x11, 0x03};
+    static const uint8_t ntag210[]  = {0x00, 0x04, 0x04, 0x01, 0x01, 0x00, 0x0B, 0x03};
+    static const uint8_t ul_ev1[]   = {0x00, 0x04, 0x03, 0x01, 0x01, 0x00, 0x0B, 0x03};
+    const pn532_uid_t    polled_uid = {
+           .uid = {0xDE, 0xAD, 0xBE, 0xEF},
+             .uid_length = 4, .tg = 1, .sak = 0x00
+    };
+
+    /* GET_VERSION answered: one raw exchange, the card stays selected. */
+    static const struct
+    {
+        const uint8_t   *version;
+        pn532_nfc_type_t subtype;
+        uint16_t         pages;
+    } versions[] = {
+        {ntag215, PN532_MIFARE_NTAG215,        135},
+        {ntag210, PN532_MIFARE_NTAG210,        20 },
+        {ul_ev1,  PN532_MIFARE_ULTRALIGHT_EV1, 20 },
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(versions); i++) {
+        sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+        mock.sim_version = versions[i].version;
+        pn532_uid_t uid  = polled_uid;
+        TEST_ASSERT_TRUE(
+            pn532_14443_detect_selected_card_type_and_capacity(&pn532, &uid, &blocks, &block_size, &needs_reselect));
+        TEST_ASSERT_EQUAL(versions[i].subtype, uid.subtype);
+        TEST_ASSERT_EQUAL_UINT16(versions[i].pages, blocks);
+        TEST_ASSERT_EQUAL_UINT16(4, block_size);
+        TEST_ASSERT_FALSE(needs_reselect);
+        const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU};
+        assert_commands(&mock, expected, ARRAY_SIZE(expected));
+        /* InCommunicateThru carries the raw command, without a target number. */
+        TEST_ASSERT_EQUAL(1, mock.exchange_params_len[0]);
+        TEST_ASSERT_EQUAL_HEX8(0x60, mock.exchange_params[0][0]);
+    }
+
+    /* No GET_VERSION: the card is listed again and asked for an Ultralight C challenge. */
+    for (int ulc = 0; ulc < 2; ulc++) {
+        sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+        mock.sim_ulc    = (ulc == 1);
+        pn532_uid_t uid = polled_uid;
+        TEST_ASSERT_TRUE(
+            pn532_14443_detect_selected_card_type_and_capacity(&pn532, &uid, &blocks, &block_size, &needs_reselect));
+        TEST_ASSERT_EQUAL(ulc ? PN532_MIFARE_ULTRALIGHT_C : PN532_MIFARE_ULTRALIGHT, uid.subtype);
+        TEST_ASSERT_EQUAL_UINT16(ulc ? 44 : 16, blocks);
+        TEST_ASSERT_TRUE(needs_reselect);
+        TEST_ASSERT_TRUE(pn532.tg_stale);
+        const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU, PN532_COMMAND_RFCONFIGURATION,
+                                    PN532_COMMAND_INLISTPASSIVETARGET, PN532_COMMAND_INSELECT,
+                                    PN532_COMMAND_INCOMMUNICATETHRU};
+        assert_commands(&mock, expected, ARRAY_SIZE(expected));
+        TEST_ASSERT_EQUAL_HEX8(0x1A, mock.exchange_params[1][0]);
+    }
+
+    /* Without a selected card only the SAK is used. */
+    sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+    pn532.inListedTag = 0;
+    pn532_uid_t uid   = polled_uid;
+    TEST_ASSERT_TRUE(
+        pn532_14443_detect_selected_card_type_and_capacity(&pn532, &uid, &blocks, &block_size, &needs_reselect));
+    TEST_ASSERT_EQUAL(PN532_MIFARE_ULTRALIGHT, uid.subtype);
+    TEST_ASSERT_FALSE(needs_reselect);
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+}
+
+TEST_CASE("capability container size does not replace a subtype the card reported", "[pn532][ndef][t2]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[48 * 4]               = {0};
+
+    /* Ultralight C: its CC announces 144 bytes, the same as an NTAG213. */
+    memory[12] = 0xE1;
+    memory[13] = 0x10;
+    memory[14] = 0x12;
+    memory[16] = 0x03;
+    memory[17] = sizeof(sim_ndef_text);
+    memcpy(&memory[18], sim_ndef_text, sizeof(sim_ndef_text));
+
+    sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+    mock.sim_memory = memory;
+    mock.sim_units  = 48;
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x00,
+        .subtype      = PN532_MIFARE_ULTRALIGHT_C,
+        .block_size   = 4,
+        .blocks_count = 44
+    };
+    pn532_ndef_message_parsed_t *msg = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
+    TEST_ASSERT_EQUAL(PN532_MIFARE_ULTRALIGHT_C, uid.subtype);
+
+    uid.subtype = PN532_MIFARE_ULTRALIGHT;
+    msg         = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
+    TEST_ASSERT_EQUAL(PN532_MIFARE_NTAG213, uid.subtype);
+}
+
+/* CRC-8 of a MIFARE Application Directory, as the NXP MAD documentation defines it. */
+static uint8_t test_mad_crc(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0xC7;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            bool carry = (crc & 0x80) != 0;
+            crc        = (uint8_t)(crc << 1);
+            if (carry) {
+                crc ^= 0x1D;
+            }
+        }
+    }
+    return crc;
+}
+
+TEST_CASE("MIFARE Classic NDEF is read through a MAD with a valid CRC only", "[pn532][ndef][classic][mad]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[64 * 16]              = {0};
+
+    /* The example of the NXP MAD documentation gives CRC 89h. */
+    static const uint8_t doc_example[31] = {0x01, 0x01, 0x08, 0x01, 0x08, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00,
+                                            0x00, 0x00, 0x04, 0x00, 0x03, 0x10, 0x03, 0x10, 0x02, 0x10, 0x02,
+                                            0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x30};
+    TEST_ASSERT_EQUAL_HEX8(0x89, test_mad_crc(doc_example, sizeof(doc_example)));
+
+    /* MAD1 in blocks 1 and 2: CRC, info byte, then the NDEF application (03E1h) in sector 1. */
+    uint8_t *mad       = &memory[16];
+    mad[1]             = 0x01;
+    mad[2]             = 0x03;
+    mad[3]             = 0xE1;
+    mad[0]             = test_mad_crc(&mad[1], 31);
+    memory[3 * 16 + 9] = 0xC1; /* general purpose byte: MAD present, version 1 */
+    memory[4 * 16]     = 0x03;
+    memory[4 * 16 + 1] = sizeof(sim_ndef_text);
+    memcpy(&memory[4 * 16 + 2], sim_ndef_text, sizeof(sim_ndef_text));
+    memory[4 * 16 + 2 + sizeof(sim_ndef_text)] = 0xFE;
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x08,
+        .subtype      = PN532_MIFARE_CLASSIC_1K,
+        .block_size   = 16,
+        .blocks_count = 64
+    };
+
+    sim_init(&mock, &pn532, sim_classic_card, send_buf, recv_buf);
+    mock.sim_memory                  = memory;
+    mock.sim_units                   = 64;
+    pn532_ndef_message_parsed_t *msg = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_EQUAL(1, msg->record_count);
+    pn532_ndef_free_parsed_message(msg);
+
+    /* A directory whose CRC does not match its content is treated as absent:
+     * only the trailer and the two MAD blocks are read. */
+    mad[0] ^= 0x01;
+    sim_init(&mock, &pn532, sim_classic_card, send_buf, recv_buf);
+    mock.sim_memory = memory;
+    mock.sim_units  = 64;
+    msg             = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NULL(msg);
+    TEST_ASSERT_EQUAL(3, mock.sim_reads);
+}
+
+TEST_CASE("Type 4 NDEF read checks mapping version, read access and NLEN", "[pn532][ndef][t4]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+
+    /* CCLEN, mapping 2.0, MLe 59, MLc 52, NDEF File Control TLV: file E104h, 32 bytes, free access. */
+    static const uint8_t good_cc[15]   = {0x00, 0x0F, 0x20, 0x00, 0x3B, 0x00, 0x34, 0x04,
+                                          0x06, 0xE1, 0x04, 0x00, 0x20, 0x00, 0x00};
+    uint8_t              ndef_file[32] = {0x00, sizeof(sim_ndef_text)};
+    memcpy(&ndef_file[2], sim_ndef_text, sizeof(sim_ndef_text));
+
+    pn532_uid_t uid = {
+        .uid        = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length = 4,
+        .tg         = 1,
+        .sak        = 0x20,
+        .subtype    = PN532_MIFARE_DESFIRE,
+        .block_size = 1
+    };
+
+    static const struct
+    {
+        size_t              cc_offset; /* CC byte to change; 0 leaves the CC as it is */
+        uint8_t             cc_value;
+        uint8_t             nlen;
+        pn532_ndef_result_t expected;
+        size_t              reads; /* READ BINARY commands: CC, NLEN, data */
+    } cases[] = {
+        {0,  0,    sizeof(sim_ndef_text), PN532_NDEF_OK,                3},
+        {2,  0x40, sizeof(sim_ndef_text), PN532_NDEF_ERR_UNSUPPORTED,   1},
+        {2,  0x00, sizeof(sim_ndef_text), PN532_NDEF_ERR_UNSUPPORTED,   1},
+        {2,  0x10, sizeof(sim_ndef_text), PN532_NDEF_OK,                3},
+        {13, 0x80, sizeof(sim_ndef_text), PN532_NDEF_ERR_ACCESS_DENIED, 1},
+        {0,  0,    31,                    PN532_NDEF_ERR_PARSE_FAILED,  2},
+        {0,  0,    0,                     PN532_NDEF_ERR_NO_NDEF,       2},
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        uint8_t cc[15];
+        memcpy(cc, good_cc, sizeof(cc));
+        if (cases[i].cc_offset != 0) {
+            cc[cases[i].cc_offset] = cases[i].cc_value;
+        }
+        ndef_file[1] = cases[i].nlen;
+
+        sim_init(&mock, &pn532, sim_type4_card, send_buf, recv_buf);
+        mock.sim_cc_file       = cc;
+        mock.sim_ndef_file     = ndef_file;
+        mock.sim_ndef_file_len = sizeof(ndef_file);
+
+        pn532_ndef_message_parsed_t *msg = NULL;
+        TEST_ASSERT_EQUAL_MESSAGE(cases[i].expected, pn532_ndef_read_card_auto(&pn532, &uid, &msg), "result");
+        TEST_ASSERT_EQUAL_MESSAGE(cases[i].reads, mock.sim_reads, "READ BINARY count");
+        if (cases[i].expected == PN532_NDEF_OK) {
+            TEST_ASSERT_NOT_NULL(msg);
+            pn532_ndef_free_parsed_message(msg);
+        } else {
+            TEST_ASSERT_NULL(msg);
+        }
+    }
+    TEST_ASSERT_EQUAL_STRING("NDEF data is read protected", pn532_ndef_result_to_string(PN532_NDEF_ERR_ACCESS_DENIED));
 }
 
 void app_main(void)

@@ -44,7 +44,7 @@ static const uint8_t mifare_keys[][6] = {
     {0x53, 0x3C, 0xB6, 0xC7, 0x23, 0xF6},
     {0x8F, 0xD0, 0xA4, 0xF2, 0x56, 0xE9},
 };
-static const uint8_t mifare_key_types[] = {MIFARE_CMD_AUTH_A, MIFARE_CMD_AUTH_B};
+static const uint8_t mifare_key_types[] = {PN532_MIFARE_CMD_AUTH_A, PN532_MIFARE_CMD_AUTH_B};
 
 typedef enum
 {
@@ -208,7 +208,7 @@ static bool pn532_authenticate_sector(pn532_t *pn532, const pn532_uid_t *uid, in
                                                                       mifare_key_types[type_index]);
             if (result == AUTH_RESULT_OK) {
                 ESP_LOGI(TAG, "  sector %2d authenticated with key %zu (%s)", sector, key_index,
-                         (mifare_key_types[type_index] == MIFARE_CMD_AUTH_A) ? "KeyA" : "KeyB");
+                         (mifare_key_types[type_index] == PN532_MIFARE_CMD_AUTH_A) ? "KeyA" : "KeyB");
                 return true;
             }
             if (result == AUTH_RESULT_NO_CARD) {
@@ -371,6 +371,8 @@ static void pn532_dump_card(pn532_t *pn532, const pn532_uid_t *uid)
     case PN532_MIFARE_ULTRALIGHT:
     case PN532_MIFARE_ULTRALIGHT_C:
     case PN532_MIFARE_ULTRALIGHT_EV1:
+    case PN532_MIFARE_NTAG210:
+    case PN532_MIFARE_NTAG212:
     case PN532_MIFARE_NTAG213:
     case PN532_MIFARE_NTAG215:
     case PN532_MIFARE_NTAG216:
@@ -385,17 +387,17 @@ static void pn532_dump_card(pn532_t *pn532, const pn532_uid_t *uid)
     }
 }
 
-static void pn532_log_record(int index, const ndef_record_t *rec)
+static void pn532_log_record(int index, const pn532_ndef_record_t *rec)
 {
-    ndef_record_type_t type = ndef_get_record_type(rec);
+    pn532_ndef_record_type_t type = pn532_ndef_get_record_type(rec);
 
     switch (type) {
-    case NDEF_RECORD_TYPE_TEXT: {
+    case PN532_NDEF_RECORD_TYPE_TEXT: {
         const uint8_t *txt      = NULL;
         size_t         tx_len   = 0;
         char           lang[64] = {0};
         bool           utf16    = false;
-        if (ndef_extract_text(rec, &txt, &tx_len, lang, &utf16)) {
+        if (pn532_ndef_extract_text(rec, &txt, &tx_len, lang, &utf16)) {
             char   preview[128];
             size_t copy = (tx_len < sizeof(preview) - 1) ? tx_len : sizeof(preview) - 1;
             memcpy(preview, txt, copy);
@@ -406,27 +408,27 @@ static void pn532_log_record(int index, const ndef_record_t *rec)
         }
         break;
     }
-    case NDEF_RECORD_TYPE_URI: {
+    case PN532_NDEF_RECORD_TYPE_URI: {
         char uri[160];
-        if (ndef_extract_uri(rec, uri, sizeof(uri)) > 0) {
+        if (pn532_ndef_extract_uri(rec, uri, sizeof(uri)) > 0) {
             ESP_LOGI(TAG, "    rec %d URI: %s", index, uri);
         } else {
             ESP_LOGI(TAG, "    rec %d URI (parse failed)", index);
         }
         break;
     }
-    case NDEF_RECORD_TYPE_SMARTPOSTER:
+    case PN532_NDEF_RECORD_TYPE_SMARTPOSTER:
         ESP_LOGI(TAG, "    rec %d SmartPoster (%u bytes)", index, (unsigned)rec->payload_len);
         break;
-    case NDEF_RECORD_TYPE_MIME:
+    case PN532_NDEF_RECORD_TYPE_MIME:
         ESP_LOGI(TAG, "    rec %d MIME type_len=%u payload_len=%u", index, (unsigned)rec->type_len,
                  (unsigned)rec->payload_len);
         break;
-    case NDEF_RECORD_TYPE_EXTERNAL:
+    case PN532_NDEF_RECORD_TYPE_EXTERNAL:
         ESP_LOGI(TAG, "    rec %d External type_len=%u payload_len=%u", index, (unsigned)rec->type_len,
                  (unsigned)rec->payload_len);
         break;
-    case NDEF_RECORD_TYPE_EMPTY:
+    case PN532_NDEF_RECORD_TYPE_EMPTY:
         ESP_LOGI(TAG, "    rec %d Empty", index);
         break;
     default:
@@ -436,13 +438,13 @@ static void pn532_log_record(int index, const ndef_record_t *rec)
     }
 }
 
-static ndef_result_t pn532_read_ndef(pn532_t *pn532, pn532_uid_t *uid)
+static pn532_ndef_result_t pn532_read_ndef(pn532_t *pn532, pn532_uid_t *uid)
 {
-    ndef_message_parsed_t *msg = NULL;
-    ndef_result_t          res = pn532_ndef_read_card_auto(pn532, uid, &msg);
+    pn532_ndef_message_parsed_t *msg = NULL;
+    pn532_ndef_result_t          res = pn532_ndef_read_card_auto(pn532, uid, &msg);
 
-    if (res != NDEF_OK) {
-        ESP_LOGI(TAG, "  NDEF: %s", ndef_result_to_string(res));
+    if (res != PN532_NDEF_OK) {
+        ESP_LOGI(TAG, "  NDEF: %s", pn532_ndef_result_to_string(res));
         return res;
     }
 
@@ -450,8 +452,8 @@ static ndef_result_t pn532_read_ndef(pn532_t *pn532, pn532_uid_t *uid)
     for (size_t i = 0; i < msg->record_count; i++) {
         pn532_log_record((int)i, &msg->records[i]);
     }
-    ndef_free_parsed_message(msg);
-    return NDEF_OK;
+    pn532_ndef_free_parsed_message(msg);
+    return PN532_NDEF_OK;
 }
 
 static void pn532_process_card(pn532_t *pn532, const pn532_uid_t *uid, int index, bool needs_select)
@@ -484,12 +486,12 @@ static void pn532_process_card(pn532_t *pn532, const pn532_uid_t *uid, int index
     }
 
     ESP_LOGI(TAG, "--- Card %d NDEF ---", index + 1);
-    ndef_result_t ndef_res = pn532_read_ndef(pn532, &working_uid);
+    pn532_ndef_result_t ndef_res = pn532_read_ndef(pn532, &working_uid);
 
-    if (ndef_res != NDEF_OK && ndef_res != NDEF_ERR_READ_FAILED) {
+    if (ndef_res != PN532_NDEF_OK && ndef_res != PN532_NDEF_ERR_READ_FAILED) {
         ESP_LOGI(TAG, "--- Card %d block dump ---", index + 1);
         pn532_dump_card(pn532, &working_uid);
-    } else if (ndef_res == NDEF_ERR_READ_FAILED) {
+    } else if (ndef_res == PN532_NDEF_ERR_READ_FAILED) {
         ESP_LOGI(TAG, "Skipping block dump after read failure");
     }
 }

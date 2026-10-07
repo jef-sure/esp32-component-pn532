@@ -1,5 +1,34 @@
 # Changelog
 
+## v 0.7.0 - 2026-10-07
+
+This release brings over what the PN5180 component gained in its 0.2.0 to 0.4.3 releases.
+
+Breaking changes:
+
+- **Every public NDEF name carries the component prefix.** Functions and types `ndef_*` are now `pn532_ndef_*` (for example `pn532_ndef_parse_message()`, `pn532_ndef_record_t`, `pn532_ndef_write_to_selected_card()`); constants `NDEF_*` are now `PN532_NDEF_*` (for example `PN532_NDEF_OK`, `PN532_NDEF_TNF_WELL_KNOWN`, `PN532_NDEF_RTD_URI`). The MIFARE command macros of `pn532-mifare.h` are `PN532_MIFARE_CMD_*` and `PN532_MIFARE_ULTRALIGHT_CMD_WRITE`. There are no compatibility aliases: add the prefix in application code. `pn532_ndef_read_card_auto()` keeps its name.
+- `pn532_nfc_type_t` has two new values, `PN532_MIFARE_NTAG210` and `PN532_MIFARE_NTAG212`, placed before `PN532_MIFARE_NTAG213`, so the numeric values of the later subtypes changed.
+- `pn532_ndef_result_t` has a new value, `PN532_NDEF_ERR_ACCESS_DENIED`.
+
+Card identification:
+
+- **`pn532_14443_detect_selected_card_type_and_capacity()` probes the Ultralight family** (`pn532-14443.c`). It was a wrapper around the SAK table, and `PN532_MIFARE_ULTRALIGHT_C` / `PN532_MIFARE_ULTRALIGHT_EV1` were never reported. For a selected SAK `0x00` card it now sends GET_VERSION through InCommunicateThru (Ultralight EV1, NTAG210/212/213/215/216, with the page count); a card without GET_VERSION is listed again and asked for an AUTHENTICATE (`1A`) challenge, which only an Ultralight C gives. After a refused probe `needs_reselect` is `true` and the card has to be selected again. Not yet checked against real cards.
+- An SAK that is not in the table but has the ISO14443-4 bit (`0x20`) set, such as `0x60`, is reported as `PN532_MIFARE_DESFIRE` instead of `PN532_MIFARE_UNKNOWN`, so `pn532_ndef_read_card_auto()` takes the Type 4 path for it.
+- The capability container of a Type 2 tag no longer replaces a subtype the card itself reported: an Ultralight C (CC size `0x12`) was renamed to NTAG213 by the NDEF reader.
+
+NDEF reading (`pn532-ndef.c`):
+
+- Type 2: a tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after reading page 3. The memory was scanned anyway before (60 pages for a zero size).
+- Type 2: the last READ of the data area is cut at its end. The pages after it (lock and configuration pages, or page 0 after a wrap-around) were fed to the TLV search.
+- MIFARE Classic: the CRC of the MIFARE Application Directory (MAD1 and MAD2) is checked; a directory with a wrong CRC is treated as absent (`PN532_NDEF_ERR_NO_NDEF`).
+- Type 4: a read-protected NDEF file is `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x is `PN532_NDEF_ERR_UNSUPPORTED`, and an NDEF length that does not fit the file is `PN532_NDEF_ERR_PARSE_FAILED` (was `PN532_NDEF_ERR_NO_NDEF`).
+
+Other changes:
+
+- `pn532_delay_ms()` is precise below an RTOS tick: whole ticks are slept and the remainder is a busy wait. Every delay was rounded up to tick boundaries before, so a 2 ms wake-up pause took up to 12 ms at `CONFIG_FREERTOS_HZ=100`. Delays shorter than a tick no longer yield to other tasks.
+- **Host tests** in `host_test/`: the tests of `test_apps/polling` run on the host under AddressSanitizer, without hardware and without an ESP-IDF build: `make -C host_test test IDF_PATH=<esp-idf>`. The bus transports are not part of that build.
+- The mock of the tests can put a simulated card behind the PN532 (Type 2, MIFARE Classic, Type 4); new tests cover the changes of this release.
+
 ## v 0.6.2 - 2026-10-06
 
 - **SPI wake-up pulse is 2 ms at any tick rate** (`pn532-bus-spi.c`). `vTaskDelay(pdMS_TO_TICKS(2))` is zero ticks at `CONFIG_FREERTOS_HZ=100`, which left a microsecond NSS pulse without the T1 settle time of PN532/C1 §8.5.6. The pulse now waits on wall-clock time through `pn532_delay_ms()`.

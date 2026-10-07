@@ -56,6 +56,8 @@ typedef enum _pn532_nfc_subtype_t
     PN532_MIFARE_ULTRALIGHT,
     PN532_MIFARE_ULTRALIGHT_C,
     PN532_MIFARE_ULTRALIGHT_EV1,
+    PN532_MIFARE_NTAG210,
+    PN532_MIFARE_NTAG212,
     PN532_MIFARE_NTAG213,
     PN532_MIFARE_NTAG215,
     PN532_MIFARE_NTAG216,
@@ -146,7 +148,12 @@ typedef struct _pn532_t
     uint8_t       listed_uid_len[2]; /**< UID lengths for listed_uid; 0 when that Tg is not listed. */
 } pn532_t;
 
-/** @brief Sleep helper used by the driver and available to callers building retry loops. */
+/**
+ * @brief Sleep helper used by the driver and available to callers building retry loops.
+ *
+ * Whole RTOS ticks are slept; the remainder (less than one tick) is a busy
+ * wait, so short delays are precise at any tick rate.
+ */
 void pn532_delay_ms(int ms);
 
 /**
@@ -562,16 +569,27 @@ int pn532_14443_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, 
  * place and also returns the same values through the out parameters. For
  * DESFire, blocks_count is 0 because capacity cannot be inferred from SAK and
  * block_size is 1 to represent byte-addressed ISO-DEP application files. When
- * the SAK is not recognised, subtype and both geometry outputs are set to 0.
+ * the SAK is not recognised, subtype and both geometry outputs are set to 0;
+ * an unlisted SAK with the ISO14443-4 bit (0x20) set, such as 0x60, is
+ * reported like DESFire.
  */
 bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *blocks_count, uint16_t *block_size);
 
 /**
- * @brief Compatibility wrapper mirroring the pn5180 API shape.
+ * @brief Detect the subtype of the selected card, probing the Ultralight family.
  *
- * The current PN532 implementation performs the same local detection as
- * pn532_14443_detect_card_type_and_capacity() and always sets
- * *needs_reselect = false.
+ * Starts from the same ATQA/SAK detection as
+ * pn532_14443_detect_card_type_and_capacity(). For a SAK 0x00 card that is
+ * selected (pn532_14443_select_by_uid()) it then asks the card itself:
+ * GET_VERSION tells Ultralight EV1 and NTAG210/212/213/215/216 apart and
+ * gives the page count; a card without GET_VERSION that answers AUTHENTICATE
+ * (1Ah) with a challenge is an Ultralight C (44 readable pages), any other is
+ * an original Ultralight. Without a selected card only the SAK result is
+ * returned.
+ *
+ * A refused probe resets the card to IDLE. *needs_reselect is then true and
+ * the card has to be selected again with pn532_14443_select_by_uid() before
+ * the next exchange.
  */
 bool pn532_14443_detect_selected_card_type_and_capacity( //
     pn532_t     *pn532,                                  //

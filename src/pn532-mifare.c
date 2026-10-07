@@ -34,7 +34,7 @@ bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_
         return false;
     }
 
-    uint8_t cmd[]        = {MIFARE_CMD_READ, (uint8_t)blockno};
+    uint8_t cmd[]        = {PN532_MIFARE_CMD_READ, (uint8_t)blockno};
     size_t  response_len = buffer_len;
     if (!pn532_in_data_exchange(pn532, cmd, sizeof(cmd), buffer, &response_len, (uint16_t)pn532->timeout_ms)) {
         return false;
@@ -56,12 +56,12 @@ int pn532_mifare_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer,
     uint8_t cmd[18];
     size_t  cmd_len;
     if (buffer_len >= 16) {
-        cmd[0] = MIFARE_CMD_WRITE;
+        cmd[0] = PN532_MIFARE_CMD_WRITE;
         cmd[1] = (uint8_t)blockno;
         memcpy(cmd + 2, buffer, 16);
         cmd_len = 18;
     } else if (buffer_len >= 4) {
-        cmd[0] = MIFARE_ULTRALIGHT_CMD_WRITE;
+        cmd[0] = PN532_MIFARE_ULTRALIGHT_CMD_WRITE;
         cmd[1] = (uint8_t)blockno;
         memcpy(cmd + 2, buffer, 4);
         cmd_len = 6;
@@ -144,13 +144,13 @@ static bool pn532_mifare_value_op(pn532_t *pn532, uint8_t cmd, uint8_t blockno, 
 
     op[0] = cmd;
     op[1] = blockno;
-    if (cmd == MIFARE_CMD_INCREMENT || cmd == MIFARE_CMD_DECREMENT) {
+    if (cmd == PN532_MIFARE_CMD_INCREMENT || cmd == PN532_MIFARE_CMD_DECREMENT) {
         op[2]  = (uint8_t)(delta & 0xFF);
         op[3]  = (uint8_t)((delta >> 8) & 0xFF);
         op[4]  = (uint8_t)((delta >> 16) & 0xFF);
         op[5]  = (uint8_t)((delta >> 24) & 0xFF);
         op_len = 6;
-    } else if (cmd == MIFARE_CMD_RESTORE) {
+    } else if (cmd == PN532_MIFARE_CMD_RESTORE) {
         /* RESTORE requires a 4-byte dummy operand. */
         op[2]  = 0;
         op[3]  = 0;
@@ -167,22 +167,22 @@ static bool pn532_mifare_value_op(pn532_t *pn532, uint8_t cmd, uint8_t blockno, 
 
 bool pn532_mifare_increment(pn532_t *pn532, uint8_t blockno, uint32_t delta)
 {
-    return pn532_mifare_value_op(pn532, MIFARE_CMD_INCREMENT, blockno, delta);
+    return pn532_mifare_value_op(pn532, PN532_MIFARE_CMD_INCREMENT, blockno, delta);
 }
 
 bool pn532_mifare_decrement(pn532_t *pn532, uint8_t blockno, uint32_t delta)
 {
-    return pn532_mifare_value_op(pn532, MIFARE_CMD_DECREMENT, blockno, delta);
+    return pn532_mifare_value_op(pn532, PN532_MIFARE_CMD_DECREMENT, blockno, delta);
 }
 
 bool pn532_mifare_restore(pn532_t *pn532, uint8_t blockno)
 {
-    return pn532_mifare_value_op(pn532, MIFARE_CMD_RESTORE, blockno, 0);
+    return pn532_mifare_value_op(pn532, PN532_MIFARE_CMD_RESTORE, blockno, 0);
 }
 
 bool pn532_mifare_transfer(pn532_t *pn532, uint8_t blockno)
 {
-    uint8_t op[2]        = {MIFARE_CMD_TRANSFER, blockno};
+    uint8_t op[2]        = {PN532_MIFARE_CMD_TRANSFER, blockno};
     size_t  response_len = 0;
     return pn532_in_data_exchange(pn532, op, sizeof(op), NULL, &response_len, (uint16_t)pn532->timeout_ms);
 }

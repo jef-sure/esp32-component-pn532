@@ -13,25 +13,25 @@ extern "C" {
 #endif
 
 /** @brief MIFARE Classic authenticate with Key A. */
-#define MIFARE_CMD_AUTH_A           (0x60)
+#define PN532_MIFARE_CMD_AUTH_A           (0x60)
 /** @brief MIFARE Classic authenticate with Key B. */
-#define MIFARE_CMD_AUTH_B           (0x61)
+#define PN532_MIFARE_CMD_AUTH_B           (0x61)
 /** @brief MIFARE Classic / Ultralight READ command. */
-#define MIFARE_CMD_READ             (0x30)
+#define PN532_MIFARE_CMD_READ             (0x30)
 /** @brief MIFARE Classic 16-byte WRITE command. */
-#define MIFARE_CMD_WRITE            (0xA0)
+#define PN532_MIFARE_CMD_WRITE            (0xA0)
 /** @brief MIFARE Classic TRANSFER value command. */
-#define MIFARE_CMD_TRANSFER         (0xB0)
+#define PN532_MIFARE_CMD_TRANSFER         (0xB0)
 /** @brief MIFARE Classic DECREMENT value command. */
-#define MIFARE_CMD_DECREMENT        (0xC0)
+#define PN532_MIFARE_CMD_DECREMENT        (0xC0)
 /** @brief MIFARE Classic INCREMENT value command. */
-#define MIFARE_CMD_INCREMENT        (0xC1)
+#define PN532_MIFARE_CMD_INCREMENT        (0xC1)
 /** @brief MIFARE Classic RESTORE value command. */
-#define MIFARE_CMD_RESTORE          (0xC2)
+#define PN532_MIFARE_CMD_RESTORE          (0xC2)
 /** @brief Backward-compatible alias for the RESTORE value command. */
-#define MIFARE_CMD_STORE            MIFARE_CMD_RESTORE
+#define PN532_MIFARE_CMD_STORE            PN532_MIFARE_CMD_RESTORE
 /** @brief Ultralight 4-byte page WRITE command. */
-#define MIFARE_ULTRALIGHT_CMD_WRITE (0xA2)
+#define PN532_MIFARE_ULTRALIGHT_CMD_WRITE (0xA2)
 
 /**
  * @brief Send a raw MIFARE Classic authenticate command.

@@ -100,12 +100,86 @@ bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *block
         *block_size   = 16;
         break;
     default:
+        /* SAK bit 6: ISO14443-4 compliant, whatever the other bits say
+         * (0x60 with NFC-DEP, for example). */
+        if ((uid->sak & 0x20u) != 0u) {
+            uid->subtype = PN532_MIFARE_DESFIRE;
+            *block_size  = 1;
+        }
         break;
     }
 
     uid->blocks_count = *blocks_count;
     uid->block_size   = *block_size;
     return true;
+}
+
+/*
+ * Tells the Ultralight family members apart on the selected card. The probes
+ * go through InCommunicateThru: InDataExchange would take 0x60 for a MIFARE
+ * Classic authentication.
+ */
+static void pn532_14443_detect_ultralight_variant(pn532_t *pn532, pn532_uid_t *uid, bool *needs_reselect)
+{
+    static const uint8_t get_version[]      = {0x60};
+    static const uint8_t ulc_authenticate[] = {0x1A, 0x00};
+    uint8_t              response[16];
+    size_t               response_len = sizeof(response);
+
+    if (pn532_in_communicate_thru(pn532, get_version, sizeof(get_version), response, &response_len,
+                                  (uint16_t)pn532->timeout_ms) &&
+        response_len == 8) {
+        /* header, vendor, product type, subtype, major, minor, storage size, protocol */
+        bool is_ntag = (response[2] == 0x04);
+        switch (response[6]) {
+        case 0x0B: /* 48 bytes of user memory: Ultralight EV1 MF0UL11 or NTAG210 */
+            uid->subtype      = is_ntag ? PN532_MIFARE_NTAG210 : PN532_MIFARE_ULTRALIGHT_EV1;
+            uid->blocks_count = 20;
+            break;
+        case 0x0E: /* 128 bytes of user memory: Ultralight EV1 MF0UL21 or NTAG212 */
+            uid->subtype      = is_ntag ? PN532_MIFARE_NTAG212 : PN532_MIFARE_ULTRALIGHT_EV1;
+            uid->blocks_count = 41;
+            break;
+        case 0x0F:
+            uid->subtype      = PN532_MIFARE_NTAG213;
+            uid->blocks_count = 45;
+            break;
+        case 0x11:
+            uid->subtype      = PN532_MIFARE_NTAG215;
+            uid->blocks_count = 135;
+            break;
+        case 0x13:
+            uid->subtype      = PN532_MIFARE_NTAG216;
+            uid->blocks_count = 231;
+            break;
+        default:
+            ESP_LOGD(TAG_T4, "GET_VERSION: unknown storage size 0x%02X, keeping Ultralight", response[6]);
+            break;
+        }
+        return;
+    }
+
+    /* No GET_VERSION: an original Ultralight or an Ultralight C. They share
+     * ATQA and SAK; only the Ultralight C answers AUTHENTICATE (1Ah) with AFh
+     * and an 8-byte challenge. The refused GET_VERSION has reset the card to
+     * IDLE, so it is listed again first. */
+    *needs_reselect = true;
+    pn532->tg_stale = true;
+    if (!pn532_14443_select_by_uid(pn532, uid)) {
+        return;
+    }
+    response_len = sizeof(response);
+    if (pn532_in_communicate_thru(pn532, ulc_authenticate, sizeof(ulc_authenticate), response, &response_len,
+                                  (uint16_t)pn532->timeout_ms) &&
+        response_len == 9 && response[0] == 0xAF) {
+        uid->subtype = PN532_MIFARE_ULTRALIGHT_C;
+        /* 48 pages, of which READ addresses 00h..2Bh; the key pages cannot be read. */
+        uid->blocks_count = 44;
+    }
+    /* The authentication is abandoned (or was refused), so the card is not
+     * in the selected state either way. */
+    pn532->tg_stale       = true;
+    pn532->session_opened = false;
 }
 
 bool pn532_14443_detect_selected_card_type_and_capacity( //
@@ -116,14 +190,20 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
     bool        *needs_reselect                          //
 )
 {
-    (void)pn532;
-
     if (uid == NULL || blocks_count == NULL || block_size == NULL || needs_reselect == NULL) {
         return false;
     }
 
     *needs_reselect = false;
-    return pn532_14443_detect_card_type_and_capacity(uid, blocks_count, block_size);
+    if (!pn532_14443_detect_card_type_and_capacity(uid, blocks_count, block_size)) {
+        return false;
+    }
+    if (pn532 != NULL && uid->subtype == PN532_MIFARE_ULTRALIGHT && pn532->inListedTag != 0) {
+        pn532_14443_detect_ultralight_variant(pn532, uid, needs_reselect);
+        *blocks_count = uid->blocks_count;
+        *block_size   = uid->block_size;
+    }
+    return true;
 }
 
 bool pn532_14443_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_t buffer_len)
@@ -541,7 +621,8 @@ bool pn532_14443_authenticate(pn532_t *pn532, const uint8_t *key, uint8_t key_ty
     }
 
     if (uid->subtype == PN532_MIFARE_ULTRALIGHT || uid->subtype == PN532_MIFARE_ULTRALIGHT_C ||
-        uid->subtype == PN532_MIFARE_ULTRALIGHT_EV1 || uid->subtype == PN532_MIFARE_NTAG213 ||
+        uid->subtype == PN532_MIFARE_ULTRALIGHT_EV1 || uid->subtype == PN532_MIFARE_NTAG210 ||
+        uid->subtype == PN532_MIFARE_NTAG212 || uid->subtype == PN532_MIFARE_NTAG213 ||
         uid->subtype == PN532_MIFARE_NTAG215 || uid->subtype == PN532_MIFARE_NTAG216 ||
         uid->subtype == PN532_MIFARE_DESFIRE) {
         return true;

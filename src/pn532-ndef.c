@@ -21,14 +21,15 @@
 
 static const char *TAG = "PN532-NDEF";
 
-const uint8_t NDEF_RTD_TEXT[]        = {'T'};
-const uint8_t NDEF_RTD_URI[]         = {'U'};
-const uint8_t NDEF_RTD_SMARTPOSTER[] = {'S', 'p'};
+const uint8_t PN532_NDEF_RTD_TEXT[]        = {'T'};
+const uint8_t PN532_NDEF_RTD_URI[]         = {'U'};
+const uint8_t PN532_NDEF_RTD_SMARTPOSTER[] = {'S', 'p'};
 
-static void pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t *uid)
+/* Returns false when page 3 does not hold a capability container. */
+static bool pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t *uid)
 {
     if (data == NULL || uid == NULL || data[0] != 0xE1) {
-        return;
+        return false;
     }
     uid->block_size = 4;
     /* CC[2] is the size of the NDEF data area in units of 8 bytes
@@ -37,6 +38,11 @@ static void pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t
      * count — bounds how far NDEF reads may go. */
     uint16_t data_area_pages = (uint16_t)data[2] * 2u;
     uid->blocks_count        = (uint16_t)(4u + data_area_pages);
+    /* The size only hints at the chip: a subtype the card itself reported
+     * (pn532_14443_detect_selected_card_type_and_capacity()) is kept. */
+    if (uid->subtype != PN532_MIFARE_ULTRALIGHT) {
+        return true;
+    }
     switch (data[2]) {
     case 0x06:
         uid->subtype = PN532_MIFARE_ULTRALIGHT;
@@ -53,9 +59,12 @@ static void pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t
     default:
         break;
     }
+    return true;
 }
 
-static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid)
+/* *has_cc reports whether the tag carries a capability container; without
+ * one it is not NDEF formatted and uid is left as detected from the SAK. */
+static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid, bool *has_cc)
 {
     uint8_t cc_read[16];
 
@@ -84,7 +93,7 @@ static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid)
         }
     }
 
-    pn532_type2_refine_uid_from_cc_read(cc_read, uid);
+    *has_cc = pn532_type2_refine_uid_from_cc_read(cc_read, uid);
     return true;
 }
 
@@ -215,8 +224,8 @@ static const char *const uri_prefix_table[] = {
 #define NDEF_IL       (1u << 3)
 #define NDEF_TNF_MASK (0x07u)
 
-static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, ndef_record_t *out_rec, bool *is_begin,
-                             bool *is_end, bool *is_chunk)
+static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, pn532_ndef_record_t *out_rec,
+                             bool *is_begin, bool *is_end, bool *is_chunk)
 {
     if (in == NULL || offset == NULL || out_rec == NULL) {
         return false;
@@ -225,15 +234,15 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
         return false;
     }
 
-    size_t     pos = *offset;
-    uint8_t    hdr = in[pos++];
-    bool       mb  = (hdr & NDEF_MB) != 0;
-    bool       me  = (hdr & NDEF_ME) != 0;
-    bool       sr  = (hdr & NDEF_SR) != 0;
-    bool       il  = (hdr & NDEF_IL) != 0;
-    ndef_tnf_t tnf = (ndef_tnf_t)(hdr & NDEF_TNF_MASK);
+    size_t           pos = *offset;
+    uint8_t          hdr = in[pos++];
+    bool             mb  = (hdr & NDEF_MB) != 0;
+    bool             me  = (hdr & NDEF_ME) != 0;
+    bool             sr  = (hdr & NDEF_SR) != 0;
+    bool             il  = (hdr & NDEF_IL) != 0;
+    pn532_ndef_tnf_t tnf = (pn532_ndef_tnf_t)(hdr & NDEF_TNF_MASK);
 
-    if (tnf == NDEF_TNF_RESERVED) {
+    if (tnf == PN532_NDEF_TNF_RESERVED) {
         /* NFC RTD: TNF 0x07 is reserved and must not appear in a message. */
         return false;
     }
@@ -294,13 +303,13 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
         pos += payload_len;
     }
 
-    if (tnf == NDEF_TNF_UNKNOWN && type_len != 0) {
+    if (tnf == PN532_NDEF_TNF_UNKNOWN && type_len != 0) {
         /* NDEF 1.0 §3.2.6: an unknown-type record carries no type (Android
          * rejects it the same way). */
         return false;
     }
 
-    if (tnf == NDEF_TNF_EMPTY && (type_len != 0 || id_len != 0 || payload_len != 0)) {
+    if (tnf == PN532_NDEF_TNF_EMPTY && (type_len != 0 || id_len != 0 || payload_len != 0)) {
         /* NFC RTD: an empty record must carry no type, ID, or payload. */
         return false;
     }
@@ -326,7 +335,7 @@ static bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, n
     return true;
 }
 
-static size_t ndef_decode_message(const uint8_t *in, size_t in_len, ndef_record_t *records, size_t capacity)
+static size_t ndef_decode_message(const uint8_t *in, size_t in_len, pn532_ndef_record_t *records, size_t capacity)
 {
     if (in == NULL || records == NULL || capacity == 0) {
         return 0;
@@ -379,10 +388,10 @@ static bool ndef_plan_decode(const uint8_t *data, size_t data_len, ndef_decode_p
     bool     message_ended   = false;
 
     while (pos < data_len) {
-        ndef_record_t physical;
-        bool          mb = false;
-        bool          me = false;
-        bool          cf = false;
+        pn532_ndef_record_t physical;
+        bool                mb = false;
+        bool                me = false;
+        bool                cf = false;
         if (!ndef_decode_next(data, data_len, &pos, &physical, &mb, &me, &cf)) {
             return false;
         }
@@ -393,7 +402,8 @@ static bool ndef_plan_decode(const uint8_t *data, size_t data_len, ndef_decode_p
         physical_count++;
 
         if (in_chunk) {
-            if (physical.tnf != NDEF_TNF_UNCHANGED || physical.type_len != 0 || physical.id_len != 0 || (cf && me)) {
+            if (physical.tnf != PN532_NDEF_TNF_UNCHANGED || physical.type_len != 0 || physical.id_len != 0 ||
+                (cf && me)) {
                 return false;
             }
             if (physical.payload_len > UINT32_MAX - chunk_total_len ||
@@ -406,7 +416,7 @@ static bool ndef_plan_decode(const uint8_t *data, size_t data_len, ndef_decode_p
                 plan->logical_record_count++;
             }
         } else {
-            if (physical.tnf == NDEF_TNF_UNCHANGED) {
+            if (physical.tnf == PN532_NDEF_TNF_UNCHANGED) {
                 return false;
             }
             if (cf) {
@@ -435,17 +445,17 @@ static bool ndef_plan_decode(const uint8_t *data, size_t data_len, ndef_decode_p
     return message_ended && !in_chunk && plan->logical_record_count > 0;
 }
 
-static bool ndef_decode_logical_records(uint8_t *data, size_t data_len, ndef_record_t *records, size_t record_count,
-                                        uint8_t *chunk_payload)
+static bool ndef_decode_logical_records(uint8_t *data, size_t data_len, pn532_ndef_record_t *records,
+                                        size_t record_count, uint8_t *chunk_payload)
 {
-    size_t         pos          = 0;
-    size_t         logical      = 0;
-    size_t         payload_used = 0;
-    ndef_record_t *chunk_record = NULL;
+    size_t               pos          = 0;
+    size_t               logical      = 0;
+    size_t               payload_used = 0;
+    pn532_ndef_record_t *chunk_record = NULL;
 
     while (pos < data_len && logical < record_count) {
-        ndef_record_t physical;
-        bool          cf = false;
+        pn532_ndef_record_t physical;
+        bool                cf = false;
         if (!ndef_decode_next(data, data_len, &pos, &physical, NULL, NULL, &cf)) {
             return false;
         }
@@ -478,42 +488,43 @@ static bool ndef_decode_logical_records(uint8_t *data, size_t data_len, ndef_rec
     return logical == record_count && chunk_record == NULL;
 }
 
-ndef_result_t ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len, ndef_message_parsed_t **out_msg)
+pn532_ndef_result_t pn532_ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len,
+                                             pn532_ndef_message_parsed_t **out_msg)
 {
     if (raw_data == NULL || raw_data_len == 0 || out_msg == NULL) {
-        return NDEF_ERR_PARSE_FAILED;
+        return PN532_NDEF_ERR_PARSE_FAILED;
     }
 
     ndef_decode_plan_t plan;
     if (!ndef_plan_decode(raw_data, raw_data_len, &plan)) {
-        return NDEF_ERR_PARSE_FAILED;
+        return PN532_NDEF_ERR_PARSE_FAILED;
     }
 
-    if (plan.logical_record_count > SIZE_MAX / sizeof(ndef_record_t)) {
-        return NDEF_ERR_NO_MEMORY;
+    if (plan.logical_record_count > SIZE_MAX / sizeof(pn532_ndef_record_t)) {
+        return PN532_NDEF_ERR_NO_MEMORY;
     }
-    size_t records_size = sizeof(ndef_record_t) * plan.logical_record_count;
+    size_t records_size = sizeof(pn532_ndef_record_t) * plan.logical_record_count;
     size_t total_size;
-    if (!ndef_size_add(sizeof(ndef_message_parsed_t), records_size, &total_size) ||
+    if (!ndef_size_add(sizeof(pn532_ndef_message_parsed_t), records_size, &total_size) ||
         !ndef_size_add(total_size, raw_data_len, &total_size) ||
         !ndef_size_add(total_size, plan.chunk_payload_size, &total_size)) {
-        return NDEF_ERR_NO_MEMORY;
+        return PN532_NDEF_ERR_NO_MEMORY;
     }
 
     uint8_t *block_ptr = malloc(total_size);
     if (block_ptr == NULL) {
-        return NDEF_ERR_NO_MEMORY;
+        return PN532_NDEF_ERR_NO_MEMORY;
     }
 
-    ndef_message_parsed_t *result        = (ndef_message_parsed_t *)block_ptr;
-    ndef_record_t         *records       = (ndef_record_t *)(block_ptr + sizeof(ndef_message_parsed_t));
-    uint8_t               *ndef_data     = block_ptr + sizeof(ndef_message_parsed_t) + records_size;
-    uint8_t               *chunk_payload = ndef_data + raw_data_len;
+    pn532_ndef_message_parsed_t *result    = (pn532_ndef_message_parsed_t *)block_ptr;
+    pn532_ndef_record_t         *records   = (pn532_ndef_record_t *)(block_ptr + sizeof(pn532_ndef_message_parsed_t));
+    uint8_t                     *ndef_data = block_ptr + sizeof(pn532_ndef_message_parsed_t) + records_size;
+    uint8_t                     *chunk_payload = ndef_data + raw_data_len;
 
     memcpy(ndef_data, raw_data, raw_data_len);
     if (!ndef_decode_logical_records(ndef_data, raw_data_len, records, plan.logical_record_count, chunk_payload)) {
         free(block_ptr);
-        return NDEF_ERR_PARSE_FAILED;
+        return PN532_NDEF_ERR_PARSE_FAILED;
     }
 
     result->raw_data     = ndef_data;
@@ -521,10 +532,10 @@ ndef_result_t ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len, n
     result->records      = records;
     result->record_count = plan.logical_record_count;
     *out_msg             = result;
-    return NDEF_OK;
+    return PN532_NDEF_OK;
 }
 
-void ndef_message_init(ndef_message_t *msg, ndef_record_t *records, size_t capacity)
+void pn532_ndef_message_init(pn532_ndef_message_t *msg, pn532_ndef_record_t *records, size_t capacity)
 {
     if (msg == NULL) {
         return;
@@ -534,7 +545,7 @@ void ndef_message_init(ndef_message_t *msg, ndef_record_t *records, size_t capac
     msg->capacity     = capacity;
 }
 
-bool ndef_message_add(ndef_message_t *msg, const ndef_record_t *rec)
+bool pn532_ndef_message_add(pn532_ndef_message_t *msg, const pn532_ndef_record_t *rec)
 {
     if (msg == NULL || rec == NULL || msg->record_count >= msg->capacity) {
         return false;
@@ -543,8 +554,8 @@ bool ndef_message_add(ndef_message_t *msg, const ndef_record_t *rec)
     return true;
 }
 
-void ndef_record_init(ndef_record_t *rec, ndef_tnf_t tnf, const uint8_t *type, uint8_t type_len, const uint8_t *id,
-                      uint8_t id_len, const uint8_t *payload, uint32_t payload_len)
+void pn532_ndef_record_init(pn532_ndef_record_t *rec, pn532_ndef_tnf_t tnf, const uint8_t *type, uint8_t type_len,
+                            const uint8_t *id, uint8_t id_len, const uint8_t *payload, uint32_t payload_len)
 {
     if (rec == NULL) {
         return;
@@ -558,7 +569,7 @@ void ndef_record_init(ndef_record_t *rec, ndef_tnf_t tnf, const uint8_t *type, u
     rec->payload     = payload;
 }
 
-static bool ndef_record_has_consistent_storage(const ndef_record_t *rec)
+static bool ndef_record_has_consistent_storage(const pn532_ndef_record_t *rec)
 {
     if (rec == NULL) {
         return false;
@@ -568,7 +579,7 @@ static bool ndef_record_has_consistent_storage(const ndef_record_t *rec)
              (rec->payload_len > 0 && rec->payload == NULL));
 }
 
-static bool ndef_record_encoded_size(const ndef_record_t *rec, size_t *size_out)
+static bool ndef_record_encoded_size(const pn532_ndef_record_t *rec, size_t *size_out)
 {
     if (rec == NULL || size_out == NULL) {
         return false;
@@ -600,7 +611,7 @@ static bool ndef_record_encoded_size(const ndef_record_t *rec, size_t *size_out)
     return true;
 }
 
-static uint8_t ndef_build_header_byte(const ndef_record_t *rec, bool is_begin, bool is_end)
+static uint8_t ndef_build_header_byte(const pn532_ndef_record_t *rec, bool is_begin, bool is_end)
 {
     uint8_t hdr = 0;
 
@@ -620,7 +631,7 @@ static uint8_t ndef_build_header_byte(const ndef_record_t *rec, bool is_begin, b
     return hdr;
 }
 
-size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_len)
+size_t pn532_ndef_encode_message(const pn532_ndef_message_t *msg, uint8_t *out, size_t out_len)
 {
     if (msg == NULL || (out == NULL && out_len > 0)) {
         return 0;
@@ -643,10 +654,10 @@ size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_l
 
     uint8_t *cursor = out;
     for (size_t i = 0; i < msg->record_count; i++) {
-        const ndef_record_t *rec          = &msg->records[i];
-        bool                 is_begin     = (i == 0);
-        bool                 is_end       = (i == (msg->record_count - 1));
-        bool                 short_record = rec->payload_len <= 255;
+        const pn532_ndef_record_t *rec          = &msg->records[i];
+        bool                       is_begin     = (i == 0);
+        bool                       is_end       = (i == (msg->record_count - 1));
+        bool                       short_record = rec->payload_len <= 255;
 
         if (!ndef_record_has_consistent_storage(rec)) {
             return 0;
@@ -704,8 +715,8 @@ static uint8_t ndef_uri_prefix_code(const char *uri, size_t *prefix_len)
     return best_code;
 }
 
-bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len, bool utf16,
-                           uint8_t *payload_buf, size_t payload_buf_len)
+bool pn532_ndef_make_text_record(pn532_ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len,
+                                 bool utf16, uint8_t *payload_buf, size_t payload_buf_len)
 {
     if (rec == NULL || text == NULL || payload_buf == NULL) {
         return false;
@@ -729,13 +740,13 @@ bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint
         memcpy(&payload_buf[1 + lang_len], text, text_len);
     }
 
-    ndef_record_init(rec, NDEF_TNF_WELL_KNOWN, NDEF_RTD_TEXT, NDEF_RTD_TEXT_LEN, NULL, 0, payload_buf,
-                     (uint32_t)needed);
+    pn532_ndef_record_init(rec, PN532_NDEF_TNF_WELL_KNOWN, PN532_NDEF_RTD_TEXT, PN532_NDEF_RTD_TEXT_LEN, NULL, 0,
+                           payload_buf, (uint32_t)needed);
     return true;
 }
 
-bool ndef_make_uri_record(ndef_record_t *rec, const char *uri, bool abbreviate, uint8_t *payload_buf,
-                          size_t payload_buf_len)
+bool pn532_ndef_make_uri_record(pn532_ndef_record_t *rec, const char *uri, bool abbreviate, uint8_t *payload_buf,
+                                size_t payload_buf_len)
 {
     if (rec == NULL || uri == NULL || payload_buf == NULL) {
         return false;
@@ -753,12 +764,13 @@ bool ndef_make_uri_record(ndef_record_t *rec, const char *uri, bool abbreviate, 
     payload_buf[0] = prefix_code;
     memcpy(&payload_buf[1], uri + prefix_len, remaining_len);
 
-    ndef_record_init(rec, NDEF_TNF_WELL_KNOWN, NDEF_RTD_URI, NDEF_RTD_URI_LEN, NULL, 0, payload_buf, (uint32_t)needed);
+    pn532_ndef_record_init(rec, PN532_NDEF_TNF_WELL_KNOWN, PN532_NDEF_RTD_URI, PN532_NDEF_RTD_URI_LEN, NULL, 0,
+                           payload_buf, (uint32_t)needed);
     return true;
 }
 
-bool ndef_make_mime_record(ndef_record_t *rec, const char *mime_type, const uint8_t *data, size_t data_len,
-                           uint8_t *type_buf, size_t type_buf_len)
+bool pn532_ndef_make_mime_record(pn532_ndef_record_t *rec, const char *mime_type, const uint8_t *data, size_t data_len,
+                                 uint8_t *type_buf, size_t type_buf_len)
 {
     if (rec == NULL || mime_type == NULL || type_buf == NULL) {
         return false;
@@ -770,12 +782,13 @@ bool ndef_make_mime_record(ndef_record_t *rec, const char *mime_type, const uint
     }
 
     memcpy(type_buf, mime_type, type_len);
-    ndef_record_init(rec, NDEF_TNF_MEDIA_TYPE, type_buf, (uint8_t)type_len, NULL, 0, data, (uint32_t)data_len);
+    pn532_ndef_record_init(rec, PN532_NDEF_TNF_MEDIA_TYPE, type_buf, (uint8_t)type_len, NULL, 0, data,
+                           (uint32_t)data_len);
     return true;
 }
 
-bool ndef_make_external_record(ndef_record_t *rec, const char *type_name, const uint8_t *data, size_t data_len,
-                               uint8_t *type_buf, size_t type_buf_len)
+bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_name, const uint8_t *data,
+                                     size_t data_len, uint8_t *type_buf, size_t type_buf_len)
 {
     if (rec == NULL || type_name == NULL || type_buf == NULL) {
         return false;
@@ -787,7 +800,8 @@ bool ndef_make_external_record(ndef_record_t *rec, const char *type_name, const 
     }
 
     memcpy(type_buf, type_name, type_len);
-    ndef_record_init(rec, NDEF_TNF_EXTERNAL, type_buf, (uint8_t)type_len, NULL, 0, data, (uint32_t)data_len);
+    pn532_ndef_record_init(rec, PN532_NDEF_TNF_EXTERNAL, type_buf, (uint8_t)type_len, NULL, 0, data,
+                           (uint32_t)data_len);
     return true;
 }
 
@@ -798,10 +812,11 @@ bool ndef_make_external_record(ndef_record_t *rec, const char *type_name, const 
  * requested page, so the TLV area is scanned 4 pages per transaction. MIFARE
  * Classic goes through classic_read_from_selected_sectors() instead.
  */
-static ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pages, ndef_message_parsed_t **out_msg)
+static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pages,
+                                           pn532_ndef_message_parsed_t **out_msg)
 {
     if (pn532 == NULL || out_msg == NULL || max_pages <= 0) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
     *out_msg = NULL;
 
@@ -809,7 +824,7 @@ static ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pag
     size_t   capacity = 256;
     uint8_t *buf      = malloc(capacity);
     if (buf == NULL) {
-        return NDEF_ERR_NO_MEMORY;
+        return PN532_NDEF_ERR_NO_MEMORY;
     }
 
     size_t len         = 0;
@@ -825,7 +840,7 @@ static ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pag
             uint8_t *new_buf = realloc(buf, new_cap);
             if (new_buf == NULL) {
                 free(buf);
-                return NDEF_ERR_NO_MEMORY;
+                return PN532_NDEF_ERR_NO_MEMORY;
             }
             buf      = new_buf;
             capacity = new_cap;
@@ -835,7 +850,10 @@ static ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pag
             read_ok = false;
             break;
         }
-        len += 16;
+        /* The last READ of the data area may run into the lock/configuration
+         * pages or wrap around to page 0, so only pages inside the area count. */
+        int pages_left = max_pages - (page - start_page);
+        len += (pages_left < 4) ? (size_t)pages_left * 4u : 16u;
 
         if (ndef_tlv_find_ndef(buf, len, &tlv_pos, &ndef_offset, &ndef_len)) {
             if (ndef_offset + ndef_len <= len) {
@@ -850,51 +868,51 @@ static ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pag
 
     if (!found || ndef_len == 0) {
         free(buf);
-        return read_ok ? NDEF_ERR_NO_NDEF : NDEF_ERR_READ_FAILED;
+        return read_ok ? PN532_NDEF_ERR_NO_NDEF : PN532_NDEF_ERR_READ_FAILED;
     }
 
-    ndef_result_t parse_res = ndef_parse_message(buf + ndef_offset, ndef_len, out_msg);
+    pn532_ndef_result_t parse_res = pn532_ndef_parse_message(buf + ndef_offset, ndef_len, out_msg);
     free(buf);
     return parse_res;
 }
 
-ndef_result_t ndef_write_to_selected_card(pn532_t *pn532, const ndef_message_t *msg, int start_block, int block_size,
-                                          int max_blocks)
+pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn532_ndef_message_t *msg, int start_block,
+                                                      int block_size, int max_blocks)
 {
     if (pn532 == NULL || msg == NULL || start_block < 0 || block_size <= 0) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
 
     if (block_size != 4) {
-        return NDEF_ERR_UNSUPPORTED;
+        return PN532_NDEF_ERR_UNSUPPORTED;
     }
 
-    size_t ndef_len = ndef_encode_message(msg, NULL, 0);
+    size_t ndef_len = pn532_ndef_encode_message(msg, NULL, 0);
     if (ndef_len == 0) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
 
     size_t tlv_len_bytes = (ndef_len < 0xFF) ? 1 : 3;
     size_t total_len     = 0;
     if (!ndef_size_add(1u, tlv_len_bytes, &total_len) || !ndef_size_add(total_len, ndef_len, &total_len) ||
         !ndef_size_add(total_len, 1u, &total_len)) {
-        return NDEF_ERR_CARD_FULL;
+        return PN532_NDEF_ERR_CARD_FULL;
     }
 
     size_t rounded_len = 0;
     if (!ndef_size_add(total_len, (size_t)block_size - 1u, &rounded_len)) {
-        return NDEF_ERR_CARD_FULL;
+        return PN532_NDEF_ERR_CARD_FULL;
     }
 
     size_t blocks_needed = rounded_len / (size_t)block_size;
     if (max_blocks > 0 && (int)blocks_needed > max_blocks) {
-        return NDEF_ERR_CARD_FULL;
+        return PN532_NDEF_ERR_CARD_FULL;
     }
 
     size_t   buf_size = blocks_needed * (size_t)block_size;
     uint8_t *buf      = calloc(buf_size, 1);
     if (buf == NULL) {
-        return NDEF_ERR_NO_MEMORY;
+        return PN532_NDEF_ERR_NO_MEMORY;
     }
 
     size_t pos = 0;
@@ -907,9 +925,9 @@ ndef_result_t ndef_write_to_selected_card(pn532_t *pn532, const ndef_message_t *
         buf[pos++] = (uint8_t)(ndef_len & 0xFF);
     }
 
-    if (ndef_encode_message(msg, buf + pos, ndef_len) != ndef_len) {
+    if (pn532_ndef_encode_message(msg, buf + pos, ndef_len) != ndef_len) {
         free(buf);
-        return NDEF_ERR_INVALID_PARAM;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
     pos += ndef_len;
     buf[pos++] = TLV_TERMINATOR;
@@ -929,7 +947,7 @@ ndef_result_t ndef_write_to_selected_card(pn532_t *pn532, const ndef_message_t *
 
         if (pn532_14443_block_write(pn532, start_block, first_block, (size_t)block_size) < 0) {
             free(buf);
-            return NDEF_ERR_WRITE_FAILED;
+            return PN532_NDEF_ERR_WRITE_FAILED;
         }
     }
 
@@ -937,17 +955,17 @@ ndef_result_t ndef_write_to_selected_card(pn532_t *pn532, const ndef_message_t *
         if (pn532_14443_block_write(pn532, start_block + (int)block, buf + block * (size_t)block_size,
                                     (size_t)block_size) < 0) {
             free(buf);
-            return NDEF_ERR_WRITE_FAILED;
+            return PN532_NDEF_ERR_WRITE_FAILED;
         }
     }
 
     if (pn532_14443_block_write(pn532, start_block, buf, (size_t)block_size) < 0) {
         free(buf);
-        return NDEF_ERR_WRITE_FAILED;
+        return PN532_NDEF_ERR_WRITE_FAILED;
     }
 
     free(buf);
-    return NDEF_OK;
+    return PN532_NDEF_OK;
 }
 
 /* ---- Mifare Classic auth callback (default key A) ---- */
@@ -1003,8 +1021,9 @@ static bool classic_auth_mad1(pn532_t *pn532, const pn532_uid_t *uid)
         return false;
     }
 
-    if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, key_mad, MIFARE_CMD_AUTH_A)) {
-        if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, key_default, MIFARE_CMD_AUTH_A)) {
+    if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, key_mad, PN532_MIFARE_CMD_AUTH_A)) {
+        if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, key_default,
+                                       PN532_MIFARE_CMD_AUTH_A)) {
             return false;
         }
     }
@@ -1052,8 +1071,8 @@ static bool classic_read_mad2(pn532_t *pn532, const pn532_uid_t *uid, uint8_t ma
         return false;
     }
 
-    if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_mad, MIFARE_CMD_AUTH_A)) {
-        if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_default, MIFARE_CMD_AUTH_A)) {
+    if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_mad, PN532_MIFARE_CMD_AUTH_A)) {
+        if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_default, PN532_MIFARE_CMD_AUTH_A)) {
             return false;
         }
     }
@@ -1065,6 +1084,21 @@ static bool classic_read_mad2(pn532_t *pn532, const pn532_uid_t *uid, uint8_t ma
     }
 
     return true;
+}
+
+/* CRC of a MIFARE Application Directory: CRC-8 with polynomial
+ * x^8 + x^4 + x^3 + x^2 + 1 (1Dh) and preset C7h over the info byte and the
+ * application identifiers. Byte 0 of the MAD holds the CRC. */
+static bool classic_mad_crc_ok(const uint8_t *mad, size_t mad_len)
+{
+    uint8_t crc = 0xC7;
+    for (size_t i = 1; i < mad_len; i++) {
+        crc ^= mad[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x1D) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc == mad[0];
 }
 
 static bool classic_mad_entry_is_ndef(const uint8_t *mad, size_t mad_len, int entry, int entry_count)
@@ -1173,18 +1207,19 @@ static bool classic_auth_cb(pn532_t *pn532, int blockno, void *user_ctx)
     return false;
 }
 
-static ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, const int *sectors, size_t sector_count,
-                                                        default_auth_ctx_t *ctx, ndef_message_parsed_t **out_msg)
+static pn532_ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, const int *sectors, size_t sector_count,
+                                                              default_auth_ctx_t           *ctx,
+                                                              pn532_ndef_message_parsed_t **out_msg)
 {
     if (pn532 == NULL || sectors == NULL || sector_count == 0 || ctx == NULL || out_msg == NULL) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
     *out_msg = NULL;
 
     size_t   capacity = 256;
     uint8_t *buf      = malloc(capacity);
     if (buf == NULL) {
-        return NDEF_ERR_NO_MEMORY;
+        return PN532_NDEF_ERR_NO_MEMORY;
     }
 
     size_t len         = 0;
@@ -1218,7 +1253,7 @@ static ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, const in
                 uint8_t *new_buf = realloc(buf, new_cap);
                 if (new_buf == NULL) {
                     free(buf);
-                    return NDEF_ERR_NO_MEMORY;
+                    return PN532_NDEF_ERR_NO_MEMORY;
                 }
                 buf      = new_buf;
                 capacity = new_cap;
@@ -1244,10 +1279,10 @@ static ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, const in
 
     if (!found || ndef_len == 0) {
         free(buf);
-        return read_ok ? NDEF_ERR_NO_NDEF : NDEF_ERR_READ_FAILED;
+        return read_ok ? PN532_NDEF_ERR_NO_NDEF : PN532_NDEF_ERR_READ_FAILED;
     }
 
-    ndef_result_t parse_res = ndef_parse_message(buf + ndef_offset, ndef_len, out_msg);
+    pn532_ndef_result_t parse_res = pn532_ndef_parse_message(buf + ndef_offset, ndef_len, out_msg);
     free(buf);
     return parse_res;
 }
@@ -1268,8 +1303,8 @@ static int classic_mad_version_from_gpb(uint8_t gpb)
     }
 }
 
-static ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn532_uid_t *uid, default_auth_ctx_t *ctx,
-                                                ndef_message_parsed_t **out_msg)
+static pn532_ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn532_uid_t *uid, default_auth_ctx_t *ctx,
+                                                      pn532_ndef_message_parsed_t **out_msg)
 {
     uint8_t mad1[32];
     uint8_t gpb = 0;
@@ -1277,72 +1312,81 @@ static ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn532_uid_
     size_t  sector_count = 0;
 
     if (pn532 == NULL || uid == NULL || ctx == NULL || out_msg == NULL) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
 
     if (!classic_auth_mad1(pn532, uid)) {
-        return NDEF_ERR_NO_NDEF;
+        return PN532_NDEF_ERR_NO_NDEF;
     }
     int mad_version = 1;
     if (classic_read_mad1_gpb(pn532, &gpb)) {
         mad_version = classic_mad_version_from_gpb(gpb);
         if (mad_version == 0) {
-            return NDEF_ERR_NO_NDEF;
+            return PN532_NDEF_ERR_NO_NDEF;
         }
     } else {
         ESP_LOGD(TAG, "classic_read_ndef_from_mad: MAD1 GPB unreadable, assuming MAD v1");
     }
     if (!classic_read_mad1(pn532, mad1)) {
-        return NDEF_ERR_NO_NDEF;
+        return PN532_NDEF_ERR_NO_NDEF;
+    }
+    /* A directory with a wrong CRC is treated as absent. */
+    if (!classic_mad_crc_ok(mad1, sizeof(mad1))) {
+        ESP_LOGD(TAG, "classic_read_ndef_from_mad: MAD1 CRC mismatch");
+        return PN532_NDEF_ERR_NO_NDEF;
     }
 
     switch (uid->subtype) {
     case PN532_MIFARE_CLASSIC_MINI:
         if (!classic_collect_ndef_sectors(mad1, sizeof(mad1), 1, 4, sectors, CLASSIC_MAX_NDEF_SECTORS, &sector_count)) {
-            return NDEF_ERR_NO_NDEF;
+            return PN532_NDEF_ERR_NO_NDEF;
         }
         break;
     case PN532_MIFARE_CLASSIC_1K:
         if (!classic_collect_ndef_sectors(mad1, sizeof(mad1), 1, CLASSIC_MAD1_ENTRY_COUNT, sectors,
                                           CLASSIC_MAX_NDEF_SECTORS, &sector_count)) {
-            return NDEF_ERR_NO_NDEF;
+            return PN532_NDEF_ERR_NO_NDEF;
         }
         break;
     case PN532_MIFARE_CLASSIC_4K:
         if (!classic_collect_ndef_sectors(mad1, sizeof(mad1), 1, CLASSIC_MAD1_ENTRY_COUNT, sectors,
                                           CLASSIC_MAX_NDEF_SECTORS, &sector_count)) {
-            return NDEF_ERR_NO_NDEF;
+            return PN532_NDEF_ERR_NO_NDEF;
         }
         if (mad_version == 2) {
             uint8_t mad2[48];
 
             if (!classic_read_mad2(pn532, uid, mad2)) {
-                return NDEF_ERR_NO_NDEF;
+                return PN532_NDEF_ERR_NO_NDEF;
+            }
+            if (!classic_mad_crc_ok(mad2, sizeof(mad2))) {
+                ESP_LOGD(TAG, "classic_read_ndef_from_mad: MAD2 CRC mismatch");
+                return PN532_NDEF_ERR_NO_NDEF;
             }
             if (!classic_collect_ndef_sectors(mad2, sizeof(mad2), 17, CLASSIC_MAD2_ENTRY_COUNT, sectors,
                                               CLASSIC_MAX_NDEF_SECTORS, &sector_count)) {
-                return NDEF_ERR_NO_NDEF;
+                return PN532_NDEF_ERR_NO_NDEF;
             }
         }
         break;
     default:
-        return NDEF_ERR_UNSUPPORTED;
+        return PN532_NDEF_ERR_UNSUPPORTED;
     }
 
     if (sector_count == 0) {
-        return NDEF_ERR_NO_NDEF;
+        return PN532_NDEF_ERR_NO_NDEF;
     }
     return classic_read_from_selected_sectors(pn532, sectors, sector_count, ctx, out_msg);
 }
 
 /* ---- Type 4 (DESFire / ISO-DEP) NDEF read ---- */
 
-static ndef_result_t ndef_type4_select_failure_result(const pn532_t *pn532)
+static pn532_ndef_result_t ndef_type4_select_failure_result(const pn532_t *pn532)
 {
     if (pn532 == NULL || pn532->inListedTag == 0 || !pn532->session_opened) {
-        return NDEF_ERR_READ_FAILED;
+        return PN532_NDEF_ERR_READ_FAILED;
     }
-    return NDEF_ERR_NO_NDEF;
+    return PN532_NDEF_ERR_NO_NDEF;
 }
 
 /*
@@ -1365,7 +1409,7 @@ static ndef_result_t ndef_type4_select_failure_result(const pn532_t *pn532)
  *   6. READ BINARY NLEN bytes from offset 2 (chunked by MLe-2) -> NDEF message.
  */
 
-static ndef_result_t ndef_read_type4(pn532_t *pn532, ndef_message_parsed_t **out_msg)
+static pn532_ndef_result_t ndef_read_type4(pn532_t *pn532, pn532_ndef_message_parsed_t **out_msg)
 {
     static const uint8_t ndef_aid[]   = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
     static const uint8_t cc_file_id[] = {0xE1, 0x03};
@@ -1383,7 +1427,7 @@ static ndef_result_t ndef_read_type4(pn532_t *pn532, ndef_message_parsed_t **out
     size_t  cc_got = sizeof(cc);
     if (!pn532_14443_4_read_binary(pn532, 0, sizeof(cc), cc, &cc_got) || cc_got < 15) {
         ESP_LOGD(TAG, "T4: READ CC failed (%u bytes)", (unsigned)cc_got);
-        return NDEF_ERR_READ_FAILED;
+        return PN532_NDEF_ERR_READ_FAILED;
     }
 
     uint16_t mle            = ((uint16_t)cc[3] << 8) | cc[4];
@@ -1391,7 +1435,20 @@ static ndef_result_t ndef_read_type4(pn532_t *pn532, ndef_message_parsed_t **out
     uint16_t max_ndef_size  = ((uint16_t)cc[11] << 8) | cc[12];
     if (cc[7] != 0x04 || cc[8] != 0x06 || max_ndef_size < 2) {
         ESP_LOGD(TAG, "T4: bad CC TLV (T=%02X L=%02X)", cc[7], cc[8]);
-        return NDEF_ERR_PARSE_FAILED;
+        return PN532_NDEF_ERR_PARSE_FAILED;
+    }
+    /* Mapping versions 1.x to 3.x share this capability container layout; a
+     * higher major version may not. */
+    uint8_t mapping_major = (uint8_t)(cc[2] >> 4);
+    if (mapping_major < 1 || mapping_major > 3) {
+        ESP_LOGD(TAG, "T4: unsupported mapping version %02X", cc[2]);
+        return PN532_NDEF_ERR_UNSUPPORTED;
+    }
+    /* Read access 00h means free access; anything else needs a security
+     * setup this driver does not do. */
+    if (cc[13] != 0x00) {
+        ESP_LOGD(TAG, "T4: NDEF file is read protected (access byte %02X)", cc[13]);
+        return PN532_NDEF_ERR_ACCESS_DENIED;
     }
     /* Cap chunk size. MLe already counts data bytes only (SW1/SW2 are not
      * part of it), so Le = MLe is legal; two bytes of headroom are kept
@@ -1413,16 +1470,21 @@ static ndef_result_t ndef_read_type4(pn532_t *pn532, ndef_message_parsed_t **out
     uint8_t nlen_buf[2];
     size_t  nlen_got = sizeof(nlen_buf);
     if (!pn532_14443_4_read_binary(pn532, 0, 2, nlen_buf, &nlen_got) || nlen_got < 2) {
-        return NDEF_ERR_READ_FAILED;
+        return PN532_NDEF_ERR_READ_FAILED;
     }
     uint16_t nlen = ((uint16_t)nlen_buf[0] << 8) | nlen_buf[1];
-    if (nlen == 0 || nlen + 2 > max_ndef_size) {
-        return NDEF_ERR_NO_NDEF;
+    if (nlen == 0) {
+        return PN532_NDEF_ERR_NO_NDEF;
+    }
+    if ((uint32_t)nlen + 2u > max_ndef_size) {
+        /* The length does not fit the file the capability container
+         * describes: the tag is inconsistent. */
+        return PN532_NDEF_ERR_PARSE_FAILED;
     }
 
     uint8_t *raw = malloc(nlen);
     if (raw == NULL) {
-        return NDEF_ERR_NO_MEMORY;
+        return PN532_NDEF_ERR_NO_MEMORY;
     }
     uint16_t read_off  = 2;
     uint16_t remaining = nlen;
@@ -1431,21 +1493,21 @@ static ndef_result_t ndef_read_type4(pn532_t *pn532, ndef_message_parsed_t **out
         size_t  got  = want;
         if (!pn532_14443_4_read_binary(pn532, read_off, want, raw + (read_off - 2), &got) || got != want) {
             free(raw);
-            return NDEF_ERR_READ_FAILED;
+            return PN532_NDEF_ERR_READ_FAILED;
         }
         read_off += want;
         remaining -= want;
     }
 
-    ndef_result_t parse_result = ndef_parse_message(raw, nlen, out_msg);
+    pn532_ndef_result_t parse_result = pn532_ndef_parse_message(raw, nlen, out_msg);
     free(raw);
     return parse_result;
 }
 
-ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, ndef_message_parsed_t **out_msg)
+pn532_ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, pn532_ndef_message_parsed_t **out_msg)
 {
     if (pn532 == NULL || uid == NULL || out_msg == NULL) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
     *out_msg = NULL;
 
@@ -1453,24 +1515,33 @@ ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, ndef_m
     case PN532_MIFARE_ULTRALIGHT:
     case PN532_MIFARE_ULTRALIGHT_C:
     case PN532_MIFARE_ULTRALIGHT_EV1:
+    case PN532_MIFARE_NTAG210:
+    case PN532_MIFARE_NTAG212:
     case PN532_MIFARE_NTAG213:
     case PN532_MIFARE_NTAG215:
     case PN532_MIFARE_NTAG216: {
-        if (!pn532_type2_prepare_layout(pn532, uid)) {
-            return NDEF_ERR_READ_FAILED;
+        bool has_cc = false;
+        if (!pn532_type2_prepare_layout(pn532, uid, &has_cc)) {
+            return PN532_NDEF_ERR_READ_FAILED;
         }
-        /* NDEF data starts at page 4, capability container at page 3. */
-        int           max_pages = (uid->blocks_count > 4) ? (uid->blocks_count - 4) : 60;
-        ndef_result_t res       = type2_read_ndef(pn532, 4, max_pages, out_msg);
-        if (res == NDEF_ERR_READ_FAILED) {
+        /* Capability container at page 3, NDEF data from page 4. A tag
+         * without the container, or with an empty data area, is not NDEF
+         * formatted. */
+        if (!has_cc || uid->blocks_count <= 4) {
+            return PN532_NDEF_ERR_NO_NDEF;
+        }
+        pn532_ndef_result_t res = type2_read_ndef(pn532, 4, uid->blocks_count - 4, out_msg);
+        if (res == PN532_NDEF_ERR_READ_FAILED) {
             if (!pn532_14443_select_by_uid(pn532, uid)) {
                 return res;
             }
-            if (!pn532_type2_prepare_layout(pn532, uid)) {
+            if (!pn532_type2_prepare_layout(pn532, uid, &has_cc)) {
                 return res;
             }
-            max_pages = (uid->blocks_count > 4) ? (uid->blocks_count - 4) : 60;
-            res       = type2_read_ndef(pn532, 4, max_pages, out_msg);
+            if (!has_cc || uid->blocks_count <= 4) {
+                return PN532_NDEF_ERR_NO_NDEF;
+            }
+            res = type2_read_ndef(pn532, 4, uid->blocks_count - 4, out_msg);
         }
         return res;
     }
@@ -1479,21 +1550,21 @@ ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, ndef_m
     case PN532_MIFARE_CLASSIC_4K:
     case PN532_MIFARE_CLASSIC_MINI: {
         if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, uid)) {
-            return NDEF_ERR_READ_FAILED;
+            return PN532_NDEF_ERR_READ_FAILED;
         }
         static const uint8_t key_a_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
         static const uint8_t key_a_ndef[6]    = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
         default_auth_ctx_t   ctx              = {
-                           .uid = uid, .primary_key = key_a_ndef, .secondary_key = key_a_default, .key_type = MIFARE_CMD_AUTH_A};
+                           .uid = uid, .primary_key = key_a_ndef, .secondary_key = key_a_default, .key_type = PN532_MIFARE_CMD_AUTH_A};
         return classic_read_ndef_from_mad(pn532, uid, &ctx, out_msg);
     }
 
     case PN532_MIFARE_DESFIRE: {
         if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, uid)) {
-            return NDEF_ERR_READ_FAILED;
+            return PN532_NDEF_ERR_READ_FAILED;
         }
-        ndef_result_t res = ndef_read_type4(pn532, out_msg);
-        if (res == NDEF_ERR_READ_FAILED) {
+        pn532_ndef_result_t res = ndef_read_type4(pn532, out_msg);
+        if (res == PN532_NDEF_ERR_READ_FAILED) {
             pn532_delay_ms(10);
             if (pn532->inListedTag == 0) {
                 if (!pn532_14443_select_by_uid(pn532, uid)) {
@@ -1506,24 +1577,24 @@ ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, ndef_m
     }
 
     default:
-        return NDEF_ERR_UNSUPPORTED;
+        return PN532_NDEF_ERR_UNSUPPORTED;
     }
 }
 
-void ndef_free_parsed_message(ndef_message_parsed_t *msg)
+void pn532_ndef_free_parsed_message(pn532_ndef_message_parsed_t *msg)
 {
     free(msg);
 }
 
 /* ---- Record helpers ---- */
 
-bool ndef_extract_text(const ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out, char *lang_buf,
-                       bool *is_utf16)
+bool pn532_ndef_extract_text(const pn532_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out,
+                             char *lang_buf, bool *is_utf16)
 {
     if (rec == NULL || text_out == NULL || text_len_out == NULL) {
         return false;
     }
-    if (rec->tnf != NDEF_TNF_WELL_KNOWN || rec->type_len != 1 || rec->type == NULL || rec->type[0] != 'T') {
+    if (rec->tnf != PN532_NDEF_TNF_WELL_KNOWN || rec->type_len != 1 || rec->type == NULL || rec->type[0] != 'T') {
         return false;
     }
     if (rec->payload == NULL || rec->payload_len < 1) {
@@ -1551,12 +1622,12 @@ bool ndef_extract_text(const ndef_record_t *rec, const uint8_t **text_out, size_
     return true;
 }
 
-size_t ndef_extract_uri(const ndef_record_t *rec, char *uri_buf, size_t uri_buf_len)
+size_t pn532_ndef_extract_uri(const pn532_ndef_record_t *rec, char *uri_buf, size_t uri_buf_len)
 {
     if (rec == NULL) {
         return 0;
     }
-    if (rec->tnf != NDEF_TNF_WELL_KNOWN || rec->type_len != 1 || rec->type == NULL || rec->type[0] != 'U') {
+    if (rec->tnf != PN532_NDEF_TNF_WELL_KNOWN || rec->type_len != 1 || rec->type == NULL || rec->type[0] != 'U') {
         return 0;
     }
     if (rec->payload == NULL || rec->payload_len < 1) {
@@ -1583,78 +1654,80 @@ size_t ndef_extract_uri(const ndef_record_t *rec, char *uri_buf, size_t uri_buf_
     return total_len;
 }
 
-ndef_record_type_t ndef_get_record_type(const ndef_record_t *rec)
+pn532_ndef_record_type_t pn532_ndef_get_record_type(const pn532_ndef_record_t *rec)
 {
     if (rec == NULL) {
-        return NDEF_RECORD_TYPE_UNKNOWN;
+        return PN532_NDEF_RECORD_TYPE_UNKNOWN;
     }
-    if (rec->tnf == NDEF_TNF_EMPTY) {
-        return NDEF_RECORD_TYPE_EMPTY;
+    if (rec->tnf == PN532_NDEF_TNF_EMPTY) {
+        return PN532_NDEF_RECORD_TYPE_EMPTY;
     }
-    if (rec->tnf == NDEF_TNF_MEDIA_TYPE) {
-        return NDEF_RECORD_TYPE_MIME;
+    if (rec->tnf == PN532_NDEF_TNF_MEDIA_TYPE) {
+        return PN532_NDEF_RECORD_TYPE_MIME;
     }
-    if (rec->tnf == NDEF_TNF_EXTERNAL) {
-        return NDEF_RECORD_TYPE_EXTERNAL;
+    if (rec->tnf == PN532_NDEF_TNF_EXTERNAL) {
+        return PN532_NDEF_RECORD_TYPE_EXTERNAL;
     }
-    if (rec->tnf == NDEF_TNF_WELL_KNOWN && rec->type != NULL && rec->type_len > 0) {
+    if (rec->tnf == PN532_NDEF_TNF_WELL_KNOWN && rec->type != NULL && rec->type_len > 0) {
         if (rec->type_len == 1 && rec->type[0] == 'T') {
-            return NDEF_RECORD_TYPE_TEXT;
+            return PN532_NDEF_RECORD_TYPE_TEXT;
         }
         if (rec->type_len == 1 && rec->type[0] == 'U') {
-            return NDEF_RECORD_TYPE_URI;
+            return PN532_NDEF_RECORD_TYPE_URI;
         }
         if (rec->type_len == 2 && rec->type[0] == 'S' && rec->type[1] == 'p') {
-            return NDEF_RECORD_TYPE_SMARTPOSTER;
+            return PN532_NDEF_RECORD_TYPE_SMARTPOSTER;
         }
     }
-    return NDEF_RECORD_TYPE_UNKNOWN;
+    return PN532_NDEF_RECORD_TYPE_UNKNOWN;
 }
 
-bool ndef_record_is_text(const ndef_record_t *rec)
+bool pn532_ndef_record_is_text(const pn532_ndef_record_t *rec)
 {
-    return ndef_get_record_type(rec) == NDEF_RECORD_TYPE_TEXT;
+    return pn532_ndef_get_record_type(rec) == PN532_NDEF_RECORD_TYPE_TEXT;
 }
-bool ndef_record_is_uri(const ndef_record_t *rec)
+bool pn532_ndef_record_is_uri(const pn532_ndef_record_t *rec)
 {
-    return ndef_get_record_type(rec) == NDEF_RECORD_TYPE_URI;
+    return pn532_ndef_get_record_type(rec) == PN532_NDEF_RECORD_TYPE_URI;
 }
-bool ndef_record_is_smartposter(const ndef_record_t *rec)
+bool pn532_ndef_record_is_smartposter(const pn532_ndef_record_t *rec)
 {
-    return ndef_get_record_type(rec) == NDEF_RECORD_TYPE_SMARTPOSTER;
+    return pn532_ndef_get_record_type(rec) == PN532_NDEF_RECORD_TYPE_SMARTPOSTER;
 }
 
-size_t ndef_decode_smartposter(const ndef_record_t *rec, ndef_record_t *records, size_t capacity)
+size_t pn532_ndef_decode_smartposter(const pn532_ndef_record_t *rec, pn532_ndef_record_t *records, size_t capacity)
 {
-    if (!ndef_record_is_smartposter(rec) || rec->payload == NULL || rec->payload_len == 0) {
+    if (!pn532_ndef_record_is_smartposter(rec) || rec->payload == NULL || rec->payload_len == 0) {
         return 0;
     }
     return ndef_decode_message(rec->payload, rec->payload_len, records, capacity);
 }
 
-const char *ndef_result_to_string(ndef_result_t result)
+const char *pn532_ndef_result_to_string(pn532_ndef_result_t result)
 {
     switch (result) {
-    case NDEF_OK:
+    case PN532_NDEF_OK:
         return "OK";
-    case NDEF_ERR_INVALID_PARAM:
+    case PN532_NDEF_ERR_INVALID_PARAM:
         return "Invalid parameter";
-    case NDEF_ERR_NO_MEMORY:
+    case PN532_NDEF_ERR_NO_MEMORY:
         return "Out of memory";
-    case NDEF_ERR_READ_FAILED:
+    case PN532_NDEF_ERR_READ_FAILED:
         return "Card read failed";
-    case NDEF_ERR_WRITE_FAILED:
+    case PN532_NDEF_ERR_WRITE_FAILED:
         return "Card write failed";
-    case NDEF_ERR_NO_NDEF:
+    case PN532_NDEF_ERR_NO_NDEF:
         return "No NDEF data found";
-    case NDEF_ERR_PARSE_FAILED:
+    case PN532_NDEF_ERR_PARSE_FAILED:
         return "NDEF parse failed";
-    case NDEF_ERR_BUFFER_TOO_SMALL:
+    case PN532_NDEF_ERR_BUFFER_TOO_SMALL:
         return "Buffer too small";
-    case NDEF_ERR_CARD_FULL:
+    case PN532_NDEF_ERR_CARD_FULL:
         return "Card capacity exceeded";
-    case NDEF_ERR_UNSUPPORTED:
+    case PN532_NDEF_ERR_UNSUPPORTED:
         return "Unsupported card";
+    case PN532_NDEF_ERR_ACCESS_DENIED:
+        return "NDEF data is read protected";
     default:
         return "Unknown";
     }
