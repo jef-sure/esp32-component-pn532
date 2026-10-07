@@ -560,6 +560,10 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid);
  *
  * For non-Classic subtypes this function returns true and performs no exchange,
  * which lets higher-level code share a single auth callback across card types.
+ *
+ * For a Classic card it returns false without an exchange when blockno is
+ * outside 0..255, key_type is neither PN532_MIFARE_CMD_AUTH_A nor
+ * PN532_MIFARE_CMD_AUTH_B, or the UID length is not 4, 7 or 10.
  */
 bool pn532_14443_authenticate(   //
     pn532_t           *pn532,    //

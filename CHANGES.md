@@ -1,5 +1,27 @@
 # Changelog
 
+## v 0.7.4 - 2026-10-07
+
+Fixes from a review of 0.7.3, checked against NxpNfcRdLib (phalTop Type 2 and Type 4). Run on the host tests only; the Type 2 write was not repeated on hardware.
+
+Behaviour changes:
+
+- **`pn532_ndef_read_card_auto()` does not read a card other than the one asked for** (`pn532-ndef.c`). With two cards in the field and a session left open on the first, a call for the second read the first one again. The helper now compares the UID behind the selected target with the requested one and selects the requested card first. A UID length other than 4, 7 or 10 is `PN532_NDEF_ERR_INVALID_PARAM`.
+- **`pn532_ndef_write_to_selected_card()` keeps Lock Control and Memory Control TLVs** (`pn532-ndef.c`). The NDEF TLV is written behind the control TLVs at the start of the data area, as NxpNfcRdLib does. A factory NTAG213/215/216 has a 5-byte Lock Control TLV in page 4: the message now starts at byte 5 of the data area and has 5 bytes less; 0.7.3 overwrote the TLV. Lock or reserved bytes that a control TLV places inside the pages to write are `PN532_NDEF_ERR_UNSUPPORTED`, a control TLV with a wrong length field is `PN532_NDEF_ERR_PARSE_FAILED`. The helper reads the first one or two 16-byte windows of the data area before it writes.
+- **A Type 2 tag without write access is not written**: capability container byte 3 other than `00` is the new result `PN532_NDEF_ERR_READ_ONLY` (-11).
+- Type 4 NDEF read: a capability container with CCLEN below 15 or MLe below 000Fh is `PN532_NDEF_ERR_PARSE_FAILED`; an MLe of 0 to 2 was replaced by 248 before.
+- `pn532_14443_authenticate()` returns false for a Classic card without an exchange when `blockno` is outside 0..255, the command is neither Key A nor Key B, or the UID length is not 4, 7 or 10; the block number used to be cut to 8 bits.
+- A listed target with a UID length other than 4, 7 or 10 is a malformed listing (`PN532_POLL_PROTOCOL_ERROR`); such a card could not be selected afterwards.
+- `pn532_ndef_make_mime_record()` and `pn532_ndef_make_external_record()` return false for `data == NULL` with a non-zero length; the record was built and refused later by the encoder.
+
+Fixes:
+
+- Frame and exchange length checks no longer rely on an addition that a length near `SIZE_MAX` wraps (`pn532_write_frame()`, `pn532_in_data_exchange()`, `pn532_in_communicate_thru()`).
+
+Not changed: the review reported URI identifier `0x07` as `"******"`; the table holds `ftp://anonymous:anonymous@` since 0.6.0. The NDEF File Control TLV of a Type 4 tag is read at offset 7, where the specification and NxpNfcRdLib place it.
+
+Tests: 64 host tests (new: session on another card, control TLVs and write access of Type 2 tags, argument and length checks).
+
 ## v 0.7.3 - 2026-10-07
 
 Fixes on real hardware: an ESP32-P4 with two PN532 on one SPI host (no IRQ, no reset line), with NTAG213, Ultralight-compatible, MIFARE Classic 1K and ISO-DEP cards. The changes come from an audit of 0.7.2 against UM0701-02, the PN532/C1 datasheet and the ESP-IDF headers, and from what the hardware runs showed.

@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.3"
+idf.py add-dependency "jef-sure/pn532^0.7.4"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -93,7 +93,7 @@ void app_main(void)
 }
 ```
 
-The loop follows the lifecycle every application uses: **poll → read (optional) → release → RF off**. For UID-only access skip the read and the release. `pn532_ndef_read_card_auto()` selects the card itself and handles NTAG/Ultralight, MIFARE Classic (MAD, default keys), and Type 4 layouts.
+The loop follows the lifecycle every application uses: **poll → read (optional) → release → RF off**. For UID-only access skip the read and the release. `pn532_ndef_read_card_auto()` selects the card itself, also when a session is still open on another card, and handles NTAG/Ultralight, MIFARE Classic (MAD, default keys), and Type 4 layouts.
 
 All headers: `pn532.h` (transports, device, polling, ISO-DEP), `pn532-ndef.h` (NDEF read/write/parse), `pn532-mifare.h` (raw MIFARE primitives, rarely needed).
 
@@ -172,7 +172,7 @@ Behavior by card family:
 
 - Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed. A tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after that one read; the scan never leaves the data area the container describes.
 - MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `PN532_NDEF_ERR_NO_NDEF`, and so does a directory whose CRC does not match its content. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
-- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in chunks of MLe − 2 bytes (at most 248). A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x or an extended NDEF file (above 32 KB) `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file `PN532_NDEF_ERR_PARSE_FAILED`.
+- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in chunks of MLe − 2 bytes (at most 248). A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x or an extended NDEF file (above 32 KB) `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file, a CCLEN below 15 or an MLe below 000Fh `PN532_NDEF_ERR_PARSE_FAILED`.
 
 The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `pn532_ndef_parse_message()`; the returned record storage remains valid until `pn532_ndef_free_parsed_message()`.
 
@@ -212,6 +212,8 @@ The arguments after the message are `start_block`, `block_size`, and `max_blocks
 - `start_block` below 4 (UID, lock bytes, and the one-time programmable capability container) and a non-positive `max_blocks` return `PN532_NDEF_ERR_INVALID_PARAM`.
 - It reads the capability container and keeps the write inside the data area it describes (pages 4 to 3 + CC[2] × 2; 4 to 39 on an NTAG213), whatever `max_blocks` says, so the dynamic lock and configuration pages behind it are never written. A message that does not fit returns `PN532_NDEF_ERR_CARD_FULL`.
 - A tag without a capability container returns `PN532_NDEF_ERR_NO_NDEF`.
+- A tag whose capability container does not grant write access (byte 3 other than `00`) returns `PN532_NDEF_ERR_READ_ONLY`.
+- Lock Control and Memory Control TLVs at the start of the data area are kept and the NDEF TLV is written behind them. A factory NTAG213/215/216 has a 5-byte Lock Control TLV in page 4, so the message has 5 bytes less there. Lock or reserved bytes that such a TLV places inside the pages to write are not skipped: the layout returns `PN532_NDEF_ERR_UNSUPPORTED`.
 
 The helper is intentionally limited:
 

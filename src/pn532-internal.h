@@ -69,3 +69,6 @@ void pn532_abort_current_command(pn532_t *pn532);
 /* Switch the PN532's automatic RATS on or off (SetParameters); a no-op when
  * the chip is already in that mode. */
 bool pn532_set_auto_rats(pn532_t *pn532, bool enabled);
+/* True when the target the driver holds selected (inListedTag) was listed with
+ * this UID; false when no target is held or it is another card. */
+bool pn532_14443_selected_target_is(const pn532_t *pn532, const pn532_uid_t *uid);

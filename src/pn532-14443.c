@@ -251,7 +251,9 @@ static bool pn532_parse_iso14443a_target( //
     uid->atqa       = ((uint16_t)response[*offset + 1] << 8) | (uint16_t)response[*offset + 2];
     uid->sak        = response[*offset + 3];
     uid->uid_length = (int8_t)response[*offset + 4];
-    if (uid->uid_length < 0 || (size_t)uid->uid_length > sizeof(uid->uid)) {
+    /* ISO/IEC 14443-3 knows single, double and triple size UIDs only; any
+     * other length could not be selected again (pn532_14443_select_by_uid()). */
+    if (uid->uid_length != 4 && uid->uid_length != 7 && uid->uid_length != 10) {
         return false;
     }
 
@@ -347,6 +349,17 @@ static bool pn532_tg_holds_uid(const pn532_t *pn532, const pn532_uid_t *uid)
     }
     return pn532->listed_uid_len[uid->tg - 1] == (uint8_t)uid->uid_length &&
            memcmp(pn532->listed_uid[uid->tg - 1], uid->uid, (size_t)uid->uid_length) == 0;
+}
+
+bool pn532_14443_selected_target_is(const pn532_t *pn532, const pn532_uid_t *uid)
+{
+    uint8_t tg = pn532->inListedTag;
+
+    if (tg < 1 || tg > PN532_MAX_PASSIVE_TARGETS_ISO14443A) {
+        return false;
+    }
+    return pn532->listed_uid_len[tg - 1] == (uint8_t)uid->uid_length &&
+           memcmp(pn532->listed_uid[tg - 1], uid->uid, (size_t)uid->uid_length) == 0;
 }
 
 static bool pn532_list_passive_iso14443a_targets( //
@@ -632,6 +645,18 @@ bool pn532_14443_authenticate(pn532_t *pn532, const uint8_t *key, uint8_t key_ty
         uid->subtype == PN532_MIFARE_NTAG215 || uid->subtype == PN532_MIFARE_NTAG216 ||
         uid->subtype == PN532_MIFARE_DESFIRE) {
         return true;
+    }
+
+    /* The block number and the command are single bytes on the air, and the
+     * last four UID bytes are part of the authentication. */
+    if (blockno < 0 || blockno > 0xFF) {
+        return false;
+    }
+    if (key_type != PN532_MIFARE_CMD_AUTH_A && key_type != PN532_MIFARE_CMD_AUTH_B) {
+        return false;
+    }
+    if (uid->uid_length != 4 && uid->uid_length != 7 && uid->uid_length != 10) {
+        return false;
     }
 
     const uint8_t *uid_for_auth = uid->uid;

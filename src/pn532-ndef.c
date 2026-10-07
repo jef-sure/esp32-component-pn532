@@ -799,7 +799,7 @@ bool pn532_ndef_make_uri_record(pn532_ndef_record_t *rec, const char *uri, bool 
 bool pn532_ndef_make_mime_record(pn532_ndef_record_t *rec, const char *mime_type, const uint8_t *data, size_t data_len,
                                  uint8_t *type_buf, size_t type_buf_len)
 {
-    if (rec == NULL || mime_type == NULL || type_buf == NULL) {
+    if (rec == NULL || mime_type == NULL || type_buf == NULL || (data == NULL && data_len != 0)) {
         return false;
     }
 
@@ -817,7 +817,7 @@ bool pn532_ndef_make_mime_record(pn532_ndef_record_t *rec, const char *mime_type
 bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_name, const uint8_t *data,
                                      size_t data_len, uint8_t *type_buf, size_t type_buf_len)
 {
-    if (rec == NULL || type_name == NULL || type_buf == NULL) {
+    if (rec == NULL || type_name == NULL || type_buf == NULL || (data == NULL && data_len != 0)) {
         return false;
     }
 
@@ -903,6 +903,77 @@ static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int m
     return parse_res;
 }
 
+#define TLV_LOCK_CONTROL   0x01
+#define TLV_MEMORY_CONTROL 0x02
+/* Six 5-byte control TLVs (NxpNfcRdLib phalTop keeps three of each kind) and two spare bytes. */
+#define TYPE2_CONTROL_TLV_SCAN  32
+#define TYPE2_MAX_CONTROL_TLVS  6
+#define TYPE2_CONTROL_TLV_VALUE 3
+
+/* Lock or reserved bytes named by a control TLV, as a byte address in the tag memory. */
+typedef struct
+{
+    size_t addr;
+    size_t len;
+} type2_reserved_area_t;
+
+/*
+ * Lock Control (01h) and Memory Control (02h) TLVs at the start of the data
+ * area (NFC Forum Type 2 Tag; NxpNfcRdLib phalTop_Sw_Int_T2T_DetectTlvBlocks()).
+ * They stand in front of the NDEF TLV and tell where the dynamic lock bits
+ * and the reserved bytes are: PageAddr * 2^BytesPerPage + ByteOffset. An
+ * NTAG213/215/216 leaves the factory with a Lock Control TLV in page 4.
+ * scan receives the first bytes of the data area, *ctrl_len how many of them
+ * the control TLVs take.
+ */
+static pn532_ndef_result_t type2_read_control_tlvs(pn532_t *pn532, size_t data_area_len, uint8_t *scan,
+                                                   size_t *ctrl_len, type2_reserved_area_t *areas, size_t *area_count)
+{
+    size_t scan_len = (data_area_len < TYPE2_CONTROL_TLV_SCAN) ? data_area_len : TYPE2_CONTROL_TLV_SCAN;
+
+    *ctrl_len   = 0;
+    *area_count = 0;
+    memset(scan, 0, TYPE2_CONTROL_TLV_SCAN);
+    for (size_t off = 0; off < scan_len; off += 16) {
+        if (!pn532_14443_block_read(pn532, TYPE2_FIRST_DATA_PAGE + (int)(off / 4), scan + off, 16)) {
+            return PN532_NDEF_ERR_READ_FAILED;
+        }
+    }
+
+    size_t i = 0;
+    while (i < scan_len) {
+        uint8_t type = scan[i];
+
+        if (type == TLV_NULL) {
+            i++;
+            continue;
+        }
+        if (type != TLV_LOCK_CONTROL && type != TLV_MEMORY_CONTROL) {
+            break;
+        }
+        /* More control TLVs than the scan holds: the layout is not known in full. */
+        if (i + 2 + TYPE2_CONTROL_TLV_VALUE > scan_len || *area_count >= TYPE2_MAX_CONTROL_TLVS) {
+            return PN532_NDEF_ERR_UNSUPPORTED;
+        }
+        if (scan[i + 1] != TYPE2_CONTROL_TLV_VALUE) {
+            return PN532_NDEF_ERR_PARSE_FAILED;
+        }
+
+        size_t page_addr      = (size_t)(scan[i + 2] >> 4);
+        size_t byte_offset    = (size_t)(scan[i + 2] & 0x0F);
+        size_t size           = (scan[i + 3] != 0) ? scan[i + 3] : 256u; /* bits for 01h, bytes for 02h */
+        size_t bytes_per_page = (size_t)1 << (scan[i + 4] & 0x0F);
+
+        areas[*area_count].addr = page_addr * bytes_per_page + byte_offset;
+        areas[*area_count].len  = (type == TLV_LOCK_CONTROL) ? (size + 7u) / 8u : size;
+        (*area_count)++;
+
+        i += 2 + TYPE2_CONTROL_TLV_VALUE;
+        *ctrl_len = i;
+    }
+    return PN532_NDEF_OK;
+}
+
 pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn532_ndef_message_t *msg, int start_block,
                                                       int block_size, int max_blocks)
 {
@@ -930,19 +1001,8 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
     }
 
     size_t tlv_len_bytes = (ndef_len < 0xFF) ? 1 : 3;
-    size_t total_len     = 0;
-    if (!ndef_size_add(1u, tlv_len_bytes, &total_len) || !ndef_size_add(total_len, ndef_len, &total_len) ||
-        !ndef_size_add(total_len, 1u, &total_len)) {
-        return PN532_NDEF_ERR_CARD_FULL;
-    }
-
-    size_t rounded_len = 0;
-    if (!ndef_size_add(total_len, (size_t)block_size - 1u, &rounded_len)) {
-        return PN532_NDEF_ERR_CARD_FULL;
-    }
-
-    size_t blocks_needed = rounded_len / (size_t)block_size;
-    if (blocks_needed > (size_t)max_blocks) {
+    size_t tlv_total_len = 1u + tlv_len_bytes + ndef_len + 1u;
+    if ((tlv_total_len + (size_t)block_size - 1u) / (size_t)block_size > (size_t)max_blocks) {
         return PN532_NDEF_ERR_CARD_FULL;
     }
 
@@ -955,18 +1015,55 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
     if (cc_read[0] != TYPE2_CC_MAGIC) {
         return PN532_NDEF_ERR_NO_NDEF;
     }
+    /* CC byte 3: 00h is read and write access without security; NxpNfcRdLib
+     * phalTop takes any other value for a tag that must not be written. */
+    if (cc_read[3] != 0x00) {
+        return PN532_NDEF_ERR_READ_ONLY;
+    }
     size_t data_area_pages = (size_t)cc_read[2] * 2u;
+
+    uint8_t               scan[TYPE2_CONTROL_TLV_SCAN];
+    type2_reserved_area_t areas[TYPE2_MAX_CONTROL_TLVS];
+    size_t                area_count = 0;
+    size_t                ctrl_len   = 0;
+    pn532_ndef_result_t   ctrl_res =
+        type2_read_control_tlvs(pn532, data_area_pages * (size_t)block_size, scan, &ctrl_len, areas, &area_count);
+    if (ctrl_res != PN532_NDEF_OK) {
+        return ctrl_res;
+    }
+
+    /* Control TLVs from start_block on are kept and the NDEF TLV follows
+     * them, as NxpNfcRdLib phalTop does by writing at the NDEF TLV it found. */
+    size_t start_byte = (size_t)start_block * (size_t)block_size;
+    size_t ctrl_end   = (size_t)TYPE2_FIRST_DATA_PAGE * (size_t)block_size + ctrl_len;
+    size_t prefix_len = (ctrl_end > start_byte) ? ctrl_end - start_byte : 0;
+
+    size_t blocks_needed = (prefix_len + tlv_total_len + (size_t)block_size - 1u) / (size_t)block_size;
+    if (blocks_needed > (size_t)max_blocks) {
+        return PN532_NDEF_ERR_CARD_FULL;
+    }
     if ((size_t)(start_block - TYPE2_FIRST_DATA_PAGE) + blocks_needed > data_area_pages) {
         return PN532_NDEF_ERR_CARD_FULL;
     }
 
-    size_t   buf_size = blocks_needed * (size_t)block_size;
-    uint8_t *buf      = calloc(buf_size, 1);
+    /* Lock or reserved bytes inside the pages to write would have to be
+     * skipped, which this helper does not do. */
+    size_t buf_size = blocks_needed * (size_t)block_size;
+    for (size_t a = 0; a < area_count; a++) {
+        if (areas[a].addr < start_byte + buf_size && areas[a].addr + areas[a].len > start_byte) {
+            return PN532_NDEF_ERR_UNSUPPORTED;
+        }
+    }
+
+    uint8_t *buf = calloc(buf_size, 1);
     if (buf == NULL) {
         return PN532_NDEF_ERR_NO_MEMORY;
     }
 
-    size_t pos = 0;
+    size_t pos = prefix_len;
+    if (prefix_len > 0) {
+        memcpy(buf, scan + (ctrl_len - prefix_len), prefix_len);
+    }
     buf[pos++] = TLV_NDEF;
     if (ndef_len < 0xFF) {
         buf[pos++] = (uint8_t)ndef_len;
@@ -983,26 +1080,36 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
     pos += ndef_len;
     buf[pos++] = TLV_TERMINATOR;
 
+    /* The page with the TLV length byte is committed last. */
+    size_t length_block = (prefix_len + 1u) / (size_t)block_size;
+
     if (blocks_needed > 1) {
-        uint8_t first_block[16] = {0};
-
         /*
-         * Hide the new TLV length until the trailing pages are programmed so a
-         * concurrent reader never sees a partially updated multi-page message.
+         * Hide the new TLV length until the other pages are programmed so a
+         * concurrent reader never sees a partially updated multi-page message:
+         * an empty NDEF TLV and a Terminator TLV, which may fall into the next page.
          */
-        first_block[0] = TLV_NDEF;
-        first_block[1] = 0x00;
-        if (block_size > 2) {
-            first_block[2] = TLV_TERMINATOR;
-        }
+        uint8_t hidden[TYPE2_CONTROL_TLV_SCAN + 8] = {0};
+        size_t  hidden_blocks                      = (prefix_len + 3u + (size_t)block_size - 1u) / (size_t)block_size;
 
-        if (pn532_14443_block_write(pn532, start_block, first_block, (size_t)block_size) < 0) {
-            free(buf);
-            return PN532_NDEF_ERR_WRITE_FAILED;
+        memcpy(hidden, buf, prefix_len);
+        hidden[prefix_len]      = TLV_NDEF;
+        hidden[prefix_len + 1u] = 0x00;
+        hidden[prefix_len + 2u] = TLV_TERMINATOR;
+
+        /* From the page with the tag byte on, which may be the one in front of the length byte. */
+        for (size_t block = prefix_len / (size_t)block_size; block < hidden_blocks && block < blocks_needed; block++) {
+            if (pn532_14443_block_write(pn532, start_block + (int)block, hidden + block * (size_t)block_size,
+                                        (size_t)block_size) < 0) {
+                free(buf);
+                return PN532_NDEF_ERR_WRITE_FAILED;
+            }
         }
     }
 
-    for (size_t block = 1; block < blocks_needed; block++) {
+    /* The pages in front of the length byte hold kept control TLV bytes, which
+     * are left as they are, and at most the tag byte, which is in place. */
+    for (size_t block = length_block + 1u; block < blocks_needed; block++) {
         if (pn532_14443_block_write(pn532, start_block + (int)block, buf + block * (size_t)block_size,
                                     (size_t)block_size) < 0) {
             free(buf);
@@ -1010,7 +1117,8 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
         }
     }
 
-    if (pn532_14443_block_write(pn532, start_block, buf, (size_t)block_size) < 0) {
+    if (pn532_14443_block_write(pn532, start_block + (int)length_block, buf + length_block * (size_t)block_size,
+                                (size_t)block_size) < 0) {
         free(buf);
         return PN532_NDEF_ERR_WRITE_FAILED;
     }
@@ -1481,6 +1589,7 @@ static pn532_ndef_result_t ndef_read_type4(pn532_t *pn532, pn532_ndef_message_pa
         return PN532_NDEF_ERR_READ_FAILED;
     }
 
+    uint16_t cclen          = ((uint16_t)cc[0] << 8) | cc[1];
     uint16_t mle            = ((uint16_t)cc[3] << 8) | cc[4];
     uint8_t  ndef_fid_be[2] = {cc[9], cc[10]};
     uint16_t max_ndef_size  = ((uint16_t)cc[11] << 8) | cc[12];
@@ -1490,6 +1599,14 @@ static pn532_ndef_result_t ndef_read_type4(pn532_t *pn532, pn532_ndef_message_pa
     if (mapping_major < 1 || mapping_major > 3) {
         ESP_LOGD(TAG, "T4: unsupported mapping version %02X", cc[2]);
         return PN532_NDEF_ERR_UNSUPPORTED;
+    }
+    /* A capability container shorter than its mandatory 15 bytes, or an MLe
+     * below 000Fh, is a misconfigured tag (NxpNfcRdLib phalTop T4T refuses
+     * both). The NDEF File Control TLV is always the first TLV, at offset 7;
+     * further TLVs up to CCLEN describe proprietary files and are not read. */
+    if (cclen < 15 || mle < 0x000Fu) {
+        ESP_LOGD(TAG, "T4: bad CC (CCLEN=%u MLe=%u)", (unsigned)cclen, (unsigned)mle);
+        return PN532_NDEF_ERR_PARSE_FAILED;
     }
     /* A mapping 3.x tag may carry the Extended NDEF File Control TLV (06h)
      * instead: 4-byte file size and NDEF length, for files above 32 KB. */
@@ -1512,12 +1629,7 @@ static pn532_ndef_result_t ndef_read_type4(pn532_t *pn532, pn532_ndef_message_pa
      * anyway for cards that size MLe to their whole R-APDU buffer. Our READ
      * BINARY helper uses a 260-byte buffer and Le is one byte, so 248 data
      * bytes is the ceiling. */
-    uint16_t chunk_max;
-    if (mle <= 2 || mle > 250) {
-        chunk_max = 248u;
-    } else {
-        chunk_max = mle - 2u;
-    }
+    uint16_t chunk_max = (mle > 250) ? 248u : (uint16_t)(mle - 2u);
 
     if (!pn532_14443_4_select_file(pn532, ndef_fid_be, sizeof(ndef_fid_be))) {
         ESP_LOGD(TAG, "T4: SELECT NDEF file %02X%02X failed", ndef_fid_be[0], ndef_fid_be[1]);
@@ -1567,6 +1679,16 @@ pn532_ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, 
         return PN532_NDEF_ERR_INVALID_PARAM;
     }
     *out_msg = NULL;
+
+    if (uid->uid_length != 4 && uid->uid_length != 7 && uid->uid_length != 10) {
+        return PN532_NDEF_ERR_INVALID_PARAM;
+    }
+    /* A session left open on another card (two cards in the field) must not
+     * be read in place of the requested one. */
+    if (pn532->inListedTag != 0 && !pn532_14443_selected_target_is(pn532, uid) &&
+        !pn532_14443_select_by_uid(pn532, uid)) {
+        return PN532_NDEF_ERR_READ_FAILED;
+    }
 
     switch (uid->subtype) {
     case PN532_MIFARE_ULTRALIGHT:
@@ -1801,6 +1923,8 @@ const char *pn532_ndef_result_to_string(pn532_ndef_result_t result)
         return "Unsupported card";
     case PN532_NDEF_ERR_ACCESS_DENIED:
         return "NDEF data is read protected";
+    case PN532_NDEF_ERR_READ_ONLY:
+        return "Tag is write protected";
     default:
         return "Unknown";
     }

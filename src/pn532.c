@@ -130,6 +130,11 @@ void pn532_bus_destroy(pn532_bus_t *bus)
 
 static bool pn532_write_frame(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len)
 {
+    /* Checked before the additions below, which a huge params_len would wrap. */
+    if (params_len > PN532_MAX_BUF_SIZE) {
+        ESP_LOGE(TAG, "pn532_write_frame: frame too large (%u parameter bytes)", (unsigned int)params_len);
+        return false;
+    }
     size_t payload_len  = params_len + 2;
     size_t required_len = payload_len + ((payload_len < 0xFF) ? 7 : 10);
     if (required_len > PN532_MAX_BUF_SIZE) {
@@ -954,7 +959,7 @@ bool pn532_deselect_target(pn532_t *pn532)
 bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                             size_t *response_len, uint16_t timeout)
 {
-    if (pn532 == NULL || data == NULL || data_len == 0 || data_len + 1 > PN532_MAX_BUF_SIZE) {
+    if (pn532 == NULL || data == NULL || data_len == 0 || data_len >= PN532_MAX_BUF_SIZE) {
         return false;
     }
 
@@ -1105,7 +1110,7 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
 bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                                size_t *response_len, uint16_t timeout)
 {
-    if (pn532 == NULL || data == NULL || data_len == 0 || data_len + 1 > PN532_MAX_BUF_SIZE) {
+    if (pn532 == NULL || data == NULL || data_len == 0 || data_len >= PN532_MAX_BUF_SIZE) {
         return false;
     }
 

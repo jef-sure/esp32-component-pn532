@@ -87,6 +87,7 @@ struct mock_bus_t
     bool            ack_dropped;    /* the current command frame was lost */
     uint8_t         error_frames;   /* next N responses are the syntax error frame */
     uint8_t         firmware_ic;    /* GetFirmwareVersion IC byte; 0 selects 0x32 */
+    uint8_t         card_uid_len;   /* InListPassiveTarget NFCIDLength of the listed card; 0 selects 4 */
 };
 
 static const uint8_t ack_frame[]  = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
@@ -289,6 +290,14 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
                 memcpy(custom + sizeof(card), ats, sizeof(ats));
                 payload_len += sizeof(ats);
             }
+        }
+        if (mock->mode == MOCK_CARD && mock->card_uid_len != 0) {
+            static uint8_t odd[6 + 10];
+            memset(odd, 0x5A, sizeof(odd));
+            memcpy(odd, card, 5);
+            odd[5]      = mock->card_uid_len;
+            payload     = odd;
+            payload_len = 6u + mock->card_uid_len;
         }
         if (mock->mode == MOCK_TWO_LONG_ATS) {
             /* NbTg=2; each: Tg ATQA(2) SAK=0x20 UIDLen=7 UID(7) ATS(TL=30): 85 bytes total. */
@@ -1830,6 +1839,8 @@ static size_t sim_type4_card(mock_bus_t *mock, uint8_t command, const uint8_t *r
     return out;
 }
 
+static const uint8_t sim_uid[] = {0xDE, 0xAD, 0xBE, 0xEF};
+
 /* Starts a test on a simulated card that is already listed and selected as Tg 1. */
 static void sim_init(mock_bus_t *mock, pn532_t *pn532, mock_sim_card_t card, uint8_t *send_buf, uint8_t *recv_buf)
 {
@@ -1838,6 +1849,8 @@ static void sim_init(mock_bus_t *mock, pn532_t *pn532, mock_sim_card_t card, uin
     pn532->inListedTag    = 1;
     pn532->session_opened = true;
     pn532->is_rf_on       = true;
+    memcpy(pn532->listed_uid[0], sim_uid, sizeof(sim_uid));
+    pn532->listed_uid_len[0] = sizeof(sim_uid);
 }
 
 /* NDEF message with one Text record "a". */
@@ -2199,6 +2212,9 @@ TEST_CASE("Type 4 NDEF read checks mapping version, read access and NLEN", "[pn5
         {7,  0x06, sizeof(sim_ndef_text), PN532_NDEF_ERR_UNSUPPORTED,   1}, /* Extended NDEF File Control TLV */
         {7,  0x05, sizeof(sim_ndef_text), PN532_NDEF_ERR_PARSE_FAILED,  1},
         {0,  0,    31,                    PN532_NDEF_ERR_PARSE_FAILED,  2},
+        {1,  0x0E, sizeof(sim_ndef_text), PN532_NDEF_ERR_PARSE_FAILED,  1}, /* CCLEN below the mandatory 15 */
+        {4,  0x0E, sizeof(sim_ndef_text), PN532_NDEF_ERR_PARSE_FAILED,  1}, /* MLe below 000Fh */
+        {4,  0x0F, sizeof(sim_ndef_text), PN532_NDEF_OK,                3},
         {0,  0,    0,                     PN532_NDEF_ERR_NO_NDEF,       2},
     };
 
@@ -2526,4 +2542,191 @@ TEST_CASE("an RF protocol error marks the target stale like the MIFARE errors", 
         TEST_ASSERT_FALSE(pn532.session_opened);
         TEST_ASSERT_EQUAL(1, pn532.inListedTag);
     }
+}
+
+TEST_CASE("NDEF read does not use a session that is open on another card", "[pn532][ndef][session]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[SIM_NTAG213_PAGES * 4];
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x00,
+        .subtype      = PN532_MIFARE_NTAG213,
+        .block_size   = 4,
+        .blocks_count = SIM_NTAG213_PAGES
+    };
+    pn532_ndef_message_parsed_t *msg = NULL;
+
+    /* The session is open on the requested card: the read starts right away. */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_EQUAL_UINT8(PN532_COMMAND_INDATAEXCHANGE, mock.commands[0]);
+
+    /* Tg 1 of the latest listing is another card (two cards in the field,
+     * the application read the first one and did not release it). */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    pn532.listed_uid[0][0] = 0x11;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    const uint8_t expected[] = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_INLISTPASSIVETARGET,
+                                PN532_COMMAND_INSELECT, PN532_COMMAND_INDATAEXCHANGE};
+    TEST_ASSERT_GREATER_OR_EQUAL(ARRAY_SIZE(expected), mock.command_count);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, mock.commands, ARRAY_SIZE(expected));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(uid.uid, pn532.listed_uid[0], 4);
+
+    uid.uid_length = 5;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_INVALID_PARAM, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+}
+
+TEST_CASE("Type 2 NDEF write keeps control TLVs and honours the write access byte", "[pn532][ndef][t2][write]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[SIM_NTAG213_PAGES * 4];
+
+    uint8_t              payload[32];
+    pn532_ndef_record_t  records[1];
+    pn532_ndef_message_t message;
+    pn532_ndef_message_init(&message, records, 1);
+    TEST_ASSERT_TRUE(pn532_ndef_make_uri_record(&records[0], "https://www.example.com", true, payload, sizeof(payload)));
+    TEST_ASSERT_TRUE(pn532_ndef_message_add(&message, &records[0]));
+
+    /* Factory NTAG213: Lock Control TLV (dynamic lock bits at byte 160, 12
+     * bits), then an empty NDEF TLV and the Terminator TLV. */
+    static const uint8_t factory[] = {0x01, 0x03, 0xA0, 0x0C, 0x34, 0x03, 0x00, 0xFE};
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memcpy(&memory[16], factory, sizeof(factory));
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
+    /* 5 + 19 bytes are six pages. Page 4 holds control TLV bytes only and is
+     * not written; page 5 with the length byte comes first (hidden) and last. */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){5, 6, 7, 8, 9, 5}), mock.sim_written, 6);
+    TEST_ASSERT_EQUAL(6, mock.sim_writes);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(factory, &memory[16], 5);
+    TEST_ASSERT_EQUAL_UINT8(0x03, memory[21]);
+    TEST_ASSERT_EQUAL_UINT8(16, memory[22]);
+    TEST_ASSERT_EQUAL_UINT8(0xFE, memory[23 + 16]);
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x00,
+        .subtype      = PN532_MIFARE_NTAG213,
+        .block_size   = 4,
+        .blocks_count = SIM_NTAG213_PAGES
+    };
+    pn532_ndef_message_parsed_t *msg = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    char uri[40];
+    TEST_ASSERT_EQUAL(23, pn532_ndef_extract_uri(&msg->records[0], uri, sizeof(uri)));
+    pn532_ndef_free_parsed_message(msg);
+
+    /* The control TLV counts against the caller's page limit and the data area. */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memcpy(&memory[16], factory, sizeof(factory));
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_CARD_FULL, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 5));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+    /* Behind the control TLV the message starts where the caller says. */
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 6, 4, 5));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){6, 7, 8, 9, 10, 6}), mock.sim_written, 6);
+
+    /* A NDEF TLV header split over two pages: Null TLVs do not count, three
+     * control TLV bytes are left in the first written page. */
+    static const uint8_t split[] = {0x00, 0x00, 0x01, 0x03, 0xA0, 0x0C, 0x34};
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memcpy(&memory[16], split, sizeof(split));
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 5, 4, 36));
+    /* T is the last byte of page 5, L the first of page 6: both pages are
+     * staged, page 6 is committed last. */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){5, 6, 7, 8, 9, 10, 6}), mock.sim_written, 7);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(split, &memory[16], sizeof(split));
+    TEST_ASSERT_EQUAL_UINT8(0x03, memory[23]);
+    TEST_ASSERT_EQUAL_UINT8(16, memory[24]);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
+
+    /* Memory Control TLV: 4 reserved bytes at byte 32 (page 8), inside the pages to write. */
+    static const uint8_t reserved[] = {0x02, 0x03, 0x20, 0x04, 0x04};
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memcpy(&memory[16], reserved, sizeof(reserved));
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_UNSUPPORTED, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+    /* A write that ends in front of the reserved bytes is fine. */
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 10, 4, 36));
+
+    /* A control TLV with a wrong length field. */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memcpy(&memory[16], reserved, sizeof(reserved));
+    memory[17] = 0x04;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+
+    /* CC byte 3 = 0Fh: no write access. */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memory[15] = 0x0F;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_READ_ONLY, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+    TEST_ASSERT_EQUAL_STRING("Tag is write protected", pn532_ndef_result_to_string(PN532_NDEF_ERR_READ_ONLY));
+}
+
+TEST_CASE("lengths, block numbers and UID sizes outside the protocol are refused", "[pn532][args]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    data[4]                      = {0};
+    uint8_t    response[8];
+    size_t     response_len;
+
+    /* A length that wraps the frame size arithmetic must not reach a buffer. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
+    response_len         = sizeof(response);
+    TEST_ASSERT_FALSE(pn532_in_data_exchange(&pn532, data, SIZE_MAX, response, &response_len, 10));
+    TEST_ASSERT_FALSE(pn532_in_communicate_thru(&pn532, data, SIZE_MAX, response, &response_len, 10));
+    TEST_ASSERT_FALSE(pn532_execute_command(&pn532, PN532_COMMAND_INDATAEXCHANGE, data, SIZE_MAX - 1, response,
+                                            &response_len, 10));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+
+    /* MIFARE authentication: one-byte block number, Key A or B, a UID of a defined size. */
+    static const uint8_t key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    pn532_uid_t uid = {.uid = {0xDE, 0xAD, 0xBE, 0xEF}, .uid_length = 4, .tg = 1, .subtype = PN532_MIFARE_CLASSIC_4K};
+    TEST_ASSERT_FALSE(pn532_14443_authenticate(&pn532, key, PN532_MIFARE_CMD_AUTH_A, &uid, -1));
+    TEST_ASSERT_FALSE(pn532_14443_authenticate(&pn532, key, PN532_MIFARE_CMD_AUTH_A, &uid, 256));
+    TEST_ASSERT_FALSE(pn532_14443_authenticate(&pn532, key, PN532_MIFARE_CMD_READ, &uid, 4));
+    uid.uid_length = 5;
+    TEST_ASSERT_FALSE(pn532_14443_authenticate(&pn532, key, PN532_MIFARE_CMD_AUTH_B, &uid, 4));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+    uid.uid_length = 4;
+    TEST_ASSERT_TRUE(pn532_14443_authenticate(&pn532, key, PN532_MIFARE_CMD_AUTH_B, &uid, 255));
+
+    /* A listed target with a UID that is neither single, double nor triple size. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.card_uid_len = 5;
+    pn532_poll_status_t status;
+    TEST_ASSERT_NULL(pn532_14443_get_all_uids_ex(&pn532, &status));
+    TEST_ASSERT_EQUAL(PN532_POLL_PROTOCOL_ERROR, status);
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.card_uid_len        = 7;
+    pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(&pn532, &status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(7, uids->uids[0].uid_length);
+    free(uids);
+
+    /* A record without payload storage is not built. */
+    pn532_ndef_record_t rec;
+    uint8_t             type_buf[16];
+    TEST_ASSERT_FALSE(pn532_ndef_make_mime_record(&rec, "a/b", NULL, 4, type_buf, sizeof(type_buf)));
+    TEST_ASSERT_FALSE(pn532_ndef_make_external_record(&rec, "a.b:c", NULL, 4, type_buf, sizeof(type_buf)));
+    TEST_ASSERT_TRUE(pn532_ndef_make_mime_record(&rec, "a/b", NULL, 0, type_buf, sizeof(type_buf)));
+    TEST_ASSERT_TRUE(pn532_ndef_make_external_record(&rec, "a.b:c", NULL, 0, type_buf, sizeof(type_buf)));
 }

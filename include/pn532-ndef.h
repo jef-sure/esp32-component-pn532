@@ -48,6 +48,7 @@ typedef enum
     PN532_NDEF_ERR_CARD_FULL        = -8,
     PN532_NDEF_ERR_UNSUPPORTED      = -9,
     PN532_NDEF_ERR_ACCESS_DENIED    = -10, /**< The NDEF data is read protected. */
+    PN532_NDEF_ERR_READ_ONLY        = -11, /**< The capability container does not grant write access. */
 } pn532_ndef_result_t;
 
 /** @brief NDEF record descriptor referencing storage owned by pn532_ndef_message_parsed_t. */
@@ -160,11 +161,11 @@ bool pn532_ndef_make_text_record(pn532_ndef_record_t *rec, const char *lang_code
 bool pn532_ndef_make_uri_record(pn532_ndef_record_t *rec, const char *uri, bool abbreviate, uint8_t *payload_buf,
                                 size_t payload_buf_len);
 
-/** @brief Build a MIME record with caller-owned type buffer and payload storage. */
+/** @brief Build a MIME record with caller-owned type buffer and payload storage. data may be NULL only with data_len 0. */
 bool pn532_ndef_make_mime_record(pn532_ndef_record_t *rec, const char *mime_type, const uint8_t *data, size_t data_len,
                                  uint8_t *type_buf, size_t type_buf_len);
 
-/** @brief Build an external-type record with caller-owned type buffer and payload storage. */
+/** @brief Build an external-type record with caller-owned type buffer and payload storage. data may be NULL only with data_len 0. */
 bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_name, const uint8_t *data,
                                      size_t data_len, uint8_t *type_buf, size_t type_buf_len);
 
@@ -179,7 +180,14 @@ bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_
  * The tag must be NDEF formatted. The helper reads the capability container
  * (page 3) and keeps the write inside the data area it describes
  * (pages 4 .. 3 + CC[2] * 2), so the lock and configuration pages behind it
- * are never written, whatever max_blocks says.
+ * are never written, whatever max_blocks says. A tag whose capability
+ * container does not grant write access (byte 3 other than 00h) is refused.
+ *
+ * Lock Control and Memory Control TLVs at the start of the data area (an
+ * NTAG213/215/216 has a 5-byte Lock Control TLV in page 4) are kept: the NDEF
+ * TLV is written behind them, so the message has that many bytes less. Lock
+ * or reserved bytes they place inside the pages to write are not skipped;
+ * such a layout is refused.
  *
  * @param start_block First page to write; 4 for a tag whose data area holds
  *                    only the NDEF message. Pages 0..3 (UID, lock bytes,
@@ -191,11 +199,16 @@ bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_
  * @return PN532_NDEF_OK on success;
  *         PN532_NDEF_ERR_INVALID_PARAM for start_block below 4, a non-positive
  *         max_blocks, or a message that cannot be encoded;
- *         PN532_NDEF_ERR_UNSUPPORTED for a block_size other than 4;
+ *         PN532_NDEF_ERR_UNSUPPORTED for a block_size other than 4, for lock
+ *         or reserved bytes inside the pages to write, or for more than six
+ *         control TLVs;
  *         PN532_NDEF_ERR_CARD_FULL when the message needs more than max_blocks
  *         pages, does not fit the data area, or is longer than 65534 bytes;
- *         PN532_NDEF_ERR_READ_FAILED when the capability container cannot be
- *         read; PN532_NDEF_ERR_NO_NDEF when the tag has none;
+ *         PN532_NDEF_ERR_READ_FAILED when the capability container or the
+ *         start of the data area cannot be read; PN532_NDEF_ERR_NO_NDEF when
+ *         the tag has no capability container; PN532_NDEF_ERR_READ_ONLY when
+ *         it does not grant write access; PN532_NDEF_ERR_PARSE_FAILED for a
+ *         malformed control TLV;
  *         PN532_NDEF_ERR_WRITE_FAILED when a page write fails.
  */
 pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn532_ndef_message_t *msg, int start_block,
@@ -214,7 +227,11 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
  * directory with a wrong CRC is treated as absent. For Type 4 tags a
  * read-protected NDEF file is PN532_NDEF_ERR_ACCESS_DENIED; an unknown
  * mapping version or an extended NDEF file (Extended NDEF File Control TLV,
- * files above 32 KB) is PN532_NDEF_ERR_UNSUPPORTED.
+ * files above 32 KB) is PN532_NDEF_ERR_UNSUPPORTED; a capability container
+ * with CCLEN below 15 or MLe below 000Fh is PN532_NDEF_ERR_PARSE_FAILED.
+ *
+ * A session that is open on another card is switched to @p uid first, so with
+ * two cards in the field the helper never reads the card selected before.
  *
  * @param pn532 Active PN532 device.
  * @param uid Target returned by pn532_14443_get_all_uids().
