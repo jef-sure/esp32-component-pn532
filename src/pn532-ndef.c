@@ -2,7 +2,7 @@
  * @file pn532-ndef.c
  * @brief NDEF read/parse for cards selected through the PN532.
  *
- * Adapted from the jef-sure pn5180 NDEF implementation. Supports Type 1/2
+ * Adapted from the jef-sure pn5180 NDEF implementation. Supports Type 2
  * (Ultralight, NTAG), Mifare Classic NDEF mapping, and Type 4 (DESFire/
  * ISO-DEP) via the PN532's built-in T=CL handler.
  */
@@ -1433,16 +1433,22 @@ static pn532_ndef_result_t ndef_read_type4(pn532_t *pn532, pn532_ndef_message_pa
     uint16_t mle            = ((uint16_t)cc[3] << 8) | cc[4];
     uint8_t  ndef_fid_be[2] = {cc[9], cc[10]};
     uint16_t max_ndef_size  = ((uint16_t)cc[11] << 8) | cc[12];
-    if (cc[7] != 0x04 || cc[8] != 0x06 || max_ndef_size < 2) {
-        ESP_LOGD(TAG, "T4: bad CC TLV (T=%02X L=%02X)", cc[7], cc[8]);
-        return PN532_NDEF_ERR_PARSE_FAILED;
-    }
-    /* Mapping versions 1.x to 3.x share this capability container layout; a
-     * higher major version may not. */
+    /* Mapping versions 1.x to 3.x describe the NDEF file with the NDEF File
+     * Control TLV (04h) read here; a higher major version may not. */
     uint8_t mapping_major = (uint8_t)(cc[2] >> 4);
     if (mapping_major < 1 || mapping_major > 3) {
         ESP_LOGD(TAG, "T4: unsupported mapping version %02X", cc[2]);
         return PN532_NDEF_ERR_UNSUPPORTED;
+    }
+    /* A mapping 3.x tag may carry the Extended NDEF File Control TLV (06h)
+     * instead: 4-byte file size and NDEF length, for files above 32 KB. */
+    if (cc[7] == 0x06) {
+        ESP_LOGD(TAG, "T4: extended NDEF file is not supported");
+        return PN532_NDEF_ERR_UNSUPPORTED;
+    }
+    if (cc[7] != 0x04 || cc[8] != 0x06 || max_ndef_size < 2) {
+        ESP_LOGD(TAG, "T4: bad CC TLV (T=%02X L=%02X)", cc[7], cc[8]);
+        return PN532_NDEF_ERR_PARSE_FAILED;
     }
     /* Read access 00h means free access; anything else needs a security
      * setup this driver does not do. */

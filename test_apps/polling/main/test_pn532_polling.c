@@ -1965,15 +1965,20 @@ TEST_CASE("Ultralight family members are told apart on the selected card", "[pn5
         TEST_ASSERT_EQUAL_HEX8(0x1A, mock.exchange_params[1][0]);
     }
 
-    /* Without a selected card only the SAK is used. */
-    sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
-    pn532.inListedTag = 0;
-    pn532_uid_t uid   = polled_uid;
-    TEST_ASSERT_TRUE(
-        pn532_14443_detect_selected_card_type_and_capacity(&pn532, &uid, &blocks, &block_size, &needs_reselect));
-    TEST_ASSERT_EQUAL(PN532_MIFARE_ULTRALIGHT, uid.subtype);
-    TEST_ASSERT_FALSE(needs_reselect);
-    TEST_ASSERT_EQUAL(0, mock.command_count);
+    /* Without a selected card only the SAK is used: no target listed, or
+     * listed (as after a poll) but without an open session. */
+    for (int listed = 0; listed < 2; listed++) {
+        sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+        mock.sim_version     = ntag215;
+        pn532.inListedTag    = (uint8_t)listed;
+        pn532.session_opened = false;
+        pn532_uid_t uid      = polled_uid;
+        TEST_ASSERT_TRUE(
+            pn532_14443_detect_selected_card_type_and_capacity(&pn532, &uid, &blocks, &block_size, &needs_reselect));
+        TEST_ASSERT_EQUAL(PN532_MIFARE_ULTRALIGHT, uid.subtype);
+        TEST_ASSERT_FALSE(needs_reselect);
+        TEST_ASSERT_EQUAL(0, mock.command_count);
+    }
 }
 
 TEST_CASE("capability container size does not replace a subtype the card reported", "[pn532][ndef][t2]")
@@ -2126,6 +2131,8 @@ TEST_CASE("Type 4 NDEF read checks mapping version, read access and NLEN", "[pn5
         {2,  0x00, sizeof(sim_ndef_text), PN532_NDEF_ERR_UNSUPPORTED,   1},
         {2,  0x10, sizeof(sim_ndef_text), PN532_NDEF_OK,                3},
         {13, 0x80, sizeof(sim_ndef_text), PN532_NDEF_ERR_ACCESS_DENIED, 1},
+        {7,  0x06, sizeof(sim_ndef_text), PN532_NDEF_ERR_UNSUPPORTED,   1}, /* Extended NDEF File Control TLV */
+        {7,  0x05, sizeof(sim_ndef_text), PN532_NDEF_ERR_PARSE_FAILED,  1},
         {0,  0,    31,                    PN532_NDEF_ERR_PARSE_FAILED,  2},
         {0,  0,    0,                     PN532_NDEF_ERR_NO_NDEF,       2},
     };

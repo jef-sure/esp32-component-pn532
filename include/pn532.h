@@ -584,8 +584,8 @@ bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *block
  * GET_VERSION tells Ultralight EV1 and NTAG210/212/213/215/216 apart and
  * gives the page count; a card without GET_VERSION that answers AUTHENTICATE
  * (1Ah) with a challenge is an Ultralight C (44 readable pages), any other is
- * an original Ultralight. Without a selected card only the SAK result is
- * returned.
+ * an original Ultralight. Without a selected card (no open target session)
+ * only the SAK result is returned.
  *
  * A refused probe resets the card to IDLE. *needs_reselect is then true and
  * the card has to be selected again with pn532_14443_select_by_uid() before

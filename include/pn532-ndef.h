@@ -6,7 +6,7 @@
  * Mirrors the surface of the jef-sure pn5180 NDEF module but talks to a PN532
  * instead. The main entry point is pn532_ndef_read_card_auto(), which selects
  * the card if needed, applies the card-type specific read policy, and returns a
- * parsed zero-copy view of the NDEF message.
+ * parsed NDEF message that owns its storage.
  */
 
 #pragma once
@@ -179,8 +179,9 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
  * 4K it also reads MAD2 when advertised, so non-NDEF cards return
  * PN532_NDEF_ERR_NO_NDEF quickly instead of falling back to a flat scan. A
  * directory with a wrong CRC is treated as absent. For Type 4 tags a
- * read-protected NDEF file is PN532_NDEF_ERR_ACCESS_DENIED and an unknown
- * mapping version PN532_NDEF_ERR_UNSUPPORTED.
+ * read-protected NDEF file is PN532_NDEF_ERR_ACCESS_DENIED; an unknown
+ * mapping version or an extended NDEF file (Extended NDEF File Control TLV,
+ * files above 32 KB) is PN532_NDEF_ERR_UNSUPPORTED.
  *
  * @param pn532 Active PN532 device.
  * @param uid Target returned by pn532_14443_get_all_uids().

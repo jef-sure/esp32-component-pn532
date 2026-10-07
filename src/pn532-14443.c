@@ -116,8 +116,10 @@ bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *block
 
 /*
  * Tells the Ultralight family members apart on the selected card. The probes
- * go through InCommunicateThru: InDataExchange would take 0x60 for a MIFARE
- * Classic authentication.
+ * go through InCommunicateThru: InDataExchange takes 0x60 for a MIFARE
+ * Classic authentication (UM0701-02 §7.3.8). A card that refuses a probe
+ * stays silent, and the PN532 gives up after fRetryTimeout (51.2 ms by
+ * default) without a retry (MaxRtyCOM defaults to 0).
  */
 static void pn532_14443_detect_ultralight_variant(pn532_t *pn532, pn532_uid_t *uid, bool *needs_reselect)
 {
@@ -198,7 +200,9 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
     if (!pn532_14443_detect_card_type_and_capacity(uid, blocks_count, block_size)) {
         return false;
     }
-    if (pn532 != NULL && uid->subtype == PN532_MIFARE_ULTRALIGHT && pn532->inListedTag != 0) {
+    /* The probes are raw exchanges with whatever card is active (UM0701-02
+     * §7.3.9 leaves the selection to the host), so the card must be selected. */
+    if (pn532 != NULL && uid->subtype == PN532_MIFARE_ULTRALIGHT && pn532->inListedTag != 0 && pn532->session_opened) {
         pn532_14443_detect_ultralight_variant(pn532, uid, needs_reselect);
         *blocks_count = uid->blocks_count;
         *block_size   = uid->block_size;

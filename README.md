@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.0"
+idf.py add-dependency "jef-sure/pn532^0.7.1"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -171,7 +171,7 @@ Behavior by card family:
 
 - Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed. A tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after that one read; the scan never leaves the data area the container describes.
 - MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `PN532_NDEF_ERR_NO_NDEF`, and so does a directory whose CRC does not match its content. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
-- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in MLe-sized chunks (capped at 250 bytes). A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file `PN532_NDEF_ERR_PARSE_FAILED`.
+- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in chunks of MLe − 2 bytes (at most 248). A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x or an extended NDEF file (above 32 KB) `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file `PN532_NDEF_ERR_PARSE_FAILED`.
 
 The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `pn532_ndef_parse_message()`; the returned record storage remains valid until `pn532_ndef_free_parsed_message()`.
 
@@ -259,7 +259,7 @@ Notes:
 - Before reading a discovered card, select it with `pn532_14443_select_by_uid()`. After a selected-card operation, finish with `pn532_release_target()` followed by `pn532_set_rf_off()`.
 - `pn532_14443_select_by_uid()` is the right way to reacquire a card after an auth or read failure.
 - `pn532_14443_detect_card_type_and_capacity()` is a metadata helper that updates `uid->subtype`, `uid->blocks_count`, and `uid->block_size` in place.
-- `pn532_14443_detect_selected_card_type_and_capacity()` additionally asks a selected SAK `0x00` card what it is: GET_VERSION tells Ultralight EV1 and NTAG210/212/213/215/216 apart, and a card without GET_VERSION that answers AUTHENTICATE (`1A`) with a challenge is an Ultralight C. A refused probe resets the card, so when `needs_reselect` comes back `true`, call `pn532_14443_select_by_uid()` before the next exchange. An SAK that is not listed but has the ISO14443-4 bit (`0x20`) set, such as `0x60`, is reported as `PN532_MIFARE_DESFIRE` by both helpers.
+- `pn532_14443_detect_selected_card_type_and_capacity()` additionally asks a SAK `0x00` card what it is, provided the card is selected (`pn532_14443_select_by_uid()`): GET_VERSION tells Ultralight EV1 and NTAG210/212/213/215/216 apart, and a card without GET_VERSION that answers AUTHENTICATE (`1A`) with a challenge is an Ultralight C. A refused probe resets the card, so when `needs_reselect` comes back `true`, call `pn532_14443_select_by_uid()` before the next exchange. An SAK that is not listed but has the ISO14443-4 bit (`0x20`) set, such as `0x60`, is reported as `PN532_MIFARE_DESFIRE` by both helpers.
 
 ### Read MIFARE Classic blocks
 

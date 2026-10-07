@@ -1,5 +1,13 @@
 # Changelog
 
+## v 0.7.1 - 2026-10-07
+
+Fixes from a check of 0.7.0 against UM0701-02, the NXP reader library (`phalTop`, `phacDiscLoop`) and the MIFARE Ultralight datasheets.
+
+- `pn532_14443_detect_selected_card_type_and_capacity()` probes the Ultralight family only while a target session is open. InCommunicateThru talks to whatever card is active (UM0701-02 §7.3.9 leaves the selection to the host), so after a poll with two cards the probe could reach the other card. A card that is listed but not selected now gets the SAK result only.
+- Type 4: a capability container with the Extended NDEF File Control TLV (`06`, mapping 3.x, files above 32 KB) is `PN532_NDEF_ERR_UNSUPPORTED`; it was `PN532_NDEF_ERR_PARSE_FAILED`. The mapping version is checked before the TLV.
+- Documentation: the Type 4 chunk size is MLe − 2, at most 248 bytes (the README said 250); `pn532-ndef.c` no longer claims Type 1 support.
+
 ## v 0.7.0 - 2026-10-07
 
 This release brings over what the PN5180 component gained in its 0.2.0 to 0.4.3 releases.
