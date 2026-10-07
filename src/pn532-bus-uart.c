@@ -362,6 +362,9 @@ pn532_bus_t *pn532_uart_init(uart_port_t uart_num, gpio_num_t tx, gpio_num_t rx,
     return &uart_bus->base;
 }
 
+/* Response timeout of SetSerialBaudRate when the device has none configured. */
+#define PN532_UART_BAUD_CHANGE_TIMEOUT_MS 500
+
 bool pn532_uart_set_baud_rate(pn532_t *pn532, uint32_t baud_rate)
 {
     static const uint8_t ack[] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
@@ -382,7 +385,15 @@ bool pn532_uart_set_baud_rate(pn532_t *pn532, uint32_t baud_rate)
         return false;
     }
 
-    if (!pn532_execute_command(pn532, PN532_COMMAND_SETSERIALBAUDRATE, code, 1, NULL, NULL, pn532->timeout_ms)) {
+    /* A zero timeout means "wait without limit" to pn532_execute_command();
+     * this command is answered at once, so it never needs that. */
+    uint16_t timeout = pn532->timeout_ms != 0 ? pn532->timeout_ms : PN532_UART_BAUD_CHANGE_TIMEOUT_MS;
+    if (!pn532_execute_command(pn532, PN532_COMMAND_SETSERIALBAUDRATE, code, 1, NULL, NULL, timeout)) {
+        /* The PN532 switches when it gets a host ACK after its response
+         * (UM0701-02 §7.2.8, fig. 53). If the response was sent but lost on
+         * the line, the ACK of the abort procedure is that ACK: the module
+         * may be on the new rate although the command failed here. */
+        ESP_LOGW(TAG, "pn532_uart_set_baud_rate: command failed, the module may be on either rate");
         return false;
     }
 

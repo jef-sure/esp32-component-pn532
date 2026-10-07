@@ -44,7 +44,7 @@ typedef enum
     PN532_NDEF_ERR_WRITE_FAILED     = -4,
     PN532_NDEF_ERR_NO_NDEF          = -5,
     PN532_NDEF_ERR_PARSE_FAILED     = -6,
-    PN532_NDEF_ERR_BUFFER_TOO_SMALL = -7,
+    PN532_NDEF_ERR_BUFFER_TOO_SMALL = -7, /**< Reserved: not returned by the current API. */
     PN532_NDEF_ERR_CARD_FULL        = -8,
     PN532_NDEF_ERR_UNSUPPORTED      = -9,
     PN532_NDEF_ERR_ACCESS_DENIED    = -10, /**< The NDEF data is read protected. */
@@ -138,6 +138,10 @@ void pn532_ndef_record_init(pn532_ndef_record_t *rec, pn532_ndef_tnf_t tnf, cons
  * @brief Encode an NDEF message into binary format.
  *
  * If out is NULL or out_len is 0, returns the required output size.
+ *
+ * @return Number of bytes written; 0 when out_len is smaller than the encoded
+ *         message, when a record has a length without a buffer, or when msg
+ *         is NULL. An empty message also encodes to 0 bytes.
  */
 size_t pn532_ndef_encode_message(const pn532_ndef_message_t *msg, uint8_t *out, size_t out_len);
 
@@ -207,7 +211,13 @@ bool pn532_ndef_extract_text(const pn532_ndef_record_t *rec, const uint8_t **tex
 
 /**
  * @brief Expand a Well-known URI ("U") record into a full URI string.
- * @return total expanded URI length (may exceed @p uri_buf_len; truncates if so), 0 on error.
+ *
+ * uri_buf always receives a NUL-terminated string when uri_buf_len > 0; pass
+ * NULL to query the length only.
+ *
+ * @return total expanded URI length without the terminating NUL (it may
+ *         exceed uri_buf_len - 1, in which case the string is truncated),
+ *         0 on error.
  */
 size_t pn532_ndef_extract_uri(const pn532_ndef_record_t *rec, char *uri_buf, size_t uri_buf_len);
 
@@ -229,7 +239,12 @@ bool pn532_ndef_record_is_smartposter(const pn532_ndef_record_t *rec);
  * @param rec Smart Poster record.
  * @param records Output array supplied by the caller.
  * @param capacity Number of elements available in records.
- * @return Number of nested records decoded, or 0 on parse failure.
+ * The payload must be a well-formed NDEF message (MB on the first record, ME
+ * on the last, nothing after it). The records point into rec->payload, so a
+ * Smart Poster with chunked nested records is not supported.
+ *
+ * @return Number of nested records decoded (at most capacity), or 0 when the
+ *         payload is malformed or chunked.
  */
 size_t pn532_ndef_decode_smartposter(const pn532_ndef_record_t *rec, pn532_ndef_record_t *records, size_t capacity);
 

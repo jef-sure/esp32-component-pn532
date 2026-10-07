@@ -70,7 +70,12 @@ bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_
  */
 int pn532_mifare_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, size_t buffer_len);
 
-/** @brief Read and validate a MIFARE Classic value block. */
+/**
+ * @brief Read and validate a MIFARE Classic value block.
+ *
+ * @return true with *value set; false when the read fails or the block is not
+ *         a well-formed value block, in which case *value is left unchanged.
+ */
 bool pn532_mifare_value_read(pn532_t *pn532, uint8_t blockno, int32_t *value);
 
 /** @brief Encode and write a MIFARE Classic value block. */

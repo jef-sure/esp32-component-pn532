@@ -62,6 +62,10 @@ static void IRAM_ATTR pn532_spi_pre_transfer(spi_transaction_t *trans)
     pn532_spi_bus_t *bus = (pn532_spi_bus_t *)trans->user;
     if (bus != NULL) {
         gpio_ll_set_level(&GPIO, bus->nss, 0);
+        /* NSS setup time before the first clock edge. The PN532 documents
+         * give no minimum outside Power Down (that wake-up is the 2 ms pulse
+         * of pn532_spi_bus_wake()); 100 us is the value this driver has been
+         * run with on hardware since its first version. */
         esp_rom_delay_us(100);
     }
 }

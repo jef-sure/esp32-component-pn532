@@ -69,6 +69,8 @@ struct mock_bus_t
     uint8_t        *sim_memory;    /* Type 2 pages or Classic blocks */
     size_t          sim_units;     /* number of pages / blocks in sim_memory */
     size_t          sim_reads;     /* READ commands the card answered */
+    size_t          sim_fail_read; /* Classic: this READ (1-based) gets no answer; 0 for none */
+    size_t          sim_read_tries;
     const uint8_t  *sim_version;   /* Type 2: 8-byte GET_VERSION answer, NULL when not supported */
     bool            sim_ulc;       /* Type 2: answers AUTHENTICATE (1Ah) like an Ultralight C */
     const uint8_t  *sim_cc_file;   /* Type 4: capability container file (15 bytes) */
@@ -1725,6 +1727,10 @@ static size_t sim_classic_card(mock_bus_t *mock, uint8_t command, const uint8_t 
         return 1;
     }
     if (request_len == 3 && request[1] == PN532_MIFARE_CMD_READ && request[2] < mock->sim_units) {
+        if (++mock->sim_read_tries == mock->sim_fail_read) {
+            response[0] = 0x13; /* framing error: the card dropped back to IDLE */
+            return 1;
+        }
         response[0] = 0x00;
         memcpy(&response[1], &mock->sim_memory[(size_t)request[2] * 16], 16);
         mock->sim_reads++;
@@ -2084,6 +2090,18 @@ TEST_CASE("MIFARE Classic NDEF is read through a MAD with a valid CRC only", "[p
     TEST_ASSERT_EQUAL(1, msg->record_count);
     pn532_ndef_free_parsed_message(msg);
 
+    /* A read that fails once is repeated from a freshly listed card. The
+     * fourth READ is the first data block of the NDEF sector. */
+    sim_init(&mock, &pn532, sim_classic_card, send_buf, recv_buf);
+    mock.sim_memory    = memory;
+    mock.sim_units     = 64;
+    mock.sim_fail_read = 4;
+    msg                = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NOT_NULL(msg);
+    pn532_ndef_free_parsed_message(msg);
+    TEST_ASSERT_EQUAL(7, mock.sim_reads);
+
     /* A directory whose CRC does not match its content is treated as absent:
      * only the trailer and the two MAD blocks are read. */
     mad[0] ^= 0x01;
@@ -2161,6 +2179,30 @@ TEST_CASE("Type 4 NDEF read checks mapping version, read access and NLEN", "[pn5
         }
     }
     TEST_ASSERT_EQUAL_STRING("NDEF data is read protected", pn532_ndef_result_to_string(PN532_NDEF_ERR_ACCESS_DENIED));
+}
+
+TEST_CASE("Smart Poster payload must be a well-formed NDEF message", "[pn532][ndef][smartposter]")
+{
+    /* URI record "U" 0x04 "a.b" (MB, SR) followed by a Text record "T" (ME, SR). */
+    uint8_t nested[] = {0x91, 0x01, 0x04, 'U', 0x04, 'a', '.', 'b', 0x51, 0x01, 0x04, 'T', 0x02, 'e', 'n', 'a'};
+    pn532_ndef_record_t poster;
+    pn532_ndef_record_t records[4];
+
+    pn532_ndef_record_init(&poster, PN532_NDEF_TNF_WELL_KNOWN, PN532_NDEF_RTD_SMARTPOSTER,
+                           PN532_NDEF_RTD_SMARTPOSTER_LEN, NULL, 0, nested, sizeof(nested));
+    TEST_ASSERT_EQUAL(2, pn532_ndef_decode_smartposter(&poster, records, ARRAY_SIZE(records)));
+    TEST_ASSERT_TRUE(pn532_ndef_record_is_uri(&records[0]));
+    TEST_ASSERT_TRUE(pn532_ndef_record_is_text(&records[1]));
+    TEST_ASSERT_EQUAL(1, pn532_ndef_decode_smartposter(&poster, records, 1));
+
+    /* Cut after the first record: no Message End. */
+    poster.payload_len = 8;
+    TEST_ASSERT_EQUAL(0, pn532_ndef_decode_smartposter(&poster, records, ARRAY_SIZE(records)));
+
+    /* Second record claims Message Begin again. */
+    poster.payload_len = sizeof(nested);
+    nested[8]          = 0xD1;
+    TEST_ASSERT_EQUAL(0, pn532_ndef_decode_smartposter(&poster, records, ARRAY_SIZE(records)));
 }
 
 void app_main(void)

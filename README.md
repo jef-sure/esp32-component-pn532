@@ -2,7 +2,7 @@
 
 [![ESP Component Registry](https://components.espressif.com/components/jef-sure/pn532/badge.svg)](https://components.espressif.com/components/jef-sure/pn532/)
 
-ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read card UIDs, read and write NDEF (NTAG / Ultralight, MIFARE Classic, Type 4), and exchange APDUs with ISO14443A cards in reader mode.
+ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read card UIDs, read NDEF (NTAG / Ultralight, MIFARE Classic, Type 4), write NDEF to NTAG / Ultralight, and exchange APDUs with ISO14443A cards in reader mode.
 
 - [Quick Start](#quick-start)
 - [Choosing A Transport](#choosing-a-transport)
@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.1"
+idf.py add-dependency "jef-sure/pn532^0.7.2"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -127,7 +127,8 @@ Every transport is then used the same way: `pn532_init(bus, irq, rst)`, and fina
 
   ```c
   if (!pn532_uart_set_baud_rate(pn532, 921600)) {
-      /* Still on the previous rate; pn532_recover() re-synchronises if unsure. */
+      /* Unsupported rate or not a UART transport: nothing changed. After a failed
+       * exchange the module may be on either rate; pn532_recover() finds it. */
   }
   ```
 
@@ -575,6 +576,10 @@ if (pn532_in_communicate_thru(pn532, cmd, sizeof(cmd), rx, &rx_len, 500)) {
 ```
 
 The target must be selected first (see `pn532_14443_select_by_uid()`). Responses carrying MI (chaining) are drained and concatenated automatically; a NAD byte in the reply is stripped.
+
+### Task stack
+
+The driver keeps its frame buffers in `pn532_t`, but the exchange helpers use stack buffers of the PN532 frame size (280 bytes). Counted by buffer sizes, the deepest path — a Type 4 NDEF read — holds about 850 bytes of driver locals at once (the READ BINARY buffer plus the request and response buffers of `InDataExchange`), and selecting a card about 300. Logging and the bus drivers add their own share. Size the stack of the task that calls the driver with that in mind; the figures are not measured high-water marks.
 
 ### Ownership and lifetime
 

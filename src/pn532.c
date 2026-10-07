@@ -206,7 +206,7 @@ static bool pn532_wait_ready(pn532_t *pn532, uint16_t timeout)
          * this call (an edge we never re-armed for). P70_IRQ low means a
          * response is pending (UM0701-02 §6.3); the bus check stays as a
          * fallback because IRQ is only driven once SAMConfiguration enables it.
-         * Without this pre-check xQueueReceive with timeout=0 blocks forever. */
+         * A zero timeout means no limit: the loop then ends only on readiness. */
         int64_t irq_deadline_us = esp_timer_get_time() + (int64_t)timeout * 1000;
         for (;;) {
             if (gpio_get_level(pn532->irq) == 0 || pn532_is_ready(pn532)) {

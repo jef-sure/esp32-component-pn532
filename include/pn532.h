@@ -62,7 +62,7 @@ typedef enum _pn532_nfc_subtype_t
     PN532_MIFARE_NTAG215,
     PN532_MIFARE_NTAG216,
     PN532_MIFARE_PLUS_2K,
-    PN532_MIFARE_PLUS_4K,
+    PN532_MIFARE_PLUS_4K, /**< Reserved: not reported by the detection helpers. */
     PN532_MIFARE_DESFIRE
 } __attribute__((__packed__)) pn532_nfc_type_t;
 
@@ -247,8 +247,14 @@ pn532_bus_t *pn532_uart_init(uart_port_t uart_num, gpio_num_t tx, gpio_num_t rx,
  * The setting is volatile: the PN532 returns to its power-on rate after a
  * power cycle or hard reset.
  *
+ * The PN532 answers the command at the old rate and switches when the host
+ * acknowledges that answer (UM0701-02 §7.2.8). If the exchange fails on the
+ * line, the module can be left on either rate; pn532_recover() probes the
+ * HSU rates and follows the module.
+ *
  * @return true when the PN532 accepted the rate and the host UART was switched;
- *         false for non-UART transports, unsupported rates, or command failure.
+ *         false for non-UART transports and unsupported rates (nothing was
+ *         sent), or when the exchange failed (rate uncertain, see above).
  */
 bool pn532_uart_set_baud_rate(pn532_t *pn532, uint32_t baud_rate);
 
@@ -288,9 +294,10 @@ bool pn532_reset(pn532_t *pn532);
 /**
  * @brief Fully re-initialise a wedged PN532 without recreating the transport.
  *
- * Runs the abort procedure, resets target/session state, re-applies the
- * SAM/retry runtime configuration, verifies the firmware version, and leaves
- * the RF field off. Use this instead of a pn532_deinit()/pn532_init() cycle
+ * Runs the abort procedure, resets target/session state, checks that the
+ * chip answers (GetFirmwareVersion, with a transport resync such as the HSU
+ * baud probe if it does not), re-applies the SAM/retry runtime configuration,
+ * and leaves the RF field off. Use this instead of a pn532_deinit()/pn532_init() cycle
  * after repeated ACK timeouts or transport errors.
  *
  * @return true when every recovery step succeeded.

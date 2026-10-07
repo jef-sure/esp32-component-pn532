@@ -1180,7 +1180,7 @@ static int classic_sector_block_count(int sector)
 static bool classic_auth_cb(pn532_t *pn532, int blockno, void *user_ctx)
 {
     default_auth_ctx_t *ctx = (default_auth_ctx_t *)user_ctx;
-    if (pn532->inListedTag == 0 && !pn532_14443_select_by_uid(pn532, ctx->uid)) {
+    if ((pn532->inListedTag == 0 || pn532->tg_stale) && !pn532_14443_select_by_uid(pn532, ctx->uid)) {
         ESP_LOGD(TAG, "reselect failed at blk %d", blockno);
         return false;
     }
@@ -1562,7 +1562,15 @@ pn532_ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, 
         static const uint8_t key_a_ndef[6]    = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
         default_auth_ctx_t   ctx              = {
                            .uid = uid, .primary_key = key_a_ndef, .secondary_key = key_a_default, .key_type = PN532_MIFARE_CMD_AUTH_A};
-        return classic_read_ndef_from_mad(pn532, uid, &ctx, out_msg);
+        pn532_ndef_result_t res = classic_read_ndef_from_mad(pn532, uid, &ctx, out_msg);
+        if (res == PN532_NDEF_ERR_READ_FAILED) {
+            /* One more attempt from a freshly listed card, as for the other tag types. */
+            if (!pn532_14443_select_by_uid(pn532, uid)) {
+                return res;
+            }
+            res = classic_read_ndef_from_mad(pn532, uid, &ctx, out_msg);
+        }
+        return res;
     }
 
     case PN532_MIFARE_DESFIRE: {
@@ -1704,6 +1712,11 @@ bool pn532_ndef_record_is_smartposter(const pn532_ndef_record_t *rec)
 size_t pn532_ndef_decode_smartposter(const pn532_ndef_record_t *rec, pn532_ndef_record_t *records, size_t capacity)
 {
     if (!pn532_ndef_record_is_smartposter(rec) || rec->payload == NULL || rec->payload_len == 0) {
+        return 0;
+    }
+    /* Same structural rules as for a message read from a card. */
+    ndef_decode_plan_t plan;
+    if (!ndef_plan_decode(rec->payload, rec->payload_len, &plan) || plan.has_chunks) {
         return 0;
     }
     return ndef_decode_message(rec->payload, rec->payload_len, records, capacity);

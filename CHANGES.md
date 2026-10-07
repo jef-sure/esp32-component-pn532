@@ -1,5 +1,14 @@
 # Changelog
 
+## v 0.7.2 - 2026-10-07
+
+Fixes from an external review of 0.7.1.
+
+- `pn532_uart_set_baud_rate()`: a device with `timeout_ms` set to 0 no longer waits without limit for the answer; 500 ms is used instead. The documented contract is corrected: after a failed exchange the module can be on either rate, because the host ACK of the abort procedure is the ACK that makes the PN532 switch (UM0701-02 §7.2.8, fig. 53) when its response was sent but lost on the line. The README said "still on the previous rate". `pn532_recover()` finds the module in both cases.
+- `pn532_ndef_decode_smartposter()` applies the rules of the message parser to the nested message: a payload without Message End, with a second Message Begin, or with data after the last record returns 0 instead of the records decoded so far. Chunked nested records return 0 as well.
+- MIFARE Classic NDEF: a failed read is repeated once from a freshly listed card, as for Type 2 and Type 4; a sector authentication re-lists a card whose target number is stale.
+- Documentation: the README introduction no longer promises NDEF writing for MIFARE Classic and Type 4 (it exists for NTAG / Ultralight only); `pn532_recover()` in `pn532.h` lists its steps in the order the code runs them; new README section on task stack use; return value contracts of `pn532_ndef_encode_message()`, `pn532_ndef_extract_uri()` and `pn532_mifare_value_read()` spelled out; `PN532_MIFARE_PLUS_4K` and `PN532_NDEF_ERR_BUFFER_TOO_SMALL` marked as reserved; comments on the zero-timeout wait and on the SPI NSS setup time corrected.
+
 ## v 0.7.1 - 2026-10-07
 
 Fixes from a check of 0.7.0 against UM0701-02, the NXP reader library (`phalTop`, `phacDiscLoop`) and the MIFARE Ultralight datasheets.
