@@ -106,7 +106,8 @@ typedef struct
  *
  * @param raw_data Encoded NDEF message bytes (without a TLV or NLEN prefix).
  * @param raw_data_len Number of encoded bytes.
- * @param out_msg Receives an allocation released by pn532_ndef_free_parsed_message().
+ * @param out_msg Receives an allocation released by pn532_ndef_free_parsed_message();
+ *                set to NULL on any error.
  * @return PN532_NDEF_OK or an NDEF error code.
  */
 pn532_ndef_result_t pn532_ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len,
@@ -139,9 +140,15 @@ void pn532_ndef_record_init(pn532_ndef_record_t *rec, pn532_ndef_tnf_t tnf, cons
  *
  * If out is NULL or out_len is 0, returns the required output size.
  *
+ * A record the parser of this driver would refuse is not encoded: an Empty
+ * record (PN532_NDEF_TNF_EMPTY) with a type, ID or payload, an Unknown record
+ * (PN532_NDEF_TNF_UNKNOWN) with a type, and the TNF values
+ * PN532_NDEF_TNF_UNCHANGED and PN532_NDEF_TNF_RESERVED.
+ *
  * @return Number of bytes written; 0 when out_len is smaller than the encoded
- *         message, when a record has a length without a buffer, or when msg
- *         is NULL. An empty message also encodes to 0 bytes.
+ *         message, when a record has a length without a buffer or is one of
+ *         the records above, or when msg is NULL. An empty message also
+ *         encodes to 0 bytes.
  */
 size_t pn532_ndef_encode_message(const pn532_ndef_message_t *msg, uint8_t *out, size_t out_len);
 
@@ -168,6 +175,28 @@ bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_
  * intended for already selected Type 2 / NTAG style memory-mapped tags.
  * MIFARE Classic is intentionally not supported here because a correct writer
  * must authenticate sector-by-sector and skip sector trailers / MAD updates.
+ *
+ * The tag must be NDEF formatted. The helper reads the capability container
+ * (page 3) and keeps the write inside the data area it describes
+ * (pages 4 .. 3 + CC[2] * 2), so the lock and configuration pages behind it
+ * are never written, whatever max_blocks says.
+ *
+ * @param start_block First page to write; 4 for a tag whose data area holds
+ *                    only the NDEF message. Pages 0..3 (UID, lock bytes,
+ *                    capability container) are refused.
+ * @param block_size Page size in bytes; only 4 is supported.
+ * @param max_blocks Number of pages the message may take, counted from
+ *                   start_block (not a page number and not the size of the
+ *                   tag). Must be positive.
+ * @return PN532_NDEF_OK on success;
+ *         PN532_NDEF_ERR_INVALID_PARAM for start_block below 4, a non-positive
+ *         max_blocks, or a message that cannot be encoded;
+ *         PN532_NDEF_ERR_UNSUPPORTED for a block_size other than 4;
+ *         PN532_NDEF_ERR_CARD_FULL when the message needs more than max_blocks
+ *         pages, does not fit the data area, or is longer than 65534 bytes;
+ *         PN532_NDEF_ERR_READ_FAILED when the capability container cannot be
+ *         read; PN532_NDEF_ERR_NO_NDEF when the tag has none;
+ *         PN532_NDEF_ERR_WRITE_FAILED when a page write fails.
  */
 pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn532_ndef_message_t *msg, int start_block,
                                                       int block_size, int max_blocks);

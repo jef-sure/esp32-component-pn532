@@ -1,0 +1,16 @@
+name: Host tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The tests need only the Unity sources, not an ESP-IDF checkout.
+      - name: Fetch Unity
+        run: git clone --depth 1 --branch v2.6.0 https://github.com/ThrowTheSwitch/Unity.git "$RUNNER_TEMP/unity"
+      - name: Run host tests
+        run: make -C host_test test UNITY_DIR="$RUNNER_TEMP/unity/src"

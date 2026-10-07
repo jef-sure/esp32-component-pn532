@@ -65,3 +65,4 @@ host_test/build/
 test_apps/*/sdkconfig
 test_apps/*/sdkconfig.old
 test_apps/*/dependencies.lock
+test_apps/hardware/

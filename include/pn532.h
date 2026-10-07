@@ -31,8 +31,14 @@ extern "C" {
 /** @brief Default HSU baud rate used when uart_init() receives a non-positive baud. */
 #define PN532_UART_DEFAULT_BAUD_RATE (115200)
 
+/** @brief Highest I2C clock of the PN532 (UM0701-02 §6.1.1.3); a higher request is lowered to it. */
+#define PN532_I2C_MAX_CLOCK_HZ (400000)
+
 /** @brief SPI clock used when pn532_spi_init()/pn532_spi_attach() receive a non-positive clock. */
 #define PN532_SPI_DEFAULT_CLOCK_HZ (1000000)
+
+/** @brief Highest SPI clock of the PN532 (UM0701-02 §6.1.1.1); a higher request is lowered to it. */
+#define PN532_SPI_MAX_CLOCK_HZ (5000000)
 
 /** @brief ACK timeout in milliseconds applied by pn532_execute_command(). */
 #define PN532_ACK_TIMEOUT_MS (50)
@@ -171,7 +177,8 @@ void pn532_delay_ms(int ms);
  * @param miso SPI MISO GPIO used when initialising the host bus.
  * @param mosi SPI MOSI GPIO used when initialising the host bus.
  * @param nss SPI chip-select GPIO for the PN532 device.
- * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ.
+ * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ,
+ *                       more than PN532_SPI_MAX_CLOCK_HZ is lowered to it.
  * @return Newly allocated transport handle, or NULL on failure.
  */
 pn532_bus_t *pn532_spi_init(         //
@@ -187,12 +194,16 @@ pn532_bus_t *pn532_spi_init(         //
  * @brief Attach a PN532 to an SPI host bus already initialised by the application.
  *
  * The bus stays owned by the caller: pn532_bus_destroy() removes only the
- * PN532 device and never calls spi_bus_free().
+ * PN532 device and never calls spi_bus_free(). The bus must carry a whole
+ * PN532 frame in one transaction: initialise it with max_transfer_sz of at
+ * least PN532_MAX_BUF_SIZE (a bus without DMA is limited to 64 bytes).
  *
  * @param host_id Initialised SPI host.
  * @param nss SPI chip-select GPIO for the PN532 device.
- * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ.
- * @return Newly allocated transport handle, or NULL when the host is not initialised or on failure.
+ * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ,
+ *                       more than PN532_SPI_MAX_CLOCK_HZ is lowered to it.
+ * @return Newly allocated transport handle, or NULL when the host is not initialised, its
+ *         transactions are too short, or on failure.
  */
 pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz);
 
@@ -201,7 +212,8 @@ pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clo
  *
  * The function creates an ESP-IDF I2C master bus and attaches the PN532 as a
  * device on it. If device_address is 0, PN532_I2C_DEFAULT_ADDRESS is used; if
- * clock_speed_hz is 0, PN532_I2C_DEFAULT_CLOCK_HZ is used.
+ * clock_speed_hz is 0, PN532_I2C_DEFAULT_CLOCK_HZ is used, and more than
+ * PN532_I2C_MAX_CLOCK_HZ is lowered to it.
  * The returned handle is heap-allocated and owned by the caller.
  *
  * @return Newly allocated transport handle, or NULL on failure.
@@ -222,7 +234,8 @@ pn532_bus_t *pn532_i2c_init(       //
  * stays owned by the caller: pn532_bus_destroy() removes only the PN532
  * device and never deletes the bus. If device_address is 0,
  * PN532_I2C_DEFAULT_ADDRESS is used; if clock_speed_hz is 0,
- * PN532_I2C_DEFAULT_CLOCK_HZ is used.
+ * PN532_I2C_DEFAULT_CLOCK_HZ is used, and more than PN532_I2C_MAX_CLOCK_HZ is
+ * lowered to it.
  *
  * @return Newly allocated transport handle, or NULL when no bus exists on port or on failure.
  */
@@ -308,7 +321,8 @@ bool pn532_recover(pn532_t *pn532);
  * @brief Read the PN532 firmware identifier.
  *
  * The packed return value is PN532's four response bytes in big-endian order:
- * IC, version, revision, support.
+ * IC, version, revision, support. The IC byte of a PN532 is 0x32; an answer
+ * with another IC is a failure.
  *
  * @return Packed firmware identifier, or 0 on failure.
  */
@@ -328,7 +342,7 @@ typedef struct
     struct
     {
         uint8_t tg;    /**< Logical target number. */
-        uint8_t br_rx; /**< Reception baud rate (0x00 = 106 kbps, 0x01 = 212, 0x02 = 424, 0x03 = 847). */
+        uint8_t br_rx; /**< Reception baud rate (0x00 = 106 kbps, 0x01 = 212, 0x02 = 424). */
         uint8_t br_tx; /**< Transmission baud rate, same encoding as br_rx. */
         uint8_t type;  /**< Modulation type (0x00 = ISO/IEC 14443-3A / MIFARE). */
     } targets[2];      /**< Per-target entries; valid for indexes < targets_count. */
@@ -472,9 +486,9 @@ bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *param
  * DEP/MIFARE-wrapped pn532_in_data_exchange(), this helper forwards @p data
  * verbatim over the RF interface: the firmware sends the bits as-is and
  * returns the raw target reply. Use it for non-standard cards and commands
- * outside the MIFARE / ISO14443-4 tables. The response status byte is checked
- * against ERROR_MASK; MI-chained raw replies are drained and concatenated the
- * same way as pn532_in_data_exchange().
+ * outside the MIFARE / ISO14443-4 tables. The response status byte is an
+ * error code only: the command does no chaining (UM0701-02 §7.3.9), so one
+ * call is one exchange.
  *
  * @param pn532 Device context.
  * @param data Raw bytes to transmit over RF.
@@ -528,6 +542,11 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532);
  * RATS switched off, as the NXP reference stack does for its MIFARE mode: the
  * card then stays at the ISO14443-3 level and accepts MIFARE commands. The
  * next poll switches automatic RATS back on.
+ *
+ * A target with a random UID (4 bytes, first byte 08h, a phone for example)
+ * takes a new UID with every activation: it can be selected only while the
+ * poll that listed it is still current. Once the field was switched off,
+ * the kept UID matches nothing and the function returns false.
  *
  * uid->subtype alone steers that choice. To open the ISO14443-4 side of such
  * a card instead, set subtype to PN532_MIFARE_DESFIRE in your copy of the

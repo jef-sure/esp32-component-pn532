@@ -37,6 +37,8 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 
 #define PN532_DEFAULT_TIMEOUT_MS         500
 #define PN532_NACK_RETRIES               2
+#define PN532_ACK_RETRIES                1
+#define PN532_FIRMWARE_IC_PN532          0x32
 #define PN532_SAM_MODE_NORMAL            0x01
 #define PN532_SAM_TIMEOUT_1S             0x14
 #define PN532_SAM_IRQ_ENABLE             0x01
@@ -47,6 +49,7 @@ static const uint8_t pn532_error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 
 #define PN532_PARAM_AUTOMATIC_RATS       0x10
 #define PN532_STATUS_OK                  0x00
 #define PN532_STATUS_RF_TIMEOUT          0x01
+#define PN532_STATUS_RF_PROTOCOL_ERROR   0x0B
 #define PN532_STATUS_MIFARE_ERROR_13     0x13
 #define PN532_STATUS_MIFARE_ERROR_14     0x14
 #define PN532_STATUS_TARGET_NOT_KNOWN    0x27
@@ -67,6 +70,7 @@ static bool pn532_status_requires_reselect(uint8_t status)
 {
     switch (status) {
     case PN532_STATUS_RF_TIMEOUT:
+    case PN532_STATUS_RF_PROTOCOL_ERROR:
     case PN532_STATUS_MIFARE_ERROR_13:
     case PN532_STATUS_MIFARE_ERROR_14:
         return true;
@@ -281,9 +285,11 @@ void pn532_abort_current_command(pn532_t *pn532)
     (void)pn532->bus->write_command(pn532->bus, pn532_ack, sizeof(pn532_ack));
     pn532_delay_ms(2);
 
-    /* Drain the full PN532 buffer: an aborted InListPassiveTarget with two
-     * cards can leave ~65 bytes of response behind. A short 16-byte read
-     * would leave the tail in the FIFO and corrupt the next frame. */
+    /* UM0701-02 §6.2.2.1-d: after the abort ACK the PN532 answers nothing.
+     * The drain covers the race where the response was already on its way
+     * when the abort was sent; it reads whole frames (an InListPassiveTarget
+     * answer with two cards is ~65 bytes), since a short read would leave the
+     * tail behind and corrupt the next frame. */
     if (pn532->bus->is_ready != NULL && pn532->bus->read_data != NULL) {
         size_t guard = 0;
         while (pn532->bus->is_ready(pn532->bus) && guard++ < PN532_ABORT_DRAIN_MAX_READS) {
@@ -410,6 +416,10 @@ bool pn532_execute_command(      //
         ESP_LOGE(TAG, "pn532_execute_command: response_len is required when response buffer is provided");
         return false;
     }
+    if (params == NULL && params_len > 0) {
+        ESP_LOGE(TAG, "pn532_execute_command: params is NULL with params_len %u", (unsigned)params_len);
+        return false;
+    }
 
     /* Drain any stale IRQ events queued from a previous command before issuing
      * a new one, so the upcoming wait_ready() blocks on the new edge. */
@@ -417,16 +427,24 @@ bool pn532_execute_command(      //
         xQueueReset(pn532->irq_queue);
     }
 
-    if (!pn532_write_frame(pn532, command, params, params_len)) {
-        return false;
+    /* ACK phase: the PN532 acknowledges a command within 15 ms (UM0701-02
+     * §6.2.3). Waiting the full response timeout here only masks a dead
+     * transport, so the ACK gets its own short budget (NXP TAMA uses 10 ms; we
+     * keep headroom for slow SPI/I2C clocking of the frame). Without an ACK
+     * the chip has not taken the command and the host should send it again
+     * (§6.2.2.1-b), so the frame is repeated once. A second miss means the
+     * transport or the chip is wedged — not an RF/card problem. */
+    bool acked = false;
+    for (int attempt = 0; attempt <= PN532_ACK_RETRIES && !acked; attempt++) {
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "pn532_execute_command: no ACK for command 0x%02X, sending it again", command);
+        }
+        if (!pn532_write_frame(pn532, command, params, params_len)) {
+            return false;
+        }
+        acked = pn532_wait_ready(pn532, pn532->ack_timeout_ms);
     }
-
-    /* ACK phase: the PN532 acknowledges a command within a few ms. Waiting the
-     * full response timeout here only masks a dead transport, so the ACK gets
-     * its own short budget (NXP TAMA uses 10 ms; we keep headroom for slow
-     * SPI/I2C clocking of the frame). A miss here means the transport or the
-     * chip is wedged — not an RF/card problem. */
-    if (!pn532_wait_ready(pn532, pn532->ack_timeout_ms)) {
+    if (!acked) {
         ESP_LOGE(TAG, "pn532_execute_command: no ACK for command 0x%02X within %u ms (transport not responding)",
                  command, (unsigned)pn532->ack_timeout_ms);
         pn532_recover_after_timeout(pn532, command, "ACK");
@@ -465,6 +483,12 @@ bool pn532_execute_command(      //
         frame = pn532_read_response_frame(pn532, (uint8_t)(command + 1), &payload_offset, &payload_len);
     }
     if (frame != PN532_FRAME_OK) {
+        /* An intact frame that is not the expected answer (the syntax error
+         * frame of UM0701-02 §6.2.1.6 included) is an application level
+         * error: the link itself works. */
+        if (frame == PN532_FRAME_REJECTED) {
+            pn532->last_command_status = PN532_COMMAND_STATUS_REJECTED;
+        }
         return false;
     }
 
@@ -497,6 +521,11 @@ uint32_t pn532_get_firmware_version(pn532_t *pn532)
                                (uint16_t)pn532->timeout_ms) ||
         response_len != sizeof(response)) {
         ESP_LOGE(TAG, "pn532_get_firmware_version: command failed");
+        return 0;
+    }
+    /* UM0701-02 §7.2.2: the IC byte of a PN532 is 0x32. */
+    if (response[0] != PN532_FIRMWARE_IC_PN532) {
+        ESP_LOGE(TAG, "pn532_get_firmware_version: IC 0x%02X is not a PN532", response[0]);
         return 0;
     }
 
@@ -949,11 +978,16 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
     /* NXP phTalTama_Transceive(): a response status with MI (0x40) means the
      * target chains more information. The host re-issues the exchange to
      * drain the chain and concatenates the payload fragments in order; the
-     * final round carries a status without MI. Per UM0701-02 §7.3.5 the
+     * final round carries a status without MI. Per UM0701-02 §7.3.8 the
      * continuation request carries only the target number — the PN532 keeps
      * the card-side chaining state, so re-sending the original payload would
      * forward the APDU/command to the target a second time. A chain that
-     * never terminates is cut off after PN532_MI_MAX_CHAIN_ROUNDS rounds. */
+     * never terminates is cut off after PN532_MI_MAX_CHAIN_ROUNDS rounds.
+     *
+     * As an initiator the PN532 reports MI for DEP targets only: for
+     * ISO14443-4 it handles chaining, WTX and retries itself, and MIFARE has
+     * none. This driver does not activate DEP targets, so the continuation
+     * rounds are not expected to run with the cards it supports. */
     for (unsigned round = 0; chaining_active; round++) {
         if (round >= PN532_MI_MAX_CHAIN_ROUNDS) {
             ESP_LOGE(TAG, "pn532_in_data_exchange: MI chain did not terminate within %u rounds",
@@ -1009,10 +1043,16 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
                                                 sizeof(rf_off_params), NULL, &rf_response_len,
                                                 (uint16_t)pn532->timeout_ms);
                 } else {
-                    /* 0x13/0x14 (framing / MIFARE authentication error): the
-                     * card fell back to IDLE, but the PN532 still counts the
-                     * target as selected, so a bare InSelect may not wake it.
-                     * pn532_14443_select_by_uid() re-lists instead. */
+                    /* 0x13 (data format does not match the specification,
+                     * UM0701-02 table 13) or 0x14 (MIFARE authentication
+                     * error): the card fell back to IDLE, but the PN532 still
+                     * counts the target as selected, so a bare InSelect does
+                     * not wake it (measured: InSelect answers 0x00 and the
+                     * next exchange times out). pn532_14443_select_by_uid()
+                     * re-lists instead. 0x0B (RF protocol error) is how an
+                     * NTAG213 NAK was seen reported instead of 0x13, with the
+                     * same effect; the NXP reference singles out 0x01, 0x13
+                     * and 0x14 only and leaves the rest to its caller. */
                     pn532->tg_stale = true;
                 }
                 pn532->session_opened = false;
@@ -1074,84 +1114,50 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
         return false;
     }
 
-    /* NXP phTalTama_Transceive() raw-command path: InCommunicateThru sends
-     * raw ISO14443 bits to the target without the DEP/MIFARE wrapping of
-     * InDataExchange. The response status byte uses the same ERROR_MASK /
-     * MI layout, so MI-chained raw replies are drained here as well. */
-    uint8_t  raw_response[PN532_MAX_BUF_SIZE];
-    uint8_t *raw_cursor        = response;
-    size_t   raw_capacity      = (response != NULL && response_len != NULL) ? *response_len : 0;
-    size_t   total_payload     = 0;
-    bool     chaining_active   = true;
-    bool     exchange_failed   = false;
-    bool     capacity_exceeded = false;
+    /* InCommunicateThru (UM0701-02 §7.3.9) sends the bytes to the target
+     * without the MIFARE / ISO14443-4 wrapping of InDataExchange and does no
+     * chaining: the status byte is an error code only. Its MI and NAD bits
+     * mean nothing here, so they neither start a continuation round (which
+     * would put an empty frame on the air) nor shift the payload. */
+    uint8_t raw_response[PN532_MAX_BUF_SIZE];
+    size_t  raw_response_len = sizeof(raw_response);
+    size_t  capacity         = (response != NULL && response_len != NULL) ? *response_len : 0;
 
-    for (unsigned round = 0; chaining_active; round++) {
-        if (round >= PN532_MI_MAX_CHAIN_ROUNDS) {
-            ESP_LOGE(TAG, "pn532_in_communicate_thru: MI chain did not terminate within %u rounds",
-                     (unsigned)PN532_MI_MAX_CHAIN_ROUNDS);
-            pn532->session_opened = false;
-            if (response_len != NULL) {
-                *response_len = total_payload;
-            }
-            return false;
+    if (!pn532_execute_command(pn532, PN532_COMMAND_INCOMMUNICATETHRU, data, data_len, raw_response,
+                               &raw_response_len, timeout)) {
+        if (response_len != NULL) {
+            *response_len = 0;
         }
-
-        size_t raw_response_len = sizeof(raw_response);
-        /* Round 0 sends the caller's raw data; MI continuations send nothing
-         * — the PN532 keeps the target-side chaining state (UM0701-02). */
-        if (!pn532_execute_command(pn532, PN532_COMMAND_INCOMMUNICATETHRU, data, (round == 0) ? data_len : 0,
-                                   raw_response, &raw_response_len, timeout)) {
-            exchange_failed = true;
-            break;
-        }
-        if (raw_response_len == 0) {
-            ESP_LOGE(TAG, "pn532_in_communicate_thru: empty response");
-            exchange_failed = true;
-            break;
-        }
-
-        uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
-        if (status != PN532_STATUS_OK) {
-            ESP_LOGD(TAG, "pn532_in_communicate_thru: PN532 status 0x%02X", status);
-            exchange_failed = true;
-            break;
-        }
-
-        const uint8_t *fragment    = raw_response + 1;
-        size_t         payload_len = raw_response_len - 1;
-        if ((raw_response[0] & PN532_STATUS_NAD_MASK) != 0) {
-            /* Same NAD handling as pn532_in_data_exchange(); see there. */
-            if (payload_len == 0) {
-                ESP_LOGE(TAG, "pn532_in_communicate_thru: NAD flag with empty payload");
-                exchange_failed = true;
-                break;
-            }
-            fragment++;
-            payload_len--;
-        }
-
-        if (raw_cursor != NULL && payload_len > 0) {
-            if (total_payload + payload_len > raw_capacity) {
-                capacity_exceeded = true;
-                total_payload += payload_len;
-                break;
-            }
-            memcpy(raw_cursor, fragment, payload_len);
-            raw_cursor += payload_len;
-        }
-        total_payload += payload_len;
-
-        chaining_active = (raw_response[0] & PN532_STATUS_MI_MASK) != 0;
-    }
-
-    if (response_len != NULL) {
-        *response_len = total_payload;
-    }
-    if (capacity_exceeded) {
         return false;
     }
-    return !exchange_failed;
+    if (raw_response_len == 0) {
+        ESP_LOGE(TAG, "pn532_in_communicate_thru: empty response");
+        if (response_len != NULL) {
+            *response_len = 0;
+        }
+        return false;
+    }
+
+    uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
+    if (status != PN532_STATUS_OK) {
+        ESP_LOGD(TAG, "pn532_in_communicate_thru: PN532 status 0x%02X", status);
+        if (response_len != NULL) {
+            *response_len = 0;
+        }
+        return false;
+    }
+
+    size_t payload_len = raw_response_len - 1;
+    if (response_len != NULL) {
+        *response_len = payload_len;
+    }
+    if (response != NULL && payload_len > 0) {
+        if (payload_len > capacity) {
+            return false;
+        }
+        memcpy(response, raw_response + 1, payload_len);
+    }
+    return true;
 }
 
 bool pn532_in_select(pn532_t *pn532, uint8_t target_number)

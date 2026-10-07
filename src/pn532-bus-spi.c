@@ -7,6 +7,7 @@
 #include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -14,6 +15,14 @@
 #include "hal/gpio_ll.h"
 
 static const char *TAG = "PN532-SPI";
+
+/* PN532/C1 §8.5.6: after the NSS falling edge the oscillator needs T_osc_start
+ * (T1, up to 2 ms with the usual quartz) before the chip takes SPI traffic.
+ * The pulse is held longer than that maximum to leave a margin. */
+#define PN532_SPI_WAKE_PULSE_MS 4
+
+/* SPIstatus bits 7..4 and 1 (PN532/C1 table 125). */
+#define PN532_SPI_STATUS_RESERVED 0xF2
 
 typedef struct
 {
@@ -24,7 +33,7 @@ typedef struct
     spi_transaction_t  *trans;
     uint8_t            *tx_buffer;
     uint8_t            *rx_buffer;
-    bool                line_fault; /* last status byte was neither 0x00 nor 0x01 */
+    bool                line_fault; /* last status byte had a reserved bit set */
 } pn532_spi_bus_t;
 
 /* Hosts initialised by this driver and how many PN532 devices sit on each.
@@ -63,8 +72,8 @@ static void IRAM_ATTR pn532_spi_pre_transfer(spi_transaction_t *trans)
     if (bus != NULL) {
         gpio_ll_set_level(&GPIO, bus->nss, 0);
         /* NSS setup time before the first clock edge. The PN532 documents
-         * give no minimum outside Power Down (that wake-up is the 2 ms pulse
-         * of pn532_spi_bus_wake()); 100 us is the value this driver has been
+         * give no minimum outside Power Down (that wake-up is the pulse of
+         * pn532_spi_bus_wake()); 100 us is the value this driver has been
          * run with on hardware since its first version. */
         esp_rom_delay_us(100);
     }
@@ -148,10 +157,14 @@ static bool pn532_spi_bus_is_ready(pn532_bus_t *bus)
         return false;
     }
 
-    /* UM0701-02 §6.2.5: the status byte is exactly 0x00 or 0x01. Anything else
-     * (0xFF for an open or stuck-high MISO) means nothing is driving the line. */
+    /* PN532/C1 §8.3.5.7, SPIstatus: bit 0 READY, bit 2 RCV_OVR, bit 3 TR_FE
+     * (set when the host read the FIFO empty, which every full-buffer read
+     * of a short frame does; a busy chip then answers 0x08). UM0701-02 §6.2.5
+     * tells the host to look at RDY only. The other bits are reserved and
+     * read 0, so a set one (0xFF from an open or stuck-high MISO) means that
+     * nothing is driving the line, and the byte does not count as ready. */
     uint8_t status = spi_bus->trans->rx_data[0];
-    bool    fault  = status != 0x00 && status != PN532_SPI_READY;
+    bool    fault  = (status & PN532_SPI_STATUS_RESERVED) != 0;
     if (fault != spi_bus->line_fault) {
         if (fault) {
             ESP_LOGW(TAG, "NSS %d: invalid status 0x%02X, MISO not driven (wiring, power, I0/I1, or chip hung)",
@@ -161,12 +174,12 @@ static bool pn532_spi_bus_is_ready(pn532_bus_t *bus)
         }
         spi_bus->line_fault = fault;
     }
-    return status == PN532_SPI_READY;
+    return !fault && (status & PN532_SPI_READY) != 0;
 }
 
 /*
- * PN532/C1 §8.5.6 wake-up: NSS high → low edge with T1 (max 2 ms) settle
- * before any SPI traffic. Do NOT send a host→PN532 ACK here — that would
+ * PN532/C1 §8.5.6 wake-up: NSS high → low edge, then T1 (max 2 ms) before any
+ * SPI traffic; NSS stays low for PN532_SPI_WAKE_PULSE_MS. Do NOT send a host→PN532 ACK here — that would
  * abort the very next command (e.g. GetFirmwareVersion in init).
  * NSS must return high: on a shared bus a low NSS keeps this reader selected
  * while another one is being addressed.
@@ -181,12 +194,12 @@ static void pn532_spi_wake_pulse(pn532_spi_bus_t *spi_bus)
         ESP_LOGW(TAG, "NSS %d: wake-up without bus lock (%s)", (int)spi_bus->nss, esp_err_to_name(err));
     }
 
-    /* pn532_delay_ms() waits on wall-clock time: pdMS_TO_TICKS(2) is zero
-     * ticks at CONFIG_FREERTOS_HZ=100. */
+    /* pn532_delay_ms() waits on wall-clock time: a few ms are zero ticks at
+     * CONFIG_FREERTOS_HZ=100. */
     gpio_set_level(spi_bus->nss, 1);
     pn532_delay_ms(2);
     gpio_set_level(spi_bus->nss, 0);
-    pn532_delay_ms(2);
+    pn532_delay_ms(PN532_SPI_WAKE_PULSE_MS);
     gpio_set_level(spi_bus->nss, 1);
 
     if (err == ESP_OK) {
@@ -255,11 +268,28 @@ static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_n
     return true;
 }
 
+/* DMA-capable scratch buffer for one PN532 frame. */
+static uint8_t *pn532_spi_alloc_buffer(spi_host_device_t host_id)
+{
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+    return spi_bus_dma_memory_alloc(host_id, PN532_MAX_BUF_SIZE + 2, 0);
+#else
+    /* spi_bus_dma_memory_alloc() appeared in ESP-IDF 5.4. */
+    (void)host_id;
+    return heap_caps_malloc(PN532_MAX_BUF_SIZE + 2, MALLOC_CAP_DMA);
+#endif
+}
+
 static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz)
 {
     if (clock_speed_hz <= 0) {
         ESP_LOGW(TAG, "clock_speed_hz=%d, using default %d Hz", clock_speed_hz, PN532_SPI_DEFAULT_CLOCK_HZ);
         clock_speed_hz = PN532_SPI_DEFAULT_CLOCK_HZ;
+    }
+    if (clock_speed_hz > PN532_SPI_MAX_CLOCK_HZ) {
+        ESP_LOGW(TAG, "clock_speed_hz=%d is above the PN532 maximum, using %d Hz", clock_speed_hz,
+                 PN532_SPI_MAX_CLOCK_HZ);
+        clock_speed_hz = PN532_SPI_MAX_CLOCK_HZ;
     }
 
     pn532_spi_bus_t *spi_bus = calloc(1, sizeof(*spi_bus));
@@ -267,7 +297,8 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         return NULL;
     }
 
-    /* Idle NSS high before the device joins the bus. */
+    /* Idle NSS high before the device joins the bus. The level is latched
+     * before the pad becomes an output, so NSS does not dip low in between. */
     gpio_config_t nss_cfg = {
         .pin_bit_mask = (1ULL << nss),
         .mode         = GPIO_MODE_OUTPUT,
@@ -275,6 +306,7 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
+    gpio_set_level(nss, 1);
     if (gpio_config(&nss_cfg) != ESP_OK) {
         free(spi_bus);
         return NULL;
@@ -302,8 +334,8 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
     pn532_spi_wake_pulse(spi_bus);
 
     spi_bus->trans     = heap_caps_malloc(sizeof(*spi_bus->trans), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    spi_bus->tx_buffer = spi_bus_dma_memory_alloc(host_id, PN532_MAX_BUF_SIZE + 2, 0);
-    spi_bus->rx_buffer = spi_bus_dma_memory_alloc(host_id, PN532_MAX_BUF_SIZE + 2, 0);
+    spi_bus->tx_buffer = pn532_spi_alloc_buffer(host_id);
+    spi_bus->rx_buffer = pn532_spi_alloc_buffer(host_id);
     if (spi_bus->trans == NULL || spi_bus->tx_buffer == NULL || spi_bus->rx_buffer == NULL) {
         spi_bus_remove_device(spi_bus->spi_handle);
         free(spi_bus->trans);
@@ -347,6 +379,12 @@ pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clo
     if ((unsigned)host_id >= SPI_HOST_MAX ||
         spi_bus_get_max_transaction_len(host_id, &max_transaction_len) != ESP_OK) {
         ESP_LOGE(TAG, "pn532_spi_attach: SPI host %d is not initialised", (int)host_id);
+        return NULL;
+    }
+    /* Every response is read as one PN532_MAX_BUF_SIZE transaction. */
+    if (max_transaction_len < PN532_MAX_BUF_SIZE) {
+        ESP_LOGE(TAG, "pn532_spi_attach: SPI host %d carries %u bytes per transaction, the PN532 needs %d", (int)host_id,
+                 (unsigned)max_transaction_len, PN532_MAX_BUF_SIZE);
         return NULL;
     }
     return pn532_spi_add_device(host_id, nss, clock_speed_hz);

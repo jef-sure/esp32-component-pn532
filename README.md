@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.2"
+idf.py add-dependency "jef-sure/pn532^0.7.3"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -122,7 +122,7 @@ Every transport is then used the same way: `pn532_init(bus, irq, rst)`, and fina
 
 - **IRQ pin (optional).** Pass the GPIO wired to the PN532 IRQ line to `pn532_init()`. The driver then waits on the interrupt instead of polling the bus, and readiness comes from the chip's own signal — most useful on UART. Pass `GPIO_NUM_NC` otherwise.
 - **RST pin (optional).** When passed, `pn532_reset()` and `pn532_recover()` pulse it for a hardware reset; without it the reset is logical only.
-- **SPI clock.** The PN532 accepts up to 5 MHz, but long wires and cheap modules often are not reliable above 1–2 MHz.
+- **SPI clock.** The PN532 accepts up to 5 MHz, but long wires and cheap modules often are not reliable above 1–2 MHz. A higher request is lowered to 5 MHz (`PN532_SPI_MAX_CLOCK_HZ`), and an I2C clock above 400 kHz to 400 kHz (`PN532_I2C_MAX_CLOCK_HZ`).
 - **UART baud rate.** If the module does not answer at the configured rate, `pn532_init()` probes all nine HSU rates (9600 to 1288000, UM0701-02 §7.2.8) and logs a warning with the rate it found. To run faster, switch both sides at once; the setting is volatile and the module returns to its power-on rate after a power cycle, which `pn532_recover()` detects and follows:
 
   ```c
@@ -191,7 +191,7 @@ if (status == PN532_POLL_FOUND && pn532_14443_select_by_uid(pn532, &uids->uids[0
     if (pn532_ndef_make_uri_record(&records[0], "https://www.example.com", true,
                              payload, sizeof(payload))) {
         pn532_ndef_message_add(&message, &records[0]);
-        /* NTAG213: 4-byte pages, data starts at page 4, 36 writable pages left. */
+        /* NTAG213: 4-byte pages, data starts at page 4, the message may take up to 36 pages. */
         pn532_ndef_result_t res = pn532_ndef_write_to_selected_card(pn532, &message, 4, 4, 36);
         if (res == PN532_NDEF_OK) {
             /* card now carries the URI record */
@@ -205,7 +205,15 @@ pn532_set_rf_off(pn532);
 
 Text, MIME, and external records are built the same way with `pn532_ndef_make_text_record()`, `pn532_ndef_make_mime_record()`, and `pn532_ndef_make_external_record()`; several records can be added to one message.
 
-`pn532_ndef_write_to_selected_card()` writes a TLV-wrapped NDEF message to a Type 2 / NTAG style tag (`block_size = 4`) starting at the block you specify. The first block is staged with a hidden TLV length so a concurrent reader never sees a partially updated message; the real length is committed only after the trailing pages have been programmed. The helper is intentionally limited:
+`pn532_ndef_write_to_selected_card()` writes a TLV-wrapped NDEF message to a Type 2 / NTAG style tag (`block_size = 4`) starting at the block you specify. The first block is staged with a hidden TLV length so a concurrent reader never sees a partially updated message; the real length is committed only after the trailing pages have been programmed.
+
+The arguments after the message are `start_block`, `block_size`, and `max_blocks`. `max_blocks` is the number of pages the message may take, counted from `start_block`; it is not a page number and not the size of the tag, so do not pass `uid->blocks_count`. The helper protects the pages that cannot be repaired:
+
+- `start_block` below 4 (UID, lock bytes, and the one-time programmable capability container) and a non-positive `max_blocks` return `PN532_NDEF_ERR_INVALID_PARAM`.
+- It reads the capability container and keeps the write inside the data area it describes (pages 4 to 3 + CC[2] × 2; 4 to 39 on an NTAG213), whatever `max_blocks` says, so the dynamic lock and configuration pages behind it are never written. A message that does not fit returns `PN532_NDEF_ERR_CARD_FULL`.
+- A tag without a capability container returns `PN532_NDEF_ERR_NO_NDEF`.
+
+The helper is intentionally limited:
 
 - MIFARE Classic block sizes (`block_size = 16`) return `PN532_NDEF_ERR_UNSUPPORTED`. Writing Classic NDEF correctly requires MAD updates and sector-trailer handling, which are out of scope for the helper.
 - It does not format blank tags, write the capability container, or update sector trailers.
@@ -394,7 +402,7 @@ pn532_bus_t *bus = pn532_i2c_attach(I2C_NUM_0, 0, 400000); /* ESP-IDF >= 5.4 */
 pn532_t *pn532 = pn532_init(bus, GPIO_NUM_NC, GPIO_NUM_NC);
 ```
 
-For SPI, initialise the host with `spi_bus_initialize()` and call `pn532_spi_attach(host, nss, clock_hz)`.
+For SPI, initialise the host with `spi_bus_initialize()` and call `pn532_spi_attach(host, nss, clock_hz)`. The bus must carry a whole PN532 frame in one transaction: set `max_transfer_sz` to at least `PN532_MAX_BUF_SIZE` (280) and use a DMA channel, since a bus without DMA is limited to 64 bytes. `pn532_spi_attach()` returns NULL for a shorter bus.
 
 ## Troubleshooting
 
@@ -402,11 +410,14 @@ For SPI, initialise the host with `spi_bus_initialize()` and call `pn532_spi_att
 - **`module answers at N baud, not the configured M baud`** — the UART module runs at another rate (often after an earlier `pn532_uart_set_baud_rate()`); the driver found it and continues. Configure that rate to skip the probe on the next boot.
 - **`pn532_i2c_attach: requires ESP-IDF >= 5.4`** — attaching to an existing I2C bus needs `i2c_master_get_bus_handle()`; use `pn532_i2c_init()` on older ESP-IDF.
 - **`invalid frame header` / `corrupted response ..., requesting retransmission`** — noise or a desynchronised stream. Occasional retransmissions are handled automatically; if they persist, shorten the wires, lower the clock or baud rate, or call `pn532_recover()`.
-- **`no ACK for command ... within N ms`** — the transport is not responding at all: check wiring, NSS/address/baud rate, and power. Degrades to `PN532_POLL_TRANSPORT_ERROR` at the polling layer. Repeated occurrences → `pn532_recover()`.
+- **`no ACK for command ..., sending it again`** — one command frame got no ACK and was repeated. Occasional lines are a noisy link; the command still ran once.
+- **`no ACK for command ... within N ms`** — the transport is not responding at all, also not to the repeated frame: check wiring, NSS/address/baud rate, and power. Degrades to `PN532_POLL_TRANSPORT_ERROR` at the polling layer. Repeated occurrences → `pn532_recover()`.
+- **`PN532 returned an error frame for command ...`** — the chip understood the frame but refused the command (wrong parameters, or a command it does not accept in its current state). The link works: a poll reports `PN532_POLL_PROTOCOL_ERROR`, and `pn532_recover()` is not needed.
 - **Alternating `PN532_POLL_FOUND` / `PN532_POLL_NO_TARGET` with a static card** — the card sits in HALT and does not power down before the next poll. Increase the RF settle delay (`pn532_set_rf_settle_delay()`); the 20 ms default fits a 250 ms two-reader cycle.
 - **Frequent `PN532_POLL_TIMEOUT` with a present card** — the response phase is too short for the card. Raise `pn532->timeout_ms` (default 500 ms). For Type 4 APDU exchanges the driver already applies a 1500 ms floor.
 - **`PN532_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the card uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
 - **Two readers on one SPI bus interfere** — poll sequentially and finish each cycle with `pn532_set_rf_off()`; the settle delay is applied by the driver itself. Never poll both readers concurrently from different tasks.
+- **A card shows a different UID starting with `08` on every poll** — a random UID, typically a phone. See [Targets with a random UID](#targets-with-a-random-uid).
 - **`pn532_in_select: status 0x27`** — the PN532 rejects the command in its current context, typically because the target number is no longer known (for example after an unexpected chip reset). Select fails so the caller re-polls. Deselect/release close the local session successfully on `0x27`; the log line `target already lost (0x27)` at debug level is informational.
 
 ## Reliability And Recovery
@@ -415,7 +426,7 @@ For SPI, initialise the host with `spi_bus_initialize()` and call `pn532_spi_att
 
 Every `pn532_execute_command()` runs in two phases with separate budgets:
 
-- **ACK phase** — the PN532 must acknowledge the command within `pn532->ack_timeout_ms` (default `PN532_ACK_TIMEOUT_MS` = 50 ms; the NXP TAMA reference uses 10 ms). A miss here means the transport or the chip is wedged, so the command fails fast through `PN532_COMMAND_STATUS_ACK_TIMEOUT` instead of burning the full response timeout. At the polling layer this surfaces as `PN532_POLL_TRANSPORT_ERROR`.
+- **ACK phase** — the PN532 must acknowledge the command within `pn532->ack_timeout_ms` (default `PN532_ACK_TIMEOUT_MS` = 50 ms; the chip answers within 15 ms, and the NXP TAMA reference waits 10 ms). Without an ACK the chip has not taken the command, so the frame is sent once more (UM0701-02 §6.2.2.1). A second miss means the transport or the chip is wedged, and the command fails through `PN532_COMMAND_STATUS_ACK_TIMEOUT` after two ACK budgets instead of burning the full response timeout. At the polling layer this surfaces as `PN532_POLL_TRANSPORT_ERROR`.
 - **Response phase** — the full caller timeout (`pn532->timeout_ms`, default 500 ms) applies while the command runs. A miss here is an RF/card-side problem (quiet card, field collision) and maps to `PN532_POLL_TIMEOUT`.
 
 Tune both budgets with `pn532_set_ack_timeout()` and by writing `pn532->timeout_ms`:
@@ -425,14 +436,14 @@ pn532_set_ack_timeout(pn532, 30); /* faster dead-transport detection */
 pn532->timeout_ms = 800;          /* more headroom for slow cards */
 ```
 
-After a timeout the driver sends the UM0701-02 ACK-abort frame and drains the full PN532 buffer (an aborted two-card `InListPassiveTarget` can leave ~65 bytes behind; a short drain would corrupt the next frame with `invalid frame header`).
+After a timeout the driver sends the UM0701-02 ACK-abort frame and drains the PN532 buffer in whole frames. The chip answers nothing after an abort; the drain covers a response that was already on its way (a two-card `InListPassiveTarget` answer is ~65 bytes, and a short read would corrupt the next frame with `invalid frame header`).
 
 ### Unreliable links
 
 Long wires, noisy power, or a module that power-cycles on its own are handled in escalating steps:
 
 1. **Frame** — a response damaged on the line (bad checksum, broken header/postamble, truncated HSU frame) is requested again with the UM0701-02 NACK frame, up to two times. The command is not re-executed, so writes and RF exchanges are never applied twice. Logged as `corrupted response ..., requesting retransmission`.
-2. **Command** — a missing ACK or response triggers the ACK-abort and buffer drain described above; the call fails with a typed status.
+2. **Command** — a command frame without an ACK is sent once more; on I2C a write the chip does not acknowledge is repeated up to three times. A second missing ACK, or a missing response, triggers the ACK-abort and buffer drain described above, and the call fails with a typed status. A command that was acknowledged is never sent again.
 3. **Device** — `pn532_recover()` resets the chip, checks that it answers, lets the transport re-negotiate the link if it does not (HSU probes all rates), and re-applies the runtime configuration.
 4. **Application** — if `pn532_recover()` fails, destroy and re-create the transport, or power-cycle the module.
 
@@ -487,6 +498,14 @@ Requirements: ESP-IDF 5.2 or newer (`pn532_i2c_attach()` needs 5.4). The compone
 3. End the session with `pn532_deselect_target()`, `pn532_release_target()`, or `pn532_set_rf_off()`. On success (`0x00`) deselect keeps the target listed for reactivation without a field restart; release and RF off invalidate it. Deselect and release verify the returned status byte: `0x27` means the chip already lost the target and is treated as a successful close that clears both the session and the listed-target state — mirroring the NXP TAMA reference — so poll loops cannot wedge. Any other non-zero status fails, leaving the local state untouched. `pn532_in_select()` treats `0x27` as a hard error so callers re-poll.
 4. After target loss, RF timeout, or `pn532_recover()`, reacquire the card through polling and `pn532_14443_select_by_uid()` before continuing. A transceive with no listed target fails without starting a new discovery.
 
+### Targets with a random UID
+
+A phone in card emulation, and some cards, answer with a random 4-byte UID whose first byte is `08` and pick a new one for every activation (ISO/IEC 14443-3). Such a UID identifies the target only until the RF field is switched off:
+
+- Select and use the target right after the poll that found it. `pn532_14443_select_by_uid()` then takes the target number of that poll and needs no new listing.
+- After the field was off (the next poll, an RF timeout, `pn532_recover()`), the target comes back under another UID. A `pn532_uid_t` kept from before no longer matches anything, `pn532_14443_select_by_uid()` returns false for it, and the second attempt of `pn532_ndef_read_card_auto()` fails the same way. Poll again and take the new entry.
+- Do not use such a UID as an identity: the same phone shows up as a new card on every poll.
+
 ### Cards with both MIFARE Classic and ISO-DEP
 
 Some cards (SmartMX, JCOP, and similar) emulate MIFARE Classic on top of an ISO14443-4 chip and report SAK `0x28` (1K) or `0x38` (4K). One activation can serve only one of the two sides: once the PN532 has sent RATS, the card speaks ISO-DEP and refuses MIFARE commands until the field is recycled.
@@ -525,7 +544,7 @@ The tests in [`test_apps/polling`](test_apps/polling) drive the driver core thro
 make -C host_test test IDF_PATH=<path to esp-idf>
 ```
 
-The host run takes the Unity sources from the ESP-IDF checkout and leaves out the bus transports (`src/pn532-bus-*.c`).
+The host run takes the Unity sources from the ESP-IDF checkout, or from a plain Unity checkout with `UNITY_DIR=<path to Unity/src>`, and leaves out the bus transports (`src/pn532-bus-*.c`). The GitHub workflow in [`.github/workflows/host-test.yml`](.github/workflows/host-test.yml) runs it on every push and pull request.
 
 ### Low-level MIFARE access
 
@@ -575,7 +594,7 @@ if (pn532_in_communicate_thru(pn532, cmd, sizeof(cmd), rx, &rx_len, 500)) {
 }
 ```
 
-The target must be selected first (see `pn532_14443_select_by_uid()`). Responses carrying MI (chaining) are drained and concatenated automatically; a NAD byte in the reply is stripped.
+The target must be selected first (see `pn532_14443_select_by_uid()`). One call is one exchange: InCommunicateThru does no chaining (UM0701-02 §7.3.9), and the reply is returned as the PN532 delivered it.
 
 ### Task stack
 

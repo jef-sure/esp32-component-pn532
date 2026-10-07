@@ -53,7 +53,8 @@ typedef enum
     PN532_COMMAND_STATUS_OK = 0,
     PN532_COMMAND_STATUS_TRANSPORT_ERROR,
     PN532_COMMAND_STATUS_TIMEOUT,
-    PN532_COMMAND_STATUS_ACK_TIMEOUT
+    PN532_COMMAND_STATUS_ACK_TIMEOUT,
+    PN532_COMMAND_STATUS_REJECTED /* intact frame, but an error frame or not the expected answer */
 } pn532_command_status_t;
 
 bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len, uint8_t *response,

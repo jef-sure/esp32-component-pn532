@@ -1,5 +1,44 @@
 # Changelog
 
+## v 0.7.3 - 2026-10-07
+
+Fixes on real hardware: an ESP32-P4 with two PN532 on one SPI host (no IRQ, no reset line), with NTAG213, Ultralight-compatible, MIFARE Classic 1K and ISO-DEP cards. The changes come from an audit of 0.7.2 against UM0701-02, the PN532/C1 datasheet and the ESP-IDF headers, and from what the hardware runs showed.
+
+Behaviour changes:
+
+- **`pn532_ndef_write_to_selected_card()` protects the pages that cannot be repaired** (`pn532-ndef.c`). `start_block` below 4 (UID, lock bytes, one-time programmable capability container) and a non-positive `max_blocks` are `PN532_NDEF_ERR_INVALID_PARAM`; `max_blocks <= 0` used to switch the capacity check off. The helper reads the capability container and keeps the write inside the data area it describes, so a `max_blocks` taken from `uid->blocks_count` no longer reaches the dynamic lock and configuration pages. A tag without a capability container is `PN532_NDEF_ERR_NO_NDEF`. A message longer than 65534 bytes is `PN532_NDEF_ERR_CARD_FULL`; its length was cut to 16 bits. `max_blocks` is documented: a number of pages counted from `start_block`.
+- **`pn532_in_communicate_thru()` is one exchange** (`pn532.c`). InCommunicateThru does no chaining and its status byte is an error code only (UM0701-02 §7.3.9), so the MI bit no longer starts a continuation round (which sent an empty frame to the card) and the NAD bit no longer removes the first reply byte. The MI rounds of InDataExchange stay, documented as DEP-only; the reference in the comments is §7.3.8, not §7.3.5.
+- **A command without an ACK is sent once more** (`pn532.c`), as UM0701-02 §6.2.2.1 asks: the chip has not taken a frame it did not acknowledge. A dead transport is now reported after two ACK budgets (100 ms by default).
+- `pn532_ndef_encode_message()` returns 0 for records the parser of this driver refuses: an Empty record with a type, ID or payload, an Unknown record with a type, and the TNF values Unchanged and Reserved.
+- `pn532_get_firmware_version()` returns 0 when the IC byte is not `0x32`.
+- `pn532_spi_attach()` returns NULL for a host whose transactions are shorter than a PN532 frame (`max_transfer_sz` below `PN532_MAX_BUF_SIZE`, or a bus without DMA); the first read failed there before.
+- SPI clocks above 5 MHz and I2C clocks above 400 kHz are lowered to these limits with a warning (`PN532_SPI_MAX_CLOCK_HZ`, `PN532_I2C_MAX_CLOCK_HZ`).
+
+Fixes:
+
+- **SPI: a busy PN532 answering status `0x08` is no longer reported as a line fault** (`pn532-bus-spi.c`). Bit 3 of the SPI status register is TR_FE, set when the host reads the FIFO empty (PN532/C1 §8.3.5.7), which every full-buffer read of a short frame does. Since 0.5.4 the driver took any byte but `0x00` / `0x01` for an undriven MISO and logged `invalid status 0x08, MISO not driven` as a warning about once per command; printing it more than doubled the time of a command (9 ms against 4 ms at 1 MHz). Ready is bit 0 again, as UM0701-02 §6.2.5 says and 0.4.5 did; a line fault is a set reserved bit (7..4 or 1), so `0xFF` from an open MISO still does not read as ready.
+- Status `0x0B` (RF protocol error) of InDataExchange marks the target stale like `0x13` and `0x14`: an NTAG213 answered a refused READ with it, and the card then needs a new listing as well.
+- **SPI builds on ESP-IDF 5.2 and 5.3** (`pn532-bus-spi.c`): `spi_bus_dma_memory_alloc()` exists from 5.4 on; older versions take the buffers from `heap_caps_malloc(MALLOC_CAP_DMA)`. Compiled here with 5.5.4 only.
+- An error frame or an unexpected response code is `PN532_POLL_PROTOCOL_ERROR` at the polling layer (new internal status `PN532_COMMAND_STATUS_REJECTED`); it was `PN532_POLL_TRANSPORT_ERROR`, which the README answers with `pn532_recover()`.
+- I2C: a command write the PN532 does not acknowledge is repeated up to three times, 2 ms apart (UM0701-02 §6.2.4); reads already did that.
+- Type 4 NDEF: the second read attempt lists the card again when its target is stale (status `0x13` / `0x14`), as for Type 2 and MIFARE Classic.
+- SPI wake-up: NSS stays low for 4 ms; 2 ms was exactly the maximum of T_osc_start, without margin. NSS is driven high before the pad becomes an output.
+- `pn532_execute_command()` rejects `params == NULL` with a non-zero `params_len`; `pn532_ndef_parse_message()` sets `*out_msg` to NULL on every error.
+- Comments: status `0x13` is "data format does not match", not a framing error; no response follows an abort, the drain covers a race; `br_rx` / `br_tx` have no 847 kbit/s code.
+
+Measured on the hardware named above:
+
+- The link is clean from 500 kHz to 5 MHz (no failed command in 200 per clock on both readers); a request for 8 MHz runs at 5 MHz.
+- A command sent right after PowerDown is lost on one of the two modules while the chip wakes up; the repeat after the missing ACK delivers it every time. With the wake-up pulse of `pn532_reset()` no frame is lost.
+- An unknown command gets the syntax error frame and `PN532_COMMAND_STATUS_REJECTED`; the next command works. The PN532 also answers an InDataExchange with an unknown MIFARE command byte that way, without sending it to the card.
+- After InDeselect the next InDataExchange works without an InSelect on all four card types.
+- After status `0x13` / `0x14` (refused READ, READ without authentication, wrong key) InSelect answers `0x00` but the next exchange fails; only a new InListPassiveTarget brings the card back, as the driver assumes.
+- With a card lying still, 70 cycles of poll, select, NDEF read, release and RF off pass without a miss for an ISO-DEP card on either reader, an Ultralight-compatible tag, and two such tags in the field of one reader (about 160 ms per cycle for one card, 210 ms for two), back to back and with 250 ms between the cycles. The same runs with MxRtyPassiveActivation lowered from the driver's 5 to 2 missed listings now and then.
+- A card in the field of both readers, which sit side by side, is listed and read by both in turn (30 of 30 cycles on each with 250 ms between the cycles).
+- A target with a random UID (first byte `08`, a phone for example) gets a new UID with every activation, so it cannot be listed again by its UID after the field was switched off. The README has a section on such targets.
+
+Tests and CI: 61 host tests (new: ACK repeat, error frame, argument and IC checks, Type 2 write limits with a simulated NTAG213, encoder rules, Type 4 re-listing, stale target after `0x0B`). `host_test/Makefile` accepts `UNITY_DIR` in place of `IDF_PATH`, and a GitHub workflow runs the host tests on push and pull request.
+
 ## v 0.7.2 - 2026-10-07
 
 Fixes from an external review of 0.7.1.
@@ -60,7 +99,7 @@ Other changes:
 
 ## v 0.6.0 - 2026-10-05
 
-- **InDataExchange/InCommunicateThru MI continuations no longer re-send the RF payload** (`pn532.c`). UM0701-02 §7.3.5 continuation requests carry only the target number (InDataExchange) or nothing (InCommunicateThru); re-sending the original data forwarded the APDU/command to the card a second time. The mock now captures per-round request parameters, and the MI regression tests assert the continuation shape.
+- **InDataExchange/InCommunicateThru MI continuations no longer re-send the RF payload** (`pn532.c`). UM0701-02 §7.3.8 continuation requests carry only the target number (InDataExchange) or nothing (InCommunicateThru); re-sending the original data forwarded the APDU/command to the card a second time. The mock now captures per-round request parameters, and the MI regression tests assert the continuation shape.
 - Type 2 NDEF capacity now derives from the capability container instead of physical page counts (`pn532-ndef.c`). `CC[2] × 8` bytes is the NDEF data-area size, which excludes the lock/configuration pages the old NTAG213/215/216 page counts (45/135/231) walked into.
 - Type 4 NDEF reads chunk by `MLe - 2` (`pn532-ndef.c`). MLe already counts data bytes only, so `Le = MLe` is legal; the two bytes of headroom are for cards that size MLe to their whole R-APDU buffer.
 - `pn532_14443_4_read_binary()` rejects offsets above `0x7FFF` instead of silently wrapping them (short EF identifier mode masks bit 15 in P1) and fails with the required size in `*got` instead of silently truncating a response that exceeds the caller's buffer. The `pn532.h` contract documents both.

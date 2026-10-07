@@ -418,10 +418,12 @@ static pn532_poll_status_t pn532_poll_command_error(const pn532_t *pn532)
         if (pn532->last_command_status == PN532_COMMAND_STATUS_TIMEOUT) {
             return PN532_POLL_TIMEOUT;
         }
-        if (pn532->last_command_status == PN532_COMMAND_STATUS_OK) {
+        if (pn532->last_command_status == PN532_COMMAND_STATUS_OK ||
+            pn532->last_command_status == PN532_COMMAND_STATUS_REJECTED) {
             /* The transport delivered a well-formed frame but the chip
-             * refused the command (non-zero poll/release status): a protocol
-             * problem, not a dead link. Recovery would be wasted effort. */
+             * refused the command (non-zero poll/release status, or an error
+             * frame): a protocol problem, not a dead link. Recovery would be
+             * wasted effort. */
             return PN532_POLL_PROTOCOL_ERROR;
         }
     }

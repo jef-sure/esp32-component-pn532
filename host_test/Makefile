@@ -2,13 +2,16 @@
 # The tests are the ones of test_apps/polling; they drive the driver core through a mock bus.
 # The Unity test framework is taken from an ESP-IDF checkout:
 #   make test IDF_PATH=~/.espressif/v5.5.4/esp-idf
-# or run it from a shell where ESP-IDF is activated.
+# or run it from a shell where ESP-IDF is activated. Without ESP-IDF, point
+# UNITY_DIR at the src directory of a Unity checkout:
+#   make test UNITY_DIR=~/Unity/src
 
+ifeq ($(strip $(UNITY_DIR)),)
 ifeq ($(strip $(IDF_PATH)),)
-$(error IDF_PATH is not set: activate ESP-IDF or pass IDF_PATH=<path to esp-idf>)
+$(error IDF_PATH is not set: activate ESP-IDF, pass IDF_PATH=<path to esp-idf> or UNITY_DIR=<path to Unity/src>)
 endif
-
 UNITY_DIR := $(IDF_PATH)/components/unity/unity/src
+endif
 BUILD_DIR ?= build
 
 # The bus transports (src/pn532-bus-*.c) need the real drivers and are not built here.

@@ -15,6 +15,8 @@ static const char *TAG = "PN532-I2C";
 #define PN532_I2C_TRANSFER_TIMEOUT_MS  100
 #define PN532_I2C_READY_RETRY_COUNT    8
 #define PN532_I2C_READY_RETRY_DELAY_MS 5
+#define PN532_I2C_WRITE_ATTEMPTS       3
+#define PN532_I2C_WRITE_RETRY_DELAY_MS 2
 /* UM0701-02 §7.2.11: leaving Power Down the PN532 stretches SCL
  * for T_osc_start (a few 100 us, quartz dependent). An upper bound, not a delay;
  * below the ESP32 hardware maximum (~13 ms at 80 MHz). */
@@ -43,13 +45,23 @@ static bool pn532_i2c_bus_write_command(pn532_bus_t *bus, const uint8_t *buffer,
         return false;
     }
 
-    esp_err_t err = i2c_master_transmit(i2c_bus->dev_handle, buffer, len, PN532_I2C_TRANSFER_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "pn532_i2c_bus_write_command: i2c_master_transmit failed (%s)", esp_err_to_name(err));
-        return false;
+    /* UM0701-02 §6.2.4: right after an exchange the PN532 may not acknowledge
+     * its address yet, so a refused write is repeated after a short pause.
+     * The frame has not reached the chip in that case. */
+    esp_err_t err = ESP_OK;
+    for (int attempt = 0; attempt < PN532_I2C_WRITE_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            pn532_delay_ms(PN532_I2C_WRITE_RETRY_DELAY_MS);
+        }
+        err = i2c_master_transmit(i2c_bus->dev_handle, buffer, len, PN532_I2C_TRANSFER_TIMEOUT_MS);
+        if (err == ESP_OK) {
+            return true;
+        }
     }
 
-    return true;
+    ESP_LOGE(TAG, "pn532_i2c_bus_write_command: i2c_master_transmit failed after %d attempts (%s)",
+             PN532_I2C_WRITE_ATTEMPTS, esp_err_to_name(err));
+    return false;
 }
 
 static bool pn532_i2c_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t len)
@@ -174,6 +186,11 @@ static pn532_bus_t *pn532_i2c_add_device(i2c_master_bus_handle_t bus_handle, boo
     }
     if (clock_speed_hz == 0) {
         clock_speed_hz = PN532_I2C_DEFAULT_CLOCK_HZ;
+    }
+    if (clock_speed_hz > PN532_I2C_MAX_CLOCK_HZ) {
+        ESP_LOGW(TAG, "clock_speed_hz=%u is above the PN532 maximum, using %d Hz", (unsigned)clock_speed_hz,
+                 PN532_I2C_MAX_CLOCK_HZ);
+        clock_speed_hz = PN532_I2C_MAX_CLOCK_HZ;
     }
 
     i2c_device_config_t dev_config = {

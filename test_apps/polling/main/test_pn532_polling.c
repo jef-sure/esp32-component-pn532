@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -78,6 +79,14 @@ struct mock_bus_t
     size_t          sim_ndef_file_len;
     const uint8_t  *sim_file; /* Type 4: selected file */
     size_t          sim_file_len;
+    uint8_t         sim_written[64]; /* Type 2: pages in the order they were written */
+    size_t          sim_writes;
+    size_t          sim_fail_exchange; /* this exchange (1-based) answers sim_fail_status; 0 for none */
+    uint8_t         sim_fail_status;
+    uint8_t         ack_drops;      /* next N command frames are lost: no ACK follows */
+    bool            ack_dropped;    /* the current command frame was lost */
+    uint8_t         error_frames;   /* next N responses are the syntax error frame */
+    uint8_t         firmware_ic;    /* GetFirmwareVersion IC byte; 0 selects 0x32 */
 };
 
 static const uint8_t ack_frame[]  = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
@@ -102,6 +111,17 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
     }
 
     uint8_t command = buffer[3] == 0xFF ? buffer[9] : buffer[6];
+    mock->ack_dropped = false;
+    if (mock->ack_drops > 0) {
+        /* The frame never reaches the chip: nothing is executed or answered. */
+        mock->ack_drops--;
+        mock->ack_dropped = true;
+        TEST_ASSERT_LESS_THAN(ARRAY_SIZE(mock->commands), mock->command_count);
+        mock->commands[mock->command_count++] = command;
+        mock->current_command                 = command;
+        mock->read_phase                      = 0;
+        return true;
+    }
     if (mock->mode == MOCK_LIST_TRANSPORT_ERROR && command == PN532_COMMAND_INLISTPASSIVETARGET) {
         return false;
     }
@@ -130,7 +150,7 @@ static bool mock_write(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
 
     /* Capture the full request parameters of each InDataExchange /
      * InCommunicateThru round so tests can assert what the MI continuation
-     * re-sends (UM0701-02 §7.3.5: only the target number). Frames larger
+     * re-sends (UM0701-02 §7.3.8: only the target number). Frames larger
      * than the capture slot (frame-size tests) and rounds beyond the first
      * few (MI loop tests) are counted but not stored. */
     if (command == PN532_COMMAND_INDATAEXCHANGE || command == PN532_COMMAND_INCOMMUNICATETHRU) {
@@ -238,8 +258,9 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         payload_len = 0;
         break;
     case PN532_COMMAND_GETFIRMWAREVERSION: {
-        static const uint8_t firmware[] = {0x32, 0x01, 0x06, 0x07};
-        payload                         = firmware;
+        static uint8_t firmware[] = {0x32, 0x01, 0x06, 0x07};
+        firmware[0]               = mock->firmware_ic != 0 ? mock->firmware_ic : 0x32;
+        payload                   = firmware;
         payload_len                     = sizeof(firmware);
         break;
     }
@@ -294,6 +315,15 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         break;
     }
 
+    if (mock->error_frames > 0) {
+        /* UM0701-02 §6.2.1.6: syntax error frame, sent instead of a response. */
+        static const uint8_t error_frame[] = {0x00, 0x00, 0xFF, 0x01, 0xFF, 0x7F, 0x81, 0x00};
+        mock->error_frames--;
+        memset(buffer, 0, len);
+        memcpy(buffer, error_frame, sizeof(error_frame));
+        return true;
+    }
+
     if (mock->mode == MOCK_PENDING_RESPONSE) {
         /* Two-card sized payload: bigger than the old 16-byte drain buffer. */
         static uint8_t pending[64] = {0x01};
@@ -310,8 +340,14 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
     if (mock->mode == MOCK_SIM_CARD && (mock->current_command == PN532_COMMAND_INDATAEXCHANGE ||
                                         mock->current_command == PN532_COMMAND_INCOMMUNICATETHRU)) {
         uint8_t sim_response[1 + 256];
-        size_t  sim_len =
-            mock->sim_card(mock, mock->current_command, mock->sim_request, mock->sim_request_len, sim_response);
+        size_t  sim_len;
+        if (mock->sim_fail_exchange != 0 && mock->exchange_rounds == mock->sim_fail_exchange) {
+            sim_response[0] = mock->sim_fail_status;
+            sim_len         = 1;
+        } else {
+            sim_len =
+                mock->sim_card(mock, mock->current_command, mock->sim_request, mock->sim_request_len, sim_response);
+        }
         mock_response_frame(mock->current_command, sim_response, sim_len, buffer, len);
         return true;
     }
@@ -381,16 +417,10 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
     }
 
     if (mock->mode == MOCK_COMMUNICATE_THRU && mock->current_command == PN532_COMMAND_INCOMMUNICATETHRU) {
-        /* Raw exchange: round 1 MI-fragments {0x11}, round 2 completes with
-         * {0x22, 0x33}. Exercises both the raw path and its MI drain. */
-        static const uint8_t first[]    = {0x40, 0x11};
-        static const uint8_t last[]     = {0x00, 0x22, 0x33};
-        const uint8_t       *payload    = (mock->mi_round == 0) ? first : last;
-        size_t               payload_sz = (mock->mi_round == 0) ? sizeof(first) : sizeof(last);
-        if (!mock->exchange_loops_mi) {
-            mock->mi_round++;
-        }
-        mock_response_frame(mock->current_command, payload, payload_sz, buffer, len);
+        /* Raw exchange answering {0x11} with a stray MI bit in the status: the
+         * command does no chaining, so no second round may follow. */
+        static const uint8_t raw[] = {0x40, 0x11};
+        mock_response_frame(mock->current_command, raw, sizeof(raw), buffer, len);
         return true;
     }
 
@@ -406,6 +436,9 @@ static bool mock_ready(pn532_bus_t *bus)
 {
     mock_bus_t *mock = (mock_bus_t *)bus;
     if (mock->chip_baud != 0 && mock->host_baud != mock->chip_baud) {
+        return false;
+    }
+    if (mock->ack_dropped) {
         return false;
     }
     if (mock->mode == MOCK_ACK_TIMEOUT) {
@@ -877,7 +910,7 @@ TEST_CASE("get general status decodes diagnostics fields", "[pn532][status]")
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
 }
 
-TEST_CASE("in communicate thru forwards raw bits and drains MI", "[pn532][thru]")
+TEST_CASE("in communicate thru is one raw exchange without MI rounds", "[pn532][thru]")
 {
     mock_bus_t mock;
     pn532_t    pn532;
@@ -887,22 +920,27 @@ TEST_CASE("in communicate thru forwards raw bits and drains MI", "[pn532][thru]"
     pn532.inListedTag    = 1;
     pn532.session_opened = true;
 
+    /* The mock sets the MI bit in the status. InCommunicateThru does no
+     * chaining (UM0701-02 §7.3.9), so the bit must not start a second round:
+     * that round would put an empty frame on the air. */
     uint8_t rx[16];
     size_t  rx_len = sizeof(rx);
     TEST_ASSERT_TRUE(pn532_in_communicate_thru(&pn532, (const uint8_t *)"\xE0\x80", 2, rx, &rx_len, 100));
-    TEST_ASSERT_EQUAL(3, rx_len);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0x11, 0x22, 0x33}), rx, 3);
+    TEST_ASSERT_EQUAL(1, rx_len);
+    TEST_ASSERT_EQUAL_UINT8(0x11, rx[0]);
     TEST_ASSERT_TRUE(pn532.session_opened);
-    TEST_ASSERT_EQUAL(2, mock.command_count);
 
-    /* Round 0 carries the raw bits; the MI continuation re-sends nothing. */
-    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+    TEST_ASSERT_EQUAL(1, mock.exchange_rounds);
     TEST_ASSERT_EQUAL(2, mock.exchange_params_len[0]);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0xE0, 0x80}), mock.exchange_params[0], 2);
-    TEST_ASSERT_EQUAL(0, mock.exchange_params_len[1]);
 
-    const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU, PN532_COMMAND_INCOMMUNICATETHRU};
+    const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU};
     assert_commands(&mock, expected, ARRAY_SIZE(expected));
+
+    /* A reply that does not fit reports the required size. */
+    rx_len = 0;
+    TEST_ASSERT_FALSE(pn532_in_communicate_thru(&pn532, (const uint8_t *)"\xE0\x80", 2, rx, &rx_len, 100));
+    TEST_ASSERT_EQUAL(1, rx_len);
 }
 
 TEST_CASE("NAD byte is stripped from exchange payload", "[pn532][exchange][nad]")
@@ -1713,6 +1751,15 @@ static size_t sim_type2_card(mock_bus_t *mock, uint8_t command, const uint8_t *r
         mock->sim_reads++;
         return 17;
     }
+    if (request_len == 7 && request[1] == PN532_MIFARE_ULTRALIGHT_CMD_WRITE && request[2] < mock->sim_units) {
+        response[0] = 0x00;
+        memcpy(&mock->sim_memory[(size_t)request[2] * 4], &request[3], 4);
+        if (mock->sim_writes < ARRAY_SIZE(mock->sim_written)) {
+            mock->sim_written[mock->sim_writes] = request[2];
+        }
+        mock->sim_writes++;
+        return 1;
+    }
     return 1;
 }
 
@@ -2208,4 +2255,275 @@ TEST_CASE("Smart Poster payload must be a well-formed NDEF message", "[pn532][nd
 void app_main(void)
 {
     unity_run_menu();
+}
+
+TEST_CASE("a command without an ACK is sent once more", "[pn532][timeout][ack]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+
+    /* The first frame is lost on the line: the chip neither acknowledges nor
+     * executes it, so the repeat is the only execution (UM0701-02 §6.2.2.1-b). */
+    mock.ack_drops = 1;
+    TEST_ASSERT_NOT_EQUAL(0, pn532_get_firmware_version(&pn532));
+    TEST_ASSERT_EQUAL(PN532_COMMAND_STATUS_OK, pn532.last_command_status);
+    TEST_ASSERT_EQUAL(0, mock.abort_count);
+    const uint8_t repeated[] = {PN532_COMMAND_GETFIRMWAREVERSION, PN532_COMMAND_GETFIRMWAREVERSION};
+    assert_commands(&mock, repeated, ARRAY_SIZE(repeated));
+
+    /* Two losses in a row are a dead link: one repeat, then the abort. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.ack_drops = 2;
+    TEST_ASSERT_EQUAL(0, pn532_get_firmware_version(&pn532));
+    TEST_ASSERT_EQUAL(PN532_COMMAND_STATUS_ACK_TIMEOUT, pn532.last_command_status);
+    TEST_ASSERT_EQUAL(1, mock.abort_count);
+    assert_commands(&mock, repeated, ARRAY_SIZE(repeated));
+}
+
+TEST_CASE("an error frame is a protocol error, not a transport error", "[pn532][polling][protocol]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+
+    mock.error_frames = 1;
+    uint8_t response[4];
+    size_t  response_len = sizeof(response);
+    TEST_ASSERT_FALSE(
+        pn532_execute_command(&pn532, PN532_COMMAND_GETFIRMWAREVERSION, NULL, 0, response, &response_len, 100));
+    TEST_ASSERT_EQUAL(PN532_COMMAND_STATUS_REJECTED, pn532.last_command_status);
+    /* The frame is intact: no retransmission is asked for and nothing is aborted. */
+    TEST_ASSERT_EQUAL(0, mock.nack_count);
+    TEST_ASSERT_EQUAL(0, mock.abort_count);
+
+    /* The poll reports it as a protocol error, so the application does not
+     * run pn532_recover() against a link that works. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    mock.error_frames = 1;
+    pn532_poll_status_t status;
+    TEST_ASSERT_NULL(pn532_14443_get_all_uids_ex(&pn532, &status));
+    TEST_ASSERT_EQUAL(PN532_POLL_PROTOCOL_ERROR, status);
+}
+
+TEST_CASE("command arguments and the firmware IC byte are checked", "[pn532][args]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+
+    TEST_ASSERT_FALSE(pn532_execute_command(&pn532, PN532_COMMAND_RFCONFIGURATION, NULL, 2, NULL, NULL, 100));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+
+    TEST_ASSERT_EQUAL_HEX32(0x32010607, pn532_get_firmware_version(&pn532));
+    mock.firmware_ic = 0x33;
+    TEST_ASSERT_EQUAL(0, pn532_get_firmware_version(&pn532));
+}
+
+/* NTAG213: 45 pages, capability container with 144 bytes of data area (pages 4..39). */
+#define SIM_NTAG213_PAGES 45
+
+static void sim_ntag213_init(mock_bus_t *mock, pn532_t *pn532, uint8_t *memory, uint8_t *send_buf, uint8_t *recv_buf)
+{
+    static const uint8_t cc[] = {0xE1, 0x10, 0x12, 0x00};
+    memset(memory, 0, SIM_NTAG213_PAGES * 4);
+    memcpy(&memory[3 * 4], cc, sizeof(cc));
+    sim_init(mock, pn532, sim_type2_card, send_buf, recv_buf);
+    mock->sim_memory = memory;
+    mock->sim_units  = SIM_NTAG213_PAGES;
+}
+
+TEST_CASE("Type 2 NDEF write stays inside the data area of the capability container", "[pn532][ndef][t2][write]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[SIM_NTAG213_PAGES * 4];
+
+    /* 16-byte record: TLV 03 10 .. FE is 19 bytes, five pages. */
+    uint8_t              payload[32];
+    pn532_ndef_record_t  records[1];
+    pn532_ndef_message_t message;
+    pn532_ndef_message_init(&message, records, 1);
+    TEST_ASSERT_TRUE(pn532_ndef_make_uri_record(&records[0], "https://www.example.com", true, payload, sizeof(payload)));
+    TEST_ASSERT_TRUE(pn532_ndef_message_add(&message, &records[0]));
+    TEST_ASSERT_EQUAL(16, pn532_ndef_encode_message(&message, NULL, 0));
+
+    /* Arguments that would reach the UID, lock or capability container
+     * pages, or that switch the capacity check off, are refused before any
+     * exchange with the card. */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    for (int start = 0; start < 4; start++) {
+        TEST_ASSERT_EQUAL(PN532_NDEF_ERR_INVALID_PARAM,
+                          pn532_ndef_write_to_selected_card(&pn532, &message, start, 4, 36));
+    }
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_INVALID_PARAM, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 0));
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_INVALID_PARAM, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, -1));
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_UNSUPPORTED, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 16, 36));
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_CARD_FULL, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 4));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+
+    /* The caller's limit is larger than the tag (blocks_count of an NTAG213
+     * is 45): the capability container still ends the data area at page 39,
+     * in front of the dynamic lock and configuration pages. */
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_CARD_FULL, pn532_ndef_write_to_selected_card(&pn532, &message, 36, 4, 45));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 35, 4, 45));
+    TEST_ASSERT_EQUAL(6, mock.sim_writes);
+    TEST_ASSERT_EQUAL_UINT8(39, mock.sim_written[4]);
+
+    /* A tag without a capability container is not written. */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memory[3 * 4] = 0x00;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+
+    /* Regular write: the length is hidden first, then the tail pages, and
+     * the first page is committed last. */
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
+    TEST_ASSERT_EQUAL(6, mock.sim_writes);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){4, 5, 6, 7, 8, 4}), mock.sim_written, 6);
+    TEST_ASSERT_EQUAL_UINT8(0x03, memory[16]);
+    TEST_ASSERT_EQUAL_UINT8(16, memory[17]);
+    TEST_ASSERT_EQUAL_UINT8(0xFE, memory[16 + 2 + 16]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){0xE1, 0x10, 0x12, 0x00}), &memory[12], 4);
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x00,
+        .subtype      = PN532_MIFARE_NTAG213,
+        .block_size   = 4,
+        .blocks_count = SIM_NTAG213_PAGES
+    };
+    pn532_ndef_message_parsed_t *msg = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NOT_NULL(msg);
+    char uri[40];
+    TEST_ASSERT_EQUAL(23, pn532_ndef_extract_uri(&msg->records[0], uri, sizeof(uri)));
+    TEST_ASSERT_EQUAL_STRING("https://www.example.com", uri);
+    pn532_ndef_free_parsed_message(msg);
+
+    /* A message beyond the 3-byte TLV length field is not truncated to 16 bits. */
+    static uint8_t      big[0x10000];
+    pn532_ndef_record_t big_record;
+    pn532_ndef_record_init(&big_record, PN532_NDEF_TNF_MEDIA_TYPE, (const uint8_t *)"a/b", 3, NULL, 0, big, sizeof(big));
+    pn532_ndef_message_init(&message, &big_record, 1);
+    message.record_count = 1;
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_CARD_FULL, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, INT_MAX));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+}
+
+TEST_CASE("the encoder refuses records its own parser rejects", "[pn532][ndef][encode]")
+{
+    static const uint8_t payload[] = {0x01, 0x02};
+    uint8_t              out[32];
+    pn532_ndef_record_t  record;
+    pn532_ndef_message_t message;
+    pn532_ndef_message_init(&message, &record, 1);
+    message.record_count = 1;
+
+    pn532_ndef_record_init(&record, PN532_NDEF_TNF_EMPTY, NULL, 0, NULL, 0, NULL, 0);
+    TEST_ASSERT_EQUAL(3, pn532_ndef_encode_message(&message, out, sizeof(out)));
+
+    pn532_ndef_record_init(&record, PN532_NDEF_TNF_EMPTY, (const uint8_t *)"T", 1, NULL, 0, NULL, 0);
+    TEST_ASSERT_EQUAL(0, pn532_ndef_encode_message(&message, NULL, 0));
+    TEST_ASSERT_EQUAL(0, pn532_ndef_encode_message(&message, out, sizeof(out)));
+    pn532_ndef_record_init(&record, PN532_NDEF_TNF_EMPTY, NULL, 0, NULL, 0, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL(0, pn532_ndef_encode_message(&message, NULL, 0));
+
+    pn532_ndef_record_init(&record, PN532_NDEF_TNF_UNKNOWN, NULL, 0, NULL, 0, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL(5, pn532_ndef_encode_message(&message, out, sizeof(out)));
+    pn532_ndef_record_init(&record, PN532_NDEF_TNF_UNKNOWN, (const uint8_t *)"x", 1, NULL, 0, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL(0, pn532_ndef_encode_message(&message, NULL, 0));
+
+    pn532_ndef_record_init(&record, PN532_NDEF_TNF_UNCHANGED, NULL, 0, NULL, 0, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL(0, pn532_ndef_encode_message(&message, NULL, 0));
+    pn532_ndef_record_init(&record, PN532_NDEF_TNF_RESERVED, NULL, 0, NULL, 0, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL(0, pn532_ndef_encode_message(&message, NULL, 0));
+
+    /* A failed parse leaves no stale pointer behind. */
+    static const uint8_t         reserved_tnf[] = {0xD7, 0x00, 0x00};
+    pn532_ndef_message_parsed_t *msg            = (pn532_ndef_message_parsed_t *)out;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_PARSE_FAILED, pn532_ndef_parse_message(reserved_tnf, sizeof(reserved_tnf), &msg));
+    TEST_ASSERT_NULL(msg);
+}
+
+TEST_CASE("Type 4 NDEF read re-lists a card whose target went stale", "[pn532][ndef][t4]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+
+    static const uint8_t cc[15]        = {0x00, 0x0F, 0x20, 0x00, 0x3B, 0x00, 0x34, 0x04,
+                                          0x06, 0xE1, 0x04, 0x00, 0x20, 0x00, 0x00};
+    uint8_t              ndef_file[32] = {0x00, sizeof(sim_ndef_text)};
+    memcpy(&ndef_file[2], sim_ndef_text, sizeof(sim_ndef_text));
+
+    pn532_uid_t uid = {
+        .uid        = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length = 4,
+        .tg         = 1,
+        .sak        = 0x20,
+        .subtype    = PN532_MIFARE_DESFIRE,
+        .block_size = 1
+    };
+
+    /* The first exchange ends with status 0x13: the card is back in IDLE
+     * while the PN532 still counts the target as selected, so the second
+     * attempt needs a new InListPassiveTarget, not just an InSelect. */
+    sim_init(&mock, &pn532, sim_type4_card, send_buf, recv_buf);
+    mock.sim_cc_file       = cc;
+    mock.sim_ndef_file     = ndef_file;
+    mock.sim_ndef_file_len = sizeof(ndef_file);
+    mock.sim_fail_exchange = 1;
+    mock.sim_fail_status   = 0x13;
+
+    pn532_ndef_message_parsed_t *msg = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NOT_NULL(msg);
+    pn532_ndef_free_parsed_message(msg);
+
+    const uint8_t expected[] = {PN532_COMMAND_INDATAEXCHANGE,      PN532_COMMAND_RFCONFIGURATION,
+                                PN532_COMMAND_INLISTPASSIVETARGET, PN532_COMMAND_INSELECT};
+    TEST_ASSERT_GREATER_THAN(ARRAY_SIZE(expected), mock.command_count);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected, mock.commands, ARRAY_SIZE(expected));
+    TEST_ASSERT_FALSE(pn532.tg_stale);
+}
+
+TEST_CASE("an RF protocol error marks the target stale like the MIFARE errors", "[pn532][polling][status]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[16 * 4]               = {0};
+
+    /* Seen on hardware: an NTAG213 NAK reported as 0x0B instead of 0x13. The
+     * card is in IDLE after it, and only a new listing brings it back. */
+    static const uint8_t statuses[] = {0x0B, 0x13, 0x14};
+    for (size_t i = 0; i < ARRAY_SIZE(statuses); i++) {
+        sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+        mock.sim_memory        = memory;
+        mock.sim_units         = 16;
+        mock.sim_fail_exchange = 1;
+        mock.sim_fail_status   = statuses[i];
+
+        uint8_t page[16];
+        TEST_ASSERT_FALSE(pn532_14443_block_read(&pn532, 4, page, sizeof(page)));
+        TEST_ASSERT_TRUE(pn532.tg_stale);
+        TEST_ASSERT_FALSE(pn532.session_opened);
+        TEST_ASSERT_EQUAL(1, pn532.inListedTag);
+    }
 }

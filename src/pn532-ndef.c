@@ -25,10 +25,14 @@ const uint8_t PN532_NDEF_RTD_TEXT[]        = {'T'};
 const uint8_t PN532_NDEF_RTD_URI[]         = {'U'};
 const uint8_t PN532_NDEF_RTD_SMARTPOSTER[] = {'S', 'p'};
 
+#define TYPE2_CC_PAGE         3
+#define TYPE2_CC_MAGIC        0xE1
+#define TYPE2_FIRST_DATA_PAGE 4
+
 /* Returns false when page 3 does not hold a capability container. */
 static bool pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t *uid)
 {
-    if (data == NULL || uid == NULL || data[0] != 0xE1) {
+    if (data == NULL || uid == NULL || data[0] != TYPE2_CC_MAGIC) {
         return false;
     }
     uid->block_size = 4;
@@ -491,6 +495,9 @@ static bool ndef_decode_logical_records(uint8_t *data, size_t data_len, pn532_nd
 pn532_ndef_result_t pn532_ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len,
                                              pn532_ndef_message_parsed_t **out_msg)
 {
+    if (out_msg != NULL) {
+        *out_msg = NULL;
+    }
     if (raw_data == NULL || raw_data_len == 0 || out_msg == NULL) {
         return PN532_NDEF_ERR_PARSE_FAILED;
     }
@@ -579,13 +586,33 @@ static bool ndef_record_has_consistent_storage(const pn532_ndef_record_t *rec)
              (rec->payload_len > 0 && rec->payload == NULL));
 }
 
+/* The rules ndef_decode_next() and ndef_plan_decode() apply on the way back,
+ * so the encoder never produces a message its own parser refuses. */
+static bool ndef_record_is_encodable(const pn532_ndef_record_t *rec)
+{
+    if (!ndef_record_has_consistent_storage(rec)) {
+        return false;
+    }
+    switch (rec->tnf) {
+    case PN532_NDEF_TNF_EMPTY:
+        return rec->type_len == 0 && rec->id_len == 0 && rec->payload_len == 0;
+    case PN532_NDEF_TNF_UNKNOWN:
+        return rec->type_len == 0;
+    case PN532_NDEF_TNF_UNCHANGED: /* continuation chunks only; the encoder writes none */
+    case PN532_NDEF_TNF_RESERVED:
+        return false;
+    default:
+        return (rec->tnf & ~NDEF_TNF_MASK) == 0;
+    }
+}
+
 static bool ndef_record_encoded_size(const pn532_ndef_record_t *rec, size_t *size_out)
 {
     if (rec == NULL || size_out == NULL) {
         return false;
     }
 
-    if (!ndef_record_has_consistent_storage(rec)) {
+    if (!ndef_record_is_encodable(rec)) {
         return false;
     }
 
@@ -659,7 +686,7 @@ size_t pn532_ndef_encode_message(const pn532_ndef_message_t *msg, uint8_t *out, 
         bool                       is_end       = (i == (msg->record_count - 1));
         bool                       short_record = rec->payload_len <= 255;
 
-        if (!ndef_record_has_consistent_storage(rec)) {
+        if (!ndef_record_is_encodable(rec)) {
             return 0;
         }
 
@@ -887,9 +914,19 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
         return PN532_NDEF_ERR_UNSUPPORTED;
     }
 
+    /* Pages 0..3 hold the UID, the lock bytes and the one-time programmable
+     * capability container: a write there cannot be taken back. */
+    if (start_block < TYPE2_FIRST_DATA_PAGE || max_blocks <= 0) {
+        return PN532_NDEF_ERR_INVALID_PARAM;
+    }
+
     size_t ndef_len = pn532_ndef_encode_message(msg, NULL, 0);
     if (ndef_len == 0) {
         return PN532_NDEF_ERR_INVALID_PARAM;
+    }
+    /* The 3-byte TLV length field ends at FFFEh. */
+    if (ndef_len > 0xFFFEu) {
+        return PN532_NDEF_ERR_CARD_FULL;
     }
 
     size_t tlv_len_bytes = (ndef_len < 0xFF) ? 1 : 3;
@@ -905,7 +942,21 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
     }
 
     size_t blocks_needed = rounded_len / (size_t)block_size;
-    if (max_blocks > 0 && (int)blocks_needed > max_blocks) {
+    if (blocks_needed > (size_t)max_blocks) {
+        return PN532_NDEF_ERR_CARD_FULL;
+    }
+
+    /* The capability container bounds the data area, whatever the caller
+     * passed: the pages after it are dynamic lock bits and configuration. */
+    uint8_t cc_read[16];
+    if (!pn532_14443_block_read(pn532, TYPE2_CC_PAGE, cc_read, sizeof(cc_read))) {
+        return PN532_NDEF_ERR_READ_FAILED;
+    }
+    if (cc_read[0] != TYPE2_CC_MAGIC) {
+        return PN532_NDEF_ERR_NO_NDEF;
+    }
+    size_t data_area_pages = (size_t)cc_read[2] * 2u;
+    if ((size_t)(start_block - TYPE2_FIRST_DATA_PAGE) + blocks_needed > data_area_pages) {
         return PN532_NDEF_ERR_CARD_FULL;
     }
 
@@ -1580,7 +1631,10 @@ pn532_ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, 
         pn532_ndef_result_t res = ndef_read_type4(pn532, out_msg);
         if (res == PN532_NDEF_ERR_READ_FAILED) {
             pn532_delay_ms(10);
-            if (pn532->inListedTag == 0) {
+            /* A stale target (card back in IDLE after status 0x13/0x14) is
+             * listed again, as for the other tag types: a bare InSelect may
+             * not wake it. */
+            if (pn532->inListedTag == 0 || pn532->tg_stale) {
                 if (!pn532_14443_select_by_uid(pn532, uid)) {
                     return res;
                 }
