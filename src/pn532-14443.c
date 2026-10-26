@@ -77,9 +77,13 @@ bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *block
         *block_size   = 16;
         break;
     case 0x10:
-    case 0x11:
         uid->subtype  = PN532_MIFARE_PLUS_2K;
         *blocks_count = 128;
+        *block_size   = 16;
+        break;
+    case 0x11:
+        uid->subtype  = PN532_MIFARE_PLUS_4K;
+        *blocks_count = 256;
         *block_size   = 16;
         break;
     case 0x18:
@@ -571,7 +575,13 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
     bool plain_mifare = pn532_uid_is_classic_emulation(uid);
     if (pn532_tg_holds_uid(pn532, uid) && pn532->is_rf_on && !pn532->tg_stale &&
         pn532->auto_rats_off == plain_mifare) {
-        return pn532_in_select(pn532, uid->tg);
+        if (pn532_in_select(pn532, uid->tg)) {
+            return true;
+        }
+        /* The chip no longer knows the handle (0x27) or the card did not
+         * answer: a new listing below either brings the card back or fails
+         * for good, whereas the kept handle would fail the same way on
+         * every retry. */
     }
 
     /*
@@ -700,19 +710,27 @@ bool pn532_14443_4_transceive(pn532_t *pn532, const uint8_t *apdu, size_t apdu_l
 static bool pn532_14443_4_select(pn532_t *pn532, uint8_t p1, uint8_t p2, const uint8_t *file_id, size_t file_id_len,
                                  bool *card_refused)
 {
-    uint8_t apdu[5 + 16];
-    apdu[0] = 0x00;                 /* CLA */
-    apdu[1] = 0xA4;                 /* INS = SELECT */
-    apdu[2] = p1;                   /* P1 */
-    apdu[3] = p2;                   /* P2 */
-    apdu[4] = (uint8_t)file_id_len; /* Lc */
+    uint8_t apdu[5 + 16 + 1];
+    size_t  apdu_len = 5u + file_id_len;
+    apdu[0]          = 0x00;                 /* CLA */
+    apdu[1]          = 0xA4;                 /* INS = SELECT */
+    apdu[2]          = p1;                   /* P1 */
+    apdu[3]          = p2;                   /* P2 */
+    apdu[4]          = (uint8_t)file_id_len; /* Lc */
     memcpy(&apdu[5], file_id, file_id_len);
+    if (p1 == 0x04) {
+        /* NFC Forum Type 4 Tag: the NDEF Tag Application Select carries
+         * Le = 00h (a case 4 APDU, the FCI may follow). A select by file
+         * identifier has no Le. */
+        apdu[apdu_len++] = 0x00;
+    }
 
     *card_refused = false;
 
-    uint8_t rx[64];
+    /* The FCI of a select by AID can take the whole short R-APDU. */
+    uint8_t rx[256 + 2];
     size_t  rx_len = sizeof(rx);
-    if (!pn532_14443_4_transceive(pn532, apdu, 5u + file_id_len, rx, &rx_len)) {
+    if (!pn532_14443_4_transceive(pn532, apdu, apdu_len, rx, &rx_len)) {
         return false;
     }
 

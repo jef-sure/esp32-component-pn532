@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.4"
+idf.py add-dependency "jef-sure/pn532^0.7.5"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -170,7 +170,7 @@ if (res == PN532_NDEF_OK) {
 
 Behavior by card family:
 
-- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed. A tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after that one read; the scan never leaves the data area the container describes.
+- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed. A tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after that one read; the scan never leaves the data area the container describes. Lock and reserved bytes that Lock Control and Memory Control TLVs place inside the data area are left out of the TLV stream, so a message continues behind them.
 - MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `PN532_NDEF_ERR_NO_NDEF`, and so does a directory whose CRC does not match its content. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key.
 - Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application (AID `D2 76 00 00 85 01 01`), reads the capability container, then reads NLEN plus the NDEF file contents in chunks of MLe − 2 bytes (at most 248). A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x or an extended NDEF file (above 32 KB) `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file, a CCLEN below 15 or an MLe below 000Fh `PN532_NDEF_ERR_PARSE_FAILED`.
 

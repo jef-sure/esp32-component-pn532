@@ -67,8 +67,8 @@ typedef enum _pn532_nfc_subtype_t
     PN532_MIFARE_NTAG213,
     PN532_MIFARE_NTAG215,
     PN532_MIFARE_NTAG216,
-    PN532_MIFARE_PLUS_2K,
-    PN532_MIFARE_PLUS_4K, /**< Reserved: not reported by the detection helpers. */
+    PN532_MIFARE_PLUS_2K, /**< MIFARE Plus 2K at security level 2 (SAK 10h). */
+    PN532_MIFARE_PLUS_4K, /**< MIFARE Plus 4K at security level 2 (SAK 11h). */
     PN532_MIFARE_DESFIRE
 } __attribute__((__packed__)) pn532_nfc_type_t;
 
@@ -301,6 +301,12 @@ void pn532_deinit(pn532_t *pn532, bool free_bus);
  *
  * If rst was provided at pn532_init() time, the pin is toggled. Otherwise this
  * is a logical driver reset only.
+ *
+ * A hardware reset returns the chip to its power-on defaults: the SAM
+ * configuration, the retry counters and the SetParameters flags that
+ * pn532_init() applied are gone until they are written again. Applications
+ * that need them back after a reset call pn532_recover(), which runs this
+ * reset and re-applies that configuration.
  */
 bool pn532_reset(pn532_t *pn532);
 
@@ -490,6 +496,11 @@ bool pn532_execute_command(pn532_t *pn532, uint8_t command, const uint8_t *param
  * error code only: the command does no chaining (UM0701-02 §7.3.9), so one
  * call is one exchange.
  *
+ * After an RF timeout (01h), an RF protocol error (0Bh) or a refused command
+ * (13h, 14h) the card may be back in IDLE while the PN532 still lists it;
+ * the target is then marked stale and the next pn532_14443_select_by_uid()
+ * lists it again instead of sending a bare InSelect.
+ *
  * @param pn532 Device context.
  * @param data Raw bytes to transmit over RF.
  * @param data_len Length of @p data in bytes.
@@ -534,8 +545,9 @@ pn532_uids_array_t *pn532_14443_get_all_uids(pn532_t *pn532);
  * @brief Select a specific ISO14443A target by UID and open a PN532 session for it.
  *
  * When the UID came from the current poll and its Tg is still valid, the helper
- * selects that target directly. Otherwise it performs a targeted passive-list
- * command and falls back to an untargeted scan plus UID match when necessary.
+ * selects that target directly. Otherwise, or when that InSelect is refused,
+ * it performs a targeted passive-list command and falls back to an untargeted
+ * scan plus UID match when necessary.
  *
  * A MIFARE Classic emulation on an ISO14443-4 card (Classic subtype with SAK
  * bit 0x20, e.g. SAK 0x28/0x38) is always re-listed with the PN532's automatic

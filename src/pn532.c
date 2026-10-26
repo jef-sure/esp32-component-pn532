@@ -1044,9 +1044,13 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
                     pn532->inListedTag            = 0;
                     const uint8_t rf_off_params[] = {0x01, 0x02};
                     size_t        rf_response_len = 0;
+                    uint8_t       exchange_status = pn532->last_command_status;
                     (void)pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, rf_off_params,
                                                 sizeof(rf_off_params), NULL, &rf_response_len,
                                                 (uint16_t)pn532->timeout_ms);
+                    /* The caller reads the outcome of its exchange, not of
+                     * this clean-up command. */
+                    pn532->last_command_status = exchange_status;
                 } else {
                     /* 0x13 (data format does not match the specification,
                      * UM0701-02 table 13) or 0x14 (MIFARE authentication
@@ -1146,6 +1150,17 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
     uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
     if (status != PN532_STATUS_OK) {
         ESP_LOGD(TAG, "pn532_in_communicate_thru: PN532 status 0x%02X", status);
+        /* As after the same statuses from InDataExchange: the card that did
+         * not answer or refused the command may be back in IDLE while the
+         * PN532 still counts it as selected, and a bare InSelect does not
+         * wake it. The target is kept but marked for a new listing by
+         * pn532_14443_select_by_uid(). The field stays on: a refused probe
+         * (pn532_14443_detect_selected_card_type_and_capacity()) is a normal
+         * outcome here, not the lost card of an InDataExchange timeout. */
+        if (pn532_status_requires_reselect(status)) {
+            pn532->tg_stale       = true;
+            pn532->session_opened = false;
+        }
         if (response_len != NULL) {
             *response_len = 0;
         }

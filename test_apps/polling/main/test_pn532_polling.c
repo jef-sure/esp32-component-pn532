@@ -1620,9 +1620,10 @@ TEST_CASE("Type 4 file select uses P2=0x0C and falls back to P2=0x00", "[pn532][
     TEST_ASSERT_EQUAL(sizeof(by_fid), mock.exchange_params_len[0]);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(by_fid, mock.exchange_params[0], sizeof(by_fid));
 
+    /* NFC Forum T4T: the application select carries Le = 00h, the file select has no Le. */
     TEST_ASSERT_TRUE(pn532_14443_4_select_file(&pn532, ndef_aid, sizeof(ndef_aid)));
     TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
-    const uint8_t by_aid[] = {0x01, 0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
+    const uint8_t by_aid[] = {0x01, 0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01, 0x00};
     TEST_ASSERT_EQUAL(sizeof(by_aid), mock.exchange_params_len[1]);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(by_aid, mock.exchange_params[1], sizeof(by_aid));
 
@@ -2729,4 +2730,229 @@ TEST_CASE("lengths, block numbers and UID sizes outside the protocol are refused
     TEST_ASSERT_FALSE(pn532_ndef_make_external_record(&rec, "a.b:c", NULL, 4, type_buf, sizeof(type_buf)));
     TEST_ASSERT_TRUE(pn532_ndef_make_mime_record(&rec, "a/b", NULL, 0, type_buf, sizeof(type_buf)));
     TEST_ASSERT_TRUE(pn532_ndef_make_external_record(&rec, "a.b:c", NULL, 0, type_buf, sizeof(type_buf)));
+}
+
+TEST_CASE("a refused InSelect on the cached handle falls back to a new listing", "[pn532][polling][select]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+
+    /* The chip lists the card but answers every InSelect with 0x27. */
+    mock_init(&mock, &pn532, MOCK_STATUS_TARGET_NOT_KNOWN, send_buf, recv_buf);
+    pn532_uids_array_t *uids = pn532_14443_get_all_uids(&pn532);
+    TEST_ASSERT_NOT_NULL(uids);
+
+    /* The short path is tried first; its refusal leads to a targeted listing
+     * instead of a kept handle that fails the same way on every retry. */
+    mock.command_count = 0;
+    TEST_ASSERT_FALSE(pn532_14443_select_by_uid(&pn532, &uids->uids[0]));
+    const uint8_t expected[] = {PN532_COMMAND_INSELECT, PN532_COMMAND_RFCONFIGURATION,
+                                PN532_COMMAND_INLISTPASSIVETARGET, PN532_COMMAND_INSELECT,
+                                PN532_COMMAND_RFCONFIGURATION};
+    assert_commands(&mock, expected, ARRAY_SIZE(expected));
+    TEST_ASSERT_EQUAL_UINT8(0, pn532.inListedTag);
+    TEST_ASSERT_FALSE(pn532.session_opened);
+    TEST_ASSERT_FALSE(pn532.is_rf_on);
+    free(uids);
+}
+
+TEST_CASE("InCommunicateThru marks the target stale after the statuses that reset the card",
+          "[pn532][thru][status]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[16 * 4]               = {0};
+
+    static const struct
+    {
+        uint8_t status;
+        bool    stale;
+    } cases[] = {
+        {0x01, true },  /* RF timeout: the card did not answer */
+        {0x0B, true },  /* RF protocol error */
+        {0x13, true },  /* data format: a refused command */
+        {0x14, true },  /* MIFARE authentication error */
+        {0x02, false}, /* CRC error: the card is still where it was */
+    };
+    static const uint8_t get_version[] = {0x60};
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+        mock.sim_memory        = memory;
+        mock.sim_units         = 16;
+        mock.sim_fail_exchange = 1;
+        mock.sim_fail_status   = cases[i].status;
+
+        uint8_t rx[16];
+        size_t  rx_len = sizeof(rx);
+        TEST_ASSERT_FALSE(pn532_in_communicate_thru(&pn532, get_version, sizeof(get_version), rx, &rx_len, 100));
+        TEST_ASSERT_EQUAL(cases[i].stale, pn532.tg_stale);
+        TEST_ASSERT_EQUAL(!cases[i].stale, pn532.session_opened);
+        /* The target and the field are kept: a refused probe is a normal outcome. */
+        TEST_ASSERT_EQUAL_UINT8(1, pn532.inListedTag);
+        TEST_ASSERT_TRUE(pn532.is_rf_on);
+        const uint8_t expected[] = {PN532_COMMAND_INCOMMUNICATETHRU};
+        assert_commands(&mock, expected, ARRAY_SIZE(expected));
+    }
+}
+
+/* Lays out a TLV stream in Type 2 memory from byte address addr on, leaving
+ * out the reserved bytes [reserved_addr, reserved_addr + reserved_len) as a
+ * tag with a Memory Control TLV does; those get a filler that is not part of
+ * the stream. */
+static void sim_type2_lay_out_stream(uint8_t *memory, size_t addr, const uint8_t *stream, size_t stream_len,
+                                     size_t reserved_addr, size_t reserved_len)
+{
+    memset(&memory[reserved_addr], 0xAA, reserved_len);
+    for (size_t i = 0; i < stream_len; i++) {
+        if (addr >= reserved_addr && addr < reserved_addr + reserved_len) {
+            addr = reserved_addr + reserved_len;
+        }
+        memory[addr++] = stream[i];
+    }
+}
+
+TEST_CASE("Type 2 NDEF read leaves out the reserved bytes of a Memory Control TLV", "[pn532][ndef][t2]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[32 * 4];
+
+    /* Text record "skip the reserved area": 29 bytes, so the NDEF TLV runs
+     * past the reserved bytes wherever it starts in the first pages. */
+    static const char    text[]   = "skip the reserved area";
+    static const uint8_t record[] = {0xD1, 0x01, 0x19, 'T', 0x02, 'e', 'n'};
+    uint8_t              stream[2 + sizeof(record) + sizeof(text) - 1 + 1];
+    size_t               stream_len = 0;
+    stream[stream_len++]            = 0x03;
+    stream[stream_len++]            = (uint8_t)(sizeof(record) + sizeof(text) - 1);
+    memcpy(&stream[stream_len], record, sizeof(record));
+    stream_len += sizeof(record);
+    memcpy(&stream[stream_len], text, sizeof(text) - 1);
+    stream_len += sizeof(text) - 1;
+    stream[stream_len++] = 0xFE;
+    TEST_ASSERT_EQUAL(sizeof(stream), stream_len);
+
+    /* Memory Control TLV: 4 reserved bytes at byte address 40 (page 10),
+     * PageAddr Ah with 2^2 bytes per page, ByteOffset 0. */
+    static const uint8_t memory_control[] = {0x02, 0x03, 0xA0, 0x04, 0x02};
+    static const uint8_t cc[]             = {0xE1, 0x10, 0x0E, 0x00}; /* data area: 28 pages, 4..31 */
+
+    /* The control TLV at the start of the data area, which the capability
+     * container READ already delivers, and once behind NULL TLVs that reach
+     * past that READ, so the scan has to read on. */
+    static const size_t ctrl_offsets[] = {0, 12};
+    for (size_t c = 0; c < ARRAY_SIZE(ctrl_offsets); c++) {
+        memset(memory, 0, sizeof(memory));
+        memcpy(&memory[3 * 4], cc, sizeof(cc));
+        size_t ctrl_addr = 4 * 4 + ctrl_offsets[c];
+        memcpy(&memory[ctrl_addr], memory_control, sizeof(memory_control));
+        sim_type2_lay_out_stream(memory, ctrl_addr + sizeof(memory_control), stream, stream_len, 40, 4);
+
+        sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+        mock.sim_memory = memory;
+        mock.sim_units  = 32;
+
+        pn532_uid_t uid = {
+            .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+            .uid_length   = 4,
+            .tg           = 1,
+            .sak          = 0x00,
+            .subtype      = PN532_MIFARE_ULTRALIGHT,
+            .block_size   = 4,
+            .blocks_count = 32
+        };
+        pn532_ndef_message_parsed_t *msg = NULL;
+        TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+        TEST_ASSERT_NOT_NULL(msg);
+        TEST_ASSERT_EQUAL(1, msg->record_count);
+
+        const uint8_t *got     = NULL;
+        size_t         got_len = 0;
+        TEST_ASSERT_TRUE(pn532_ndef_extract_text(&msg->records[0], &got, &got_len, NULL, NULL));
+        TEST_ASSERT_EQUAL(sizeof(text) - 1, got_len);
+        TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)text, got, got_len);
+        pn532_ndef_free_parsed_message(msg);
+    }
+
+    /* Without the control TLV the same bytes are one stream, filler included:
+     * the record is then not the text written. */
+    memset(memory, 0, sizeof(memory));
+    memcpy(&memory[3 * 4], cc, sizeof(cc));
+    sim_type2_lay_out_stream(memory, 4 * 4, stream, stream_len, 40, 4);
+    sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
+    mock.sim_memory = memory;
+    mock.sim_units  = 32;
+    pn532_uid_t plain = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x00,
+        .subtype      = PN532_MIFARE_ULTRALIGHT,
+        .block_size   = 4,
+        .blocks_count = 32
+    };
+    pn532_ndef_message_parsed_t *msg = NULL;
+    if (pn532_ndef_read_card_auto(&pn532, &plain, &msg) == PN532_NDEF_OK) {
+        const uint8_t *got     = NULL;
+        size_t         got_len = 0;
+        TEST_ASSERT_TRUE(pn532_ndef_extract_text(&msg->records[0], &got, &got_len, NULL, NULL));
+        TEST_ASSERT_TRUE(got_len != sizeof(text) - 1 || memcmp(got, text, got_len) != 0);
+        pn532_ndef_free_parsed_message(msg);
+    }
+}
+
+TEST_CASE("the IRQ wait falls back to the bus status and keeps the timeouts", "[pn532][irq]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+
+    /* The IRQ line of the test host is never driven low, and the queue never
+     * delivers an edge: readiness has to come from the bus status. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    pn532.irq           = 4;
+    pn532.isr_installed = true;
+    pn532.irq_queue     = xQueueCreate(4, sizeof(uint8_t));
+    TEST_ASSERT_NOT_NULL(pn532.irq_queue);
+    TEST_ASSERT_NOT_EQUAL(0, pn532_get_firmware_version(&pn532));
+    TEST_ASSERT_EQUAL(PN532_COMMAND_STATUS_OK, pn532.last_command_status);
+    vQueueDelete(pn532.irq_queue);
+
+    /* A chip that never acknowledges is given up after the ACK budget, not
+     * waited for without limit. */
+    mock_init(&mock, &pn532, MOCK_ACK_TIMEOUT, send_buf, recv_buf);
+    pn532.irq           = 4;
+    pn532.isr_installed = true;
+    pn532.irq_queue     = xQueueCreate(4, sizeof(uint8_t));
+    TEST_ASSERT_NOT_NULL(pn532.irq_queue);
+    TEST_ASSERT_EQUAL(0, pn532_get_firmware_version(&pn532));
+    TEST_ASSERT_EQUAL(PN532_COMMAND_STATUS_ACK_TIMEOUT, pn532.last_command_status);
+    TEST_ASSERT_EQUAL(1, mock.abort_count);
+    vQueueDelete(pn532.irq_queue);
+}
+
+TEST_CASE("MIFARE Plus SAKs tell the 2K from the 4K", "[pn532][polling][sak]")
+{
+    uint16_t blocks     = 0;
+    uint16_t block_size = 0;
+
+    pn532_uid_t plus_2k = {.sak = 0x10};
+    TEST_ASSERT_TRUE(pn532_14443_detect_card_type_and_capacity(&plus_2k, &blocks, &block_size));
+    TEST_ASSERT_EQUAL(PN532_MIFARE_PLUS_2K, plus_2k.subtype);
+    TEST_ASSERT_EQUAL_UINT16(128, blocks);
+    TEST_ASSERT_EQUAL_UINT16(16, block_size);
+
+    pn532_uid_t plus_4k = {.sak = 0x11};
+    TEST_ASSERT_TRUE(pn532_14443_detect_card_type_and_capacity(&plus_4k, &blocks, &block_size));
+    TEST_ASSERT_EQUAL(PN532_MIFARE_PLUS_4K, plus_4k.subtype);
+    TEST_ASSERT_EQUAL_UINT16(256, blocks);
+    TEST_ASSERT_EQUAL_UINT16(16, block_size);
 }

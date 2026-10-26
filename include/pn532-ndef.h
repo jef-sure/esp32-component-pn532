@@ -221,6 +221,9 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
  * For Type 2 tags the helper reads the capability container to refine subtype
  * and capacity; a tag without the capability container magic (E1h) or with
  * an empty data area returns PN532_NDEF_ERR_NO_NDEF without scanning the memory.
+ * Lock and reserved bytes that Lock Control and Memory Control TLVs place
+ * inside the data area are left out of the TLV stream, as the NFC Forum Type
+ * 2 Tag specification asks, so a message continues behind them.
  * For MIFARE Classic Mini / 1K it uses MAD1 to locate NDEF sectors, and for
  * 4K it also reads MAD2 when advertised, so non-NDEF cards return
  * PN532_NDEF_ERR_NO_NDEF quickly instead of falling back to a flat scan. A

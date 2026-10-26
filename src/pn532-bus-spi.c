@@ -4,7 +4,6 @@
 #include <string.h>
 
 #include "driver/gpio.h"
-#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
@@ -12,7 +11,6 @@
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "hal/gpio_ll.h"
 
 static const char *TAG = "PN532-SPI";
 
@@ -20,6 +18,12 @@ static const char *TAG = "PN532-SPI";
  * (T1, up to 2 ms with the usual quartz) before the chip takes SPI traffic.
  * The pulse is held longer than that maximum to leave a margin. */
 #define PN532_SPI_WAKE_PULSE_MS 4
+
+/* NSS setup time before the first clock edge. The PN532 documents give no
+ * minimum outside Power Down (that wake-up is the pulse of
+ * pn532_spi_bus_wake()); 100 us is the value this driver has been run with
+ * on hardware since its first version. */
+#define PN532_SPI_NSS_SETUP_US 100
 
 /* SPIstatus bits 7..4 and 1 (PN532/C1 table 125). */
 #define PN532_SPI_STATUS_RESERVED 0xF2
@@ -63,28 +67,38 @@ static pn532_spi_bus_t *pn532_spi_bus(pn532_bus_t *bus)
     return (pn532_spi_bus_t *)bus;
 }
 
-/* Called from the SPI ISR, which may run with the flash cache disabled when the
- * bus was initialised with ESP_INTR_FLAG_IRAM; gpio_set_level() lives in flash
- * unless CONFIG_GPIO_CTRL_FUNC_IN_IRAM, so write the register directly. */
-static void IRAM_ATTR pn532_spi_pre_transfer(spi_transaction_t *trans)
+/*
+ * One transaction of spi_bus->trans with NSS driven as a plain GPIO from the
+ * calling task. The bus is held meanwhile: NSS is asserted outside the
+ * transaction, and a reader polled from another task must not end up selected
+ * together with this one. Driving NSS here instead of from pre_cb/post_cb
+ * keeps the setup wait out of the SPI interrupt, where an interrupt
+ * transaction runs those callbacks.
+ */
+static bool pn532_spi_transact(pn532_spi_bus_t *spi_bus, bool polling, const char *what)
 {
-    pn532_spi_bus_t *bus = (pn532_spi_bus_t *)trans->user;
-    if (bus != NULL) {
-        gpio_ll_set_level(&GPIO, bus->nss, 0);
-        /* NSS setup time before the first clock edge. The PN532 documents
-         * give no minimum outside Power Down (that wake-up is the pulse of
-         * pn532_spi_bus_wake()); 100 us is the value this driver has been
-         * run with on hardware since its first version. */
-        esp_rom_delay_us(100);
+    esp_err_t err = spi_device_acquire_bus(spi_bus->spi_handle, portMAX_DELAY);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: spi_device_acquire_bus failed (%s)", what, esp_err_to_name(err));
+        return false;
     }
-}
 
-static void IRAM_ATTR pn532_spi_post_transfer(spi_transaction_t *trans)
-{
-    pn532_spi_bus_t *bus = (pn532_spi_bus_t *)trans->user;
-    if (bus != NULL) {
-        gpio_ll_set_level(&GPIO, bus->nss, 1);
+    gpio_set_level(spi_bus->nss, 0);
+    esp_rom_delay_us(PN532_SPI_NSS_SETUP_US);
+    /* Polling for the 1-byte status read, which wait_ready() issues every
+     * tick, avoids interrupt/task-switch latency; the frame transfers wait
+     * on the DMA interrupt. */
+    err = polling ? spi_device_polling_transmit(spi_bus->spi_handle, spi_bus->trans)
+                  : spi_device_transmit(spi_bus->spi_handle, spi_bus->trans);
+    gpio_set_level(spi_bus->nss, 1);
+
+    spi_device_release_bus(spi_bus->spi_handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: failed (%s)", what, esp_err_to_name(err));
+        return false;
     }
+    return true;
 }
 
 static bool pn532_spi_bus_write_command(pn532_bus_t *bus, const uint8_t *buffer, size_t len)
@@ -101,14 +115,8 @@ static bool pn532_spi_bus_write_command(pn532_bus_t *bus, const uint8_t *buffer,
     spi_bus->trans->cmd       = PN532_SPI_DATAWRITE;
     spi_bus->trans->length    = len * 8u;
     spi_bus->trans->tx_buffer = spi_bus->tx_buffer;
-    spi_bus->trans->user      = spi_bus;
 
-    esp_err_t err = spi_device_transmit(spi_bus->spi_handle, spi_bus->trans);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "pn532_spi_bus_write_command: failed (%s)", esp_err_to_name(err));
-        return false;
-    }
-    return true;
+    return pn532_spi_transact(spi_bus, false, "pn532_spi_bus_write_command");
 }
 
 static bool pn532_spi_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t len)
@@ -123,11 +131,8 @@ static bool pn532_spi_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t le
     spi_bus->trans->cmd       = PN532_SPI_DATAREAD;
     spi_bus->trans->rxlength  = len * 8u;
     spi_bus->trans->rx_buffer = spi_bus->rx_buffer;
-    spi_bus->trans->user      = spi_bus;
 
-    esp_err_t err = spi_device_transmit(spi_bus->spi_handle, spi_bus->trans);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "pn532_spi_bus_read_data: data failed (%s)", esp_err_to_name(err));
+    if (!pn532_spi_transact(spi_bus, false, "pn532_spi_bus_read_data")) {
         return false;
     }
 
@@ -147,13 +152,8 @@ static bool pn532_spi_bus_is_ready(pn532_bus_t *bus)
     spi_bus->trans->cmd      = PN532_SPI_STATREAD;
     spi_bus->trans->rxlength = 8;
     spi_bus->trans->flags    = SPI_TRANS_USE_RXDATA;
-    spi_bus->trans->user     = spi_bus;
 
-    /* Polling avoids interrupt/task-switch latency for this 1-byte read,
-     * which wait_ready() issues every tick. */
-    esp_err_t err = spi_device_polling_transmit(spi_bus->spi_handle, spi_bus->trans);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "pn532_spi_bus_is_ready: failed (%s)", esp_err_to_name(err));
+    if (!pn532_spi_transact(spi_bus, true, "pn532_spi_bus_is_ready")) {
         return false;
     }
 
@@ -239,11 +239,26 @@ static void pn532_spi_bus_destroy(pn532_bus_t *bus)
     free(spi_bus);
 }
 
+/* Every response is read as one PN532_MAX_BUF_SIZE transaction, so a host
+ * initialised by the application must carry a whole frame (a bus without
+ * DMA is limited to 64 bytes). */
+static bool pn532_spi_host_fits_frame(spi_host_device_t host_id, size_t max_transaction_len, const char *who)
+{
+    if (max_transaction_len < PN532_MAX_BUF_SIZE) {
+        ESP_LOGE(TAG, "%s: SPI host %d carries %u bytes per transaction, the PN532 needs %d", who, (int)host_id,
+                 (unsigned)max_transaction_len, PN532_MAX_BUF_SIZE);
+        return false;
+    }
+    return true;
+}
+
 static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi)
 {
     size_t max_transaction_len;
     if (spi_bus_get_max_transaction_len(host_id, &max_transaction_len) == ESP_OK) {
-        return true;
+        /* Initialised by the application (or by an earlier pn532_spi_init()):
+         * reused as it is. */
+        return pn532_spi_host_fits_frame(host_id, max_transaction_len, "pn532_spi_init");
     }
 
     spi_bus_config_t bus_config = {
@@ -322,8 +337,6 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         .spics_io_num   = -1,
         .queue_size     = 3,
         .flags          = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_BIT_LSBFIRST,
-        .pre_cb         = pn532_spi_pre_transfer,
-        .post_cb        = pn532_spi_post_transfer,
     };
 
     if (spi_bus_add_device(host_id, &dev_config, &spi_bus->spi_handle) != ESP_OK) {
@@ -381,10 +394,7 @@ pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clo
         ESP_LOGE(TAG, "pn532_spi_attach: SPI host %d is not initialised", (int)host_id);
         return NULL;
     }
-    /* Every response is read as one PN532_MAX_BUF_SIZE transaction. */
-    if (max_transaction_len < PN532_MAX_BUF_SIZE) {
-        ESP_LOGE(TAG, "pn532_spi_attach: SPI host %d carries %u bytes per transaction, the PN532 needs %d", (int)host_id,
-                 (unsigned)max_transaction_len, PN532_MAX_BUF_SIZE);
+    if (!pn532_spi_host_fits_frame(host_id, max_transaction_len, "pn532_spi_attach")) {
         return NULL;
     }
     return pn532_spi_add_device(host_id, nss, clock_speed_hz);

@@ -1,5 +1,32 @@
 # Changelog
 
+## v 0.7.5 - 2026-10-27
+
+Fixes from an audit of 0.7.4, checked against the NXP FRISDK reference, NxpNfcRdLib (phalTop Type 2 and Type 4, phNfcLib) and the PN532/C1 datasheet. Run on an ESP32 with two PN532 on separate SPI hosts, one task per reader and both at the same time, with NTAG213, MIFARE Classic 1K and DESFire cards. Two readers on one shared SPI host have run 0.7.4 only.
+
+Behaviour changes:
+
+- **SPI: NSS is driven from the calling task, not from the SPI interrupt** (`pn532-bus-spi.c`). The `pre_cb` / `post_cb` callbacks run in the SPI ISR for interrupt transactions, so every frame transfer spent the 100 µs NSS setup wait there. The driver now holds the bus with `spi_device_acquire_bus()` while it drives NSS as a GPIO around the transaction; the setup time stays 100 µs, and a second device on the host cannot be selected meanwhile.
+- **Type 4: the NDEF Tag Application Select carries Le = 00h** (`pn532-14443.c`), as the NFC Forum Type 4 Tag specification and NxpNfcRdLib write it; strict ISO 7816 applets refuse the form without Le. A select by file identifier has no Le. The answer of a select may take a full short R-APDU (258 bytes).
+- **Type 2 NDEF read leaves out the lock and reserved bytes** (`pn532-ndef.c`) that Lock Control and Memory Control TLVs place inside the data area, as NxpNfcRdLib phalTop does, so a message continues behind them. A control TLV layout the scan cannot follow is read as before. The scan starts from the 12 data-area bytes the capability container READ already returns: the write needs one READ less on a factory NTAG21x, the read none extra.
+- `pn532_14443_select_by_uid()`: a refused InSelect of a cached target number falls back to a new listing instead of returning a handle that fails the same way on every retry.
+- `pn532_in_communicate_thru()`: statuses `0x01`, `0x0B`, `0x13` and `0x14` mark the target stale and close the session, as `pn532_in_data_exchange()` does; the field stays on.
+- `pn532_spi_init()` refuses a host initialised by the application whose transactions are shorter than a PN532 frame, as `pn532_spi_attach()` already did.
+- SAK `0x11` is `PN532_MIFARE_PLUS_4K` with 256 blocks (MIFARE Plus 4K at security level 2, NxpNfcRdLib phNfcLib); it was `PN532_MIFARE_PLUS_2K` with 128. SAK `0x10` stays `PN532_MIFARE_PLUS_2K`.
+
+Fixes:
+
+- `pn532_in_data_exchange()`: the RF-off after an RF timeout no longer overwrites `last_command_status` with the status of that clean-up command.
+- `pn532_reset()` documents that a hardware reset drops the SAM, retry and SetParameters configuration until `pn532_recover()` writes it again.
+
+Measured on the hardware named above:
+
+- Without a card, in four runs: init, error frame, PowerDown and wake-up, 200 commands per clock from 500 kHz to 5 MHz without a failure on either reader, and 40 polls per reader with both readers polling at the same time. A status read takes 150 to 190 µs, 100 µs of them the NSS setup.
+- An NTAG213 lying on a reader: type from GET_VERSION, NDEF read before and after provoked errors, write guards, and 70 of 70 poll / select / read cycles. An NTAG213 on one reader and a Classic 1K on the other, both readers at once: 70 of 70 cycles on each.
+- A DESFire without an NDEF application refuses the Select with Le every time, and the read returns `PN532_NDEF_ERR_NO_NDEF`. Some cards are not listed in part of the polls (the DESFire about one poll in eleven, on either reader); the polling code did not change in this version.
+
+Tests: 69 host tests under ASan/UBSan (new: InSelect fallback, InCommunicateThru statuses, reserved bytes of a Memory Control TLV, the IRQ wait path through the bus fallback, MIFARE Plus SAKs; the Type 4 select test checks the Le byte).
+
 ## v 0.7.4 - 2026-10-07
 
 Fixes from a review of 0.7.3, checked against NxpNfcRdLib (phalTop Type 2 and Type 4). Run on the host tests only; the Type 2 write was not repeated on hardware.

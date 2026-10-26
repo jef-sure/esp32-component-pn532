@@ -66,9 +66,15 @@ static bool pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t
     return true;
 }
 
+/* The READ of the capability container (page 3) also returns pages 4..6: the
+ * first bytes of the data area, handed on so the control TLV scan can start
+ * without a READ of its own. */
+#define TYPE2_DATA_HEAD_LEN 12
+
 /* *has_cc reports whether the tag carries a capability container; without
- * one it is not NDEF formatted and uid is left as detected from the SAK. */
-static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid, bool *has_cc)
+ * one it is not NDEF formatted and uid is left as detected from the SAK.
+ * data_head receives the first TYPE2_DATA_HEAD_LEN bytes of the data area. */
+static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid, bool *has_cc, uint8_t *data_head)
 {
     uint8_t cc_read[16];
 
@@ -98,6 +104,7 @@ static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid, bool *h
     }
 
     *has_cc = pn532_type2_refine_uid_from_cc_read(cc_read, uid);
+    memcpy(data_head, cc_read + 4, TYPE2_DATA_HEAD_LEN);
     return true;
 }
 
@@ -834,12 +841,40 @@ bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_
 
 /* ---- Read flow ---- */
 
+#define TLV_LOCK_CONTROL   0x01
+#define TLV_MEMORY_CONTROL 0x02
+/* Six 5-byte control TLVs (NxpNfcRdLib phalTop keeps three of each kind) and two spare bytes. */
+#define TYPE2_CONTROL_TLV_SCAN  32
+#define TYPE2_MAX_CONTROL_TLVS  6
+#define TYPE2_CONTROL_TLV_VALUE 3
+
+/* Lock or reserved bytes named by a control TLV, as a byte address in the tag memory. */
+typedef struct
+{
+    size_t addr;
+    size_t len;
+} type2_reserved_area_t;
+
+static bool type2_addr_is_reserved(const type2_reserved_area_t *areas, size_t area_count, size_t addr)
+{
+    for (size_t a = 0; a < area_count; a++) {
+        if (addr >= areas[a].addr && addr - areas[a].addr < areas[a].len) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Type 2 (Ultralight/NTAG) flat read: READ returns 16 bytes (4 pages) from the
- * requested page, so the TLV area is scanned 4 pages per transaction. MIFARE
- * Classic goes through classic_read_from_selected_sectors() instead.
+ * requested page, so the TLV area is scanned 4 pages per transaction. Lock and
+ * reserved bytes named by the control TLVs (areas) are not part of the TLV
+ * stream (NFC Forum Type 2 Tag): they are left out, so a message continues
+ * behind them. MIFARE Classic goes through classic_read_from_selected_sectors()
+ * instead.
  */
 static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int max_pages,
+                                           const type2_reserved_area_t *areas, size_t area_count,
                                            pn532_ndef_message_parsed_t **out_msg)
 {
     if (pn532 == NULL || out_msg == NULL || max_pages <= 0) {
@@ -862,7 +897,9 @@ static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int m
     bool   read_ok     = true;
 
     for (int page = start_page; (page - start_page) < max_pages; page += 4) {
-        if (len + 16 > capacity) {
+        uint8_t window[16];
+
+        if (len + sizeof(window) > capacity) {
             size_t   new_cap = capacity * 2;
             uint8_t *new_buf = realloc(buf, new_cap);
             if (new_buf == NULL) {
@@ -873,14 +910,19 @@ static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int m
             capacity = new_cap;
         }
 
-        if (!pn532_14443_block_read(pn532, page, buf + len, 16)) {
+        if (!pn532_14443_block_read(pn532, page, window, sizeof(window))) {
             read_ok = false;
             break;
         }
         /* The last READ of the data area may run into the lock/configuration
          * pages or wrap around to page 0, so only pages inside the area count. */
-        int pages_left = max_pages - (page - start_page);
-        len += (pages_left < 4) ? (size_t)pages_left * 4u : 16u;
+        int    pages_left = max_pages - (page - start_page);
+        size_t bytes      = (pages_left < 4) ? (size_t)pages_left * 4u : sizeof(window);
+        for (size_t b = 0; b < bytes; b++) {
+            if (!type2_addr_is_reserved(areas, area_count, (size_t)page * 4u + b)) {
+                buf[len++] = window[b];
+            }
+        }
 
         if (ndef_tlv_find_ndef(buf, len, &tlv_pos, &ndef_offset, &ndef_len)) {
             if (ndef_offset + ndef_len <= len) {
@@ -903,19 +945,25 @@ static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int m
     return parse_res;
 }
 
-#define TLV_LOCK_CONTROL   0x01
-#define TLV_MEMORY_CONTROL 0x02
-/* Six 5-byte control TLVs (NxpNfcRdLib phalTop keeps three of each kind) and two spare bytes. */
-#define TYPE2_CONTROL_TLV_SCAN  32
-#define TYPE2_MAX_CONTROL_TLVS  6
-#define TYPE2_CONTROL_TLV_VALUE 3
-
-/* Lock or reserved bytes named by a control TLV, as a byte address in the tag memory. */
-typedef struct
+/* Reads 16-byte windows of the data area into scan until *have covers need
+ * bytes (need <= scan_len); *have is a multiple of 4 whenever a READ is due. */
+static bool type2_scan_fill(pn532_t *pn532, uint8_t *scan, size_t scan_len, size_t *have, size_t need)
 {
-    size_t addr;
-    size_t len;
-} type2_reserved_area_t;
+    while (*have < need) {
+        uint8_t window[16];
+        size_t  take = scan_len - *have;
+
+        if (!pn532_14443_block_read(pn532, TYPE2_FIRST_DATA_PAGE + (int)(*have / 4), window, sizeof(window))) {
+            return false;
+        }
+        if (take > sizeof(window)) {
+            take = sizeof(window);
+        }
+        memcpy(scan + *have, window, take);
+        *have += take;
+    }
+    return true;
+}
 
 /*
  * Lock Control (01h) and Memory Control (02h) TLVs at the start of the data
@@ -923,25 +971,28 @@ typedef struct
  * They stand in front of the NDEF TLV and tell where the dynamic lock bits
  * and the reserved bytes are: PageAddr * 2^BytesPerPage + ByteOffset. An
  * NTAG213/215/216 leaves the factory with a Lock Control TLV in page 4.
+ * known holds the first known_len bytes of the data area (from the READ of
+ * the capability container); more is read only while control TLVs go on.
  * scan receives the first bytes of the data area, *ctrl_len how many of them
  * the control TLVs take.
  */
-static pn532_ndef_result_t type2_read_control_tlvs(pn532_t *pn532, size_t data_area_len, uint8_t *scan,
-                                                   size_t *ctrl_len, type2_reserved_area_t *areas, size_t *area_count)
+static pn532_ndef_result_t type2_read_control_tlvs(pn532_t *pn532, size_t data_area_len, const uint8_t *known,
+                                                   size_t known_len, uint8_t *scan, size_t *ctrl_len,
+                                                   type2_reserved_area_t *areas, size_t *area_count)
 {
     size_t scan_len = (data_area_len < TYPE2_CONTROL_TLV_SCAN) ? data_area_len : TYPE2_CONTROL_TLV_SCAN;
+    size_t have     = (known_len < scan_len) ? known_len : scan_len;
 
     *ctrl_len   = 0;
     *area_count = 0;
     memset(scan, 0, TYPE2_CONTROL_TLV_SCAN);
-    for (size_t off = 0; off < scan_len; off += 16) {
-        if (!pn532_14443_block_read(pn532, TYPE2_FIRST_DATA_PAGE + (int)(off / 4), scan + off, 16)) {
-            return PN532_NDEF_ERR_READ_FAILED;
-        }
-    }
+    memcpy(scan, known, have);
 
     size_t i = 0;
     while (i < scan_len) {
+        if (!type2_scan_fill(pn532, scan, scan_len, &have, i + 1)) {
+            return PN532_NDEF_ERR_READ_FAILED;
+        }
         uint8_t type = scan[i];
 
         if (type == TLV_NULL) {
@@ -954,6 +1005,9 @@ static pn532_ndef_result_t type2_read_control_tlvs(pn532_t *pn532, size_t data_a
         /* More control TLVs than the scan holds: the layout is not known in full. */
         if (i + 2 + TYPE2_CONTROL_TLV_VALUE > scan_len || *area_count >= TYPE2_MAX_CONTROL_TLVS) {
             return PN532_NDEF_ERR_UNSUPPORTED;
+        }
+        if (!type2_scan_fill(pn532, scan, scan_len, &have, i + 2 + TYPE2_CONTROL_TLV_VALUE)) {
+            return PN532_NDEF_ERR_READ_FAILED;
         }
         if (scan[i + 1] != TYPE2_CONTROL_TLV_VALUE) {
             return PN532_NDEF_ERR_PARSE_FAILED;
@@ -972,6 +1026,30 @@ static pn532_ndef_result_t type2_read_control_tlvs(pn532_t *pn532, size_t data_a
         *ctrl_len = i;
     }
     return PN532_NDEF_OK;
+}
+
+/* NDEF read of the data area the capability container describes, with the
+ * lock and reserved bytes of the control TLVs left out. */
+static pn532_ndef_result_t type2_read_ndef_area(pn532_t *pn532, const pn532_uid_t *uid, const uint8_t *data_head,
+                                                pn532_ndef_message_parsed_t **out_msg)
+{
+    uint8_t               scan[TYPE2_CONTROL_TLV_SCAN];
+    type2_reserved_area_t areas[TYPE2_MAX_CONTROL_TLVS];
+    size_t                area_count      = 0;
+    size_t                ctrl_len        = 0;
+    int                   data_area_pages = (int)uid->blocks_count - TYPE2_FIRST_DATA_PAGE;
+
+    pn532_ndef_result_t res = type2_read_control_tlvs(pn532, (size_t)data_area_pages * 4u, data_head,
+                                                      TYPE2_DATA_HEAD_LEN, scan, &ctrl_len, areas, &area_count);
+    if (res == PN532_NDEF_ERR_READ_FAILED) {
+        return res;
+    }
+    if (res != PN532_NDEF_OK) {
+        /* A layout the scan cannot follow: the stream is read as it is. */
+        ESP_LOGD(TAG, "type2_read_ndef_area: control TLVs not usable (%s)", pn532_ndef_result_to_string(res));
+        area_count = 0;
+    }
+    return type2_read_ndef(pn532, TYPE2_FIRST_DATA_PAGE, data_area_pages, areas, area_count, out_msg);
 }
 
 pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn532_ndef_message_t *msg, int start_block,
@@ -1026,8 +1104,11 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
     type2_reserved_area_t areas[TYPE2_MAX_CONTROL_TLVS];
     size_t                area_count = 0;
     size_t                ctrl_len   = 0;
-    pn532_ndef_result_t   ctrl_res =
-        type2_read_control_tlvs(pn532, data_area_pages * (size_t)block_size, scan, &ctrl_len, areas, &area_count);
+    /* The READ of page 3 brought pages 4..6 along: the first 12 bytes of the
+     * data area, enough for the usual single control TLV. */
+    pn532_ndef_result_t ctrl_res =
+        type2_read_control_tlvs(pn532, data_area_pages * (size_t)block_size, cc_read + 4, TYPE2_DATA_HEAD_LEN, scan,
+                                &ctrl_len, areas, &area_count);
     if (ctrl_res != PN532_NDEF_OK) {
         return ctrl_res;
     }
@@ -1699,28 +1780,29 @@ pn532_ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, 
     case PN532_MIFARE_NTAG213:
     case PN532_MIFARE_NTAG215:
     case PN532_MIFARE_NTAG216: {
-        bool has_cc = false;
-        if (!pn532_type2_prepare_layout(pn532, uid, &has_cc)) {
+        bool    has_cc = false;
+        uint8_t data_head[TYPE2_DATA_HEAD_LEN];
+        if (!pn532_type2_prepare_layout(pn532, uid, &has_cc, data_head)) {
             return PN532_NDEF_ERR_READ_FAILED;
         }
         /* Capability container at page 3, NDEF data from page 4. A tag
          * without the container, or with an empty data area, is not NDEF
          * formatted. */
-        if (!has_cc || uid->blocks_count <= 4) {
+        if (!has_cc || uid->blocks_count <= TYPE2_FIRST_DATA_PAGE) {
             return PN532_NDEF_ERR_NO_NDEF;
         }
-        pn532_ndef_result_t res = type2_read_ndef(pn532, 4, uid->blocks_count - 4, out_msg);
+        pn532_ndef_result_t res = type2_read_ndef_area(pn532, uid, data_head, out_msg);
         if (res == PN532_NDEF_ERR_READ_FAILED) {
             if (!pn532_14443_select_by_uid(pn532, uid)) {
                 return res;
             }
-            if (!pn532_type2_prepare_layout(pn532, uid, &has_cc)) {
+            if (!pn532_type2_prepare_layout(pn532, uid, &has_cc, data_head)) {
                 return res;
             }
-            if (!has_cc || uid->blocks_count <= 4) {
+            if (!has_cc || uid->blocks_count <= TYPE2_FIRST_DATA_PAGE) {
                 return PN532_NDEF_ERR_NO_NDEF;
             }
-            res = type2_read_ndef(pn532, 4, uid->blocks_count - 4, out_msg);
+            res = type2_read_ndef_area(pn532, uid, data_head, out_msg);
         }
         return res;
     }
