@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.5"
+idf.py add-dependency "jef-sure/pn532^0.7.6"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -540,7 +540,7 @@ With that subtype `pn532_ndef_read_card_auto()` also takes the Type 4 path. To s
 
 ### Tests
 
-The tests in [`test_apps/polling`](test_apps/polling) drive the driver core through a mock bus, with simulated Type 2, MIFARE Classic, and Type 4 cards behind it. They build as an ESP-IDF Unity app for a board, and run on the host without hardware under AddressSanitizer:
+The tests live in the [GitHub repository](https://github.com/jef-sure/esp32-component-pn532) and are not part of the component archive. Those in [`test_apps/polling`](test_apps/polling) drive the driver core through a mock bus, with simulated Type 2, MIFARE Classic, and Type 4 cards behind it. They build as an ESP-IDF Unity app for a board, and run on the host without hardware under AddressSanitizer:
 
 ```sh
 make -C host_test test IDF_PATH=<path to esp-idf>

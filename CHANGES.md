@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.7.6 - 2026-11-01
+
+Packaging only, no code changes.
+
+- The `files` section of the manifest is now an explicit list: the component archive holds the sources, the headers, the example, the README, the change log and the license. `host_test/`, `test_apps/`, `.clang-format` and `.gitignore` stay in the repository.
+- The README says that the tests are not part of the component archive.
+
 ## v 0.7.5 - 2026-10-27
 
 Fixes from an audit of 0.7.4, checked against the NXP FRISDK reference, NxpNfcRdLib (phalTop Type 2 and Type 4, phNfcLib) and the PN532/C1 datasheet. Run on an ESP32 with two PN532 on separate SPI hosts, one task per reader and both at the same time, with NTAG213, MIFARE Classic 1K and DESFire cards. Two readers on one shared SPI host have run 0.7.4 only.
