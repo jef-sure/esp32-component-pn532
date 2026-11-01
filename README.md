@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.6"
+idf.py add-dependency "jef-sure/pn532^0.7.7"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -389,7 +389,7 @@ For UID-only discovery the lifecycle is `poll -> RF off`. When card data is read
 
 ### Sharing a bus with other devices
 
-`pn532_i2c_init()` and `pn532_spi_init()` create the bus themselves. When other devices live on the same port, create the bus in your application and attach the PN532 to it. Destroying the PN532 then removes only its device; the bus and its neighbours stay alive.
+`pn532_i2c_init()` and `pn532_spi_init()` create the bus themselves. When other devices live on the same port, create the bus in your application and attach the PN532 to it. Destroying the PN532 then removes only its device; the bus and its neighbours stay alive. An I2C bus must keep `trans_queue_depth` at 0: the driver needs blocking transfers, and on an asynchronous bus it would read its buffers before the data arrives.
 
 ```c
 i2c_master_bus_config_t cfg = {

@@ -237,6 +237,10 @@ pn532_bus_t *pn532_i2c_init(       //
  * PN532_I2C_DEFAULT_CLOCK_HZ is used, and more than PN532_I2C_MAX_CLOCK_HZ is
  * lowered to it.
  *
+ * The bus must be created with trans_queue_depth = 0: on an asynchronous bus
+ * i2c_master_receive() returns before the data arrives and shows no bus errors.
+ * ESP-IDF offers no way to check this here.
+ *
  * @return Newly allocated transport handle, or NULL when no bus exists on port or on failure.
  */
 pn532_bus_t *pn532_i2c_attach(i2c_port_num_t port, uint16_t device_address, uint32_t clock_speed_hz);

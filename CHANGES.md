@@ -1,5 +1,22 @@
 # Changelog
 
+## v 0.7.7 - 2026-11-01
+
+I2C fixes. Not run on a PN532 over I2C: the test boards have their readers on SPI. The ESP-IDF behaviour below was read in the sources of 5.5.4, 5.5.5, 6.0.3 and 6.1, and measured on a JC4827 board with a GT911 touch controller on 6.1; the PN532 transport was run on the host against a stand-in for the I2C master driver.
+
+Fixes:
+
+- **I2C: `pn532_i2c_init()` creates a blocking bus** (`pn532-bus-i2c.c`). `trans_queue_depth = 1`, there since the first version, puts an ESP-IDF bus into its asynchronous mode. `i2c_master_receive()` then returned `ESP_OK` after about 46 µs, before the byte arrived, also for an address nobody answered (`ESP_ERR_INVALID_RESPONSE` and about 230 µs on a blocking bus). The readiness check looked at its still empty status variable, and the interrupt wrote the byte to that stack variable later, after the function had returned. By the code a PN532 could practically never get through `pn532_init()` on this path, and every poll wrote one byte to stack memory the check no longer owned; the warning ESP-IDF prints for this mode also calls it incompatible with `i2c_master_probe()`, the I2C wake-up. `pn532_i2c_attach()` was not affected on a bus without a queue, which the README example creates; the requirement is now documented.
+- I2C: ready is bit 0 of the status byte, the other bits are rfu (UM0701-02 §6.2.4); the whole byte was compared with `0x01`.
+
+Kept on purpose:
+
+- I2C reads the status byte alone and the frame in a new read, as Adafruit_PN532, its CircuitPython driver and ESPHome do. UM0701-02 §6.2.4 and AN10449 §2.4.2 ask for one read without a STOP (Fig 31/32 of the manual draw two accesses), but reports from real chips say a STOP right after the status byte keeps the frame: a 2016 test on a Raspberry Pi and go-pn532 on a Raspberry Pi 5 with a logic analyzer. The 0.7.7 bus runs this path here for the first time; if a chip did lose the frame, `pn532_init()` would fail instead of returning bad data.
+
+Tests:
+
+- `host_test` builds the I2C transport against a stand-in for the ESP-IDF driver that behaves like the real one on a bus with a queue.
+
 ## v 0.7.6 - 2026-11-01
 
 Packaging only, no code changes.

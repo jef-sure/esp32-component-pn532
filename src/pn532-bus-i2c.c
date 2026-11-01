@@ -11,6 +11,7 @@
 
 static const char *TAG = "PN532-I2C";
 
+/* UM0701-02 §6.2.4: RDY is bit 0 of the status byte, the other bits are rfu. */
 #define PN532_I2C_READY                0x01
 #define PN532_I2C_TRANSFER_TIMEOUT_MS  100
 #define PN532_I2C_READY_RETRY_COUNT    8
@@ -85,13 +86,13 @@ static bool pn532_i2c_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t le
             pn532_delay_ms(PN532_I2C_READY_RETRY_DELAY_MS);
             uint8_t status = 0;
             err            = i2c_master_receive(i2c_bus->dev_handle, &status, 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
-            if (err != ESP_OK || status != PN532_I2C_READY) {
+            if (err != ESP_OK || (status & PN532_I2C_READY) == 0) {
                 continue;
             }
         }
 
         err = i2c_master_receive(i2c_bus->dev_handle, i2c_bus->buffer, len + 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
-        if (err == ESP_OK && i2c_bus->buffer[0] == PN532_I2C_READY) {
+        if (err == ESP_OK && (i2c_bus->buffer[0] & PN532_I2C_READY) != 0) {
             memcpy(buffer, i2c_bus->buffer + 1, len);
             return true;
         }
@@ -111,6 +112,13 @@ static bool pn532_i2c_bus_is_ready(pn532_bus_t *bus)
         return false;
     }
 
+    /*
+     * The status byte is read alone, then read_data() reads it again with the
+     * frame. UM0701-02 §6.2.4 and AN10449 §2.4.2 ask for one read without a STOP,
+     * but Adafruit_PN532, its CircuitPython driver and ESPHome work this way, and
+     * reports from real chips say a STOP right after the status byte keeps the
+     * frame. A STOP inside a frame does lose the rest, so that is read whole.
+     */
     esp_err_t err = i2c_master_receive(i2c_bus->dev_handle, &status, 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
     if (err != ESP_OK) {
         /* A busy PN532 may NACK instead of returning status 0x00. */
@@ -118,7 +126,7 @@ static bool pn532_i2c_bus_is_ready(pn532_bus_t *bus)
         return false;
     }
 
-    return status == PN532_I2C_READY;
+    return (status & PN532_I2C_READY) != 0;
 }
 
 static void pn532_i2c_bus_wake(pn532_bus_t *bus)
@@ -229,7 +237,10 @@ pn532_bus_t *pn532_i2c_init(i2c_port_num_t port, gpio_num_t scl, gpio_num_t sda,
         .clk_source                   = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt            = 7,
         .intr_priority                = 0,
-        .trans_queue_depth            = 1,
+        /* 0 is a blocking bus. With a queue i2c_master_receive() returns before
+         * the data arrives, shows no bus error, and the ISR writes to the caller's
+         * buffer later: for the status byte a stack variable that is gone by then. */
+        .trans_queue_depth            = 0,
         .flags.enable_internal_pullup = 1,
     };
     i2c_master_bus_handle_t bus_handle = NULL;
