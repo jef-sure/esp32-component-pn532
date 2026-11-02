@@ -256,9 +256,10 @@ static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_n
 {
     size_t max_transaction_len;
     if (spi_bus_get_max_transaction_len(host_id, &max_transaction_len) == ESP_OK) {
-        /* Initialised by the application (or by an earlier pn532_spi_init()):
-         * reused as it is. */
-        return pn532_spi_host_fits_frame(host_id, max_transaction_len, "pn532_spi_init");
+        /* A host with a device on it (an earlier pn532_spi_init() or the
+         * application) is reused as it is; pn532_spi_add_device() checks its
+         * transaction size. */
+        return true;
     }
 
     spi_bus_config_t bus_config = {
@@ -275,6 +276,12 @@ static bool pn532_spi_bus_init(spi_host_device_t host_id, gpio_num_t sck, gpio_n
     };
 
     esp_err_t err = spi_bus_initialize(host_id, &bus_config, SPI_DMA_CH_AUTO);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* Initialised by the application with no device on it yet: ESP-IDF
+         * answers spi_bus_get_max_transaction_len() only after the first
+         * spi_bus_add_device(), and logs "SPI bus already initialized" here. */
+        return true;
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "pn532_spi_bus_init: spi_bus_initialize failed (%s)", esp_err_to_name(err));
         return false;
@@ -295,7 +302,8 @@ static uint8_t *pn532_spi_alloc_buffer(spi_host_device_t host_id)
 #endif
 }
 
-static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz)
+static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz,
+                                         const char *who)
 {
     if (clock_speed_hz <= 0) {
         ESP_LOGW(TAG, "clock_speed_hz=%d, using default %d Hz", clock_speed_hz, PN532_SPI_DEFAULT_CLOCK_HZ);
@@ -339,9 +347,20 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
         .flags          = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_BIT_LSBFIRST,
     };
 
-    if (spi_bus_add_device(host_id, &dev_config, &spi_bus->spi_handle) != ESP_OK) {
+    esp_err_t err = spi_bus_add_device(host_id, &dev_config, &spi_bus->spi_handle);
+    if (err != ESP_OK) {
         free(spi_bus);
-        ESP_LOGE(TAG, "pn532_spi_add_device: failed to add SPI device");
+        ESP_LOGE(TAG, "%s: spi_bus_add_device on host %d failed (%s); is the host initialised?", who, (int)host_id,
+                 esp_err_to_name(err));
+        return NULL;
+    }
+    /* ESP-IDF answers spi_bus_get_max_transaction_len() only once a device is
+     * on the host, so the size is checked here and not before. */
+    size_t max_transaction_len = 0;
+    if (spi_bus_get_max_transaction_len(host_id, &max_transaction_len) != ESP_OK ||
+        !pn532_spi_host_fits_frame(host_id, max_transaction_len, who)) {
+        spi_bus_remove_device(spi_bus->spi_handle);
+        free(spi_bus);
         return NULL;
     }
     pn532_spi_wake_pulse(spi_bus);
@@ -379,7 +398,7 @@ pn532_bus_t *pn532_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_
     if (!pn532_spi_bus_init(host_id, sck, miso, mosi)) {
         return NULL;
     }
-    pn532_bus_t *bus = pn532_spi_add_device(host_id, nss, clock_speed_hz);
+    pn532_bus_t *bus = pn532_spi_add_device(host_id, nss, clock_speed_hz, "pn532_spi_init");
     if (bus == NULL) {
         pn532_spi_host_release(host_id);
     }
@@ -388,14 +407,8 @@ pn532_bus_t *pn532_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_
 
 pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz)
 {
-    size_t max_transaction_len;
-    if ((unsigned)host_id >= SPI_HOST_MAX ||
-        spi_bus_get_max_transaction_len(host_id, &max_transaction_len) != ESP_OK) {
-        ESP_LOGE(TAG, "pn532_spi_attach: SPI host %d is not initialised", (int)host_id);
+    if ((unsigned)host_id >= SPI_HOST_MAX) {
         return NULL;
     }
-    if (!pn532_spi_host_fits_frame(host_id, max_transaction_len, "pn532_spi_attach")) {
-        return NULL;
-    }
-    return pn532_spi_add_device(host_id, nss, clock_speed_hz);
+    return pn532_spi_add_device(host_id, nss, clock_speed_hz, "pn532_spi_attach");
 }

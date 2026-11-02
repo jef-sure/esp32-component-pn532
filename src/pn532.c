@@ -599,7 +599,8 @@ bool pn532_reset(pn532_t *pn532)
         pn532_delay_ms(20);
         gpio_set_level(pn532->rst, 1);
         /* A hard reset restores the chip's default parameters. */
-        pn532->auto_rats_off = false;
+        pn532->auto_rats_off     = false;
+        pn532->auto_rats_unknown = false;
     }
 
     pn532_delay_ms(100);
@@ -875,9 +876,13 @@ static bool pn532_write_parameters(pn532_t *pn532, bool auto_rats)
     if (!pn532_execute_command(pn532, PN532_COMMAND_SETPARAMETERS, params, sizeof(params), NULL, &response_len,
                                (uint16_t)pn532->timeout_ms) ||
         response_len != 0) {
+        /* The chip may have applied the flags and only the answer got lost:
+         * the next request sends them whatever it asks for. */
+        pn532->auto_rats_unknown = true;
         return false;
     }
-    pn532->auto_rats_off = !auto_rats;
+    pn532->auto_rats_off     = !auto_rats;
+    pn532->auto_rats_unknown = false;
     return true;
 }
 
@@ -886,7 +891,7 @@ bool pn532_set_auto_rats(pn532_t *pn532, bool enabled)
     if (pn532 == NULL) {
         return false;
     }
-    if (pn532->auto_rats_off == !enabled) {
+    if (!pn532->auto_rats_unknown && pn532->auto_rats_off == !enabled) {
         return true;
     }
     return pn532_write_parameters(pn532, enabled);
@@ -910,31 +915,27 @@ bool pn532_release_target(pn532_t *pn532)
         return false;
     }
 
-    /* UM0701-02 §7.3.11: InRelease returns a status byte like InSelect and
-     * InDeselect. Only 0x00 means the target was released; 0x27 means the
-     * target number is not known. Per the NXP TAMA reference (its release
-     * path ignores the status and always closes the session) a release after
-     * the chip already lost the target is not an error the caller can act
-     * on: treat 0x27 as "nothing left to release", clear the local state,
-     * and succeed so poll loops keep working. Any other non-zero status is a
-     * real error and leaves the state untouched. */
+    /* UM0701-02 §7.3.11: "In all the cases ... the logical numbers of the
+     * released targets are freed", whatever the status byte says (a card
+     * that left the field does not answer the DESELECT or HLTA). The NXP
+     * TAMA reference ignores the status and always closes the session, so
+     * the local state goes with any answer. 0x00 is a release and 0x27 a
+     * target the chip had already lost; another status is reported to the
+     * caller, but the target is gone all the same. */
     if (response_len == 0) {
         ESP_LOGE(TAG, "pn532_release_target: empty response");
         return false;
     }
+    pn532->inListedTag    = 0;
+    pn532->session_opened = false;
     if (response[0] == PN532_STATUS_TARGET_NOT_KNOWN) {
         ESP_LOGD(TAG, "pn532_release_target: target already lost (0x27)");
-        pn532->inListedTag    = 0;
-        pn532->session_opened = false;
         return true;
     }
     if (response[0] != PN532_STATUS_OK) {
-        ESP_LOGE(TAG, "pn532_release_target: status 0x%02X", response[0]);
+        ESP_LOGW(TAG, "pn532_release_target: status 0x%02X, target freed anyway", response[0]);
         return false;
     }
-
-    pn532->inListedTag    = 0;
-    pn532->session_opened = false;
     return true;
 }
 

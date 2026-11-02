@@ -136,8 +136,14 @@ static void pn532_14443_detect_ultralight_variant(pn532_t *pn532, pn532_uid_t *u
                                   (uint16_t)pn532->timeout_ms) &&
         response_len == 8) {
         /* header, vendor, product type, subtype, major, minor, storage size, protocol */
-        bool is_ntag = (response[2] == 0x04);
-        switch (response[6]) {
+        bool    is_ntag = (response[2] == 0x04);
+        uint8_t storage = response[6];
+        /* The NTAG213/215/216 sizes name an NTAG only with product type 04h:
+         * another Ultralight family member of that size is not one. */
+        if (!is_ntag && (storage == 0x0F || storage == 0x11 || storage == 0x13)) {
+            storage = 0x00;
+        }
+        switch (storage) {
         case 0x0B: /* 48 bytes of user memory: Ultralight EV1 MF0UL11 or NTAG210 */
             uid->subtype      = is_ntag ? PN532_MIFARE_NTAG210 : PN532_MIFARE_ULTRALIGHT_EV1;
             uid->blocks_count = 20;
@@ -159,7 +165,8 @@ static void pn532_14443_detect_ultralight_variant(pn532_t *pn532, pn532_uid_t *u
             uid->blocks_count = 231;
             break;
         default:
-            ESP_LOGD(TAG_T4, "GET_VERSION: unknown storage size 0x%02X, keeping Ultralight", response[6]);
+            ESP_LOGD(TAG_T4, "GET_VERSION: product type 0x%02X, storage size 0x%02X unknown, keeping Ultralight",
+                     response[2], response[6]);
             break;
         }
         return;
@@ -205,8 +212,10 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
         return false;
     }
     /* The probes are raw exchanges with whatever card is active (UM0701-02
-     * §7.3.9 leaves the selection to the host), so the card must be selected. */
-    if (pn532 != NULL && uid->subtype == PN532_MIFARE_ULTRALIGHT && pn532->inListedTag != 0 && pn532->session_opened) {
+     * §7.3.9 leaves the selection to the host), so this card must be the
+     * selected one; a session open on another card would answer for it. */
+    if (pn532 != NULL && uid->subtype == PN532_MIFARE_ULTRALIGHT && pn532->inListedTag != 0 && pn532->session_opened &&
+        pn532_14443_selected_target_is(pn532, uid)) {
         pn532_14443_detect_ultralight_variant(pn532, uid, needs_reselect);
         *blocks_count = uid->blocks_count;
         *block_size   = uid->block_size;
@@ -467,7 +476,10 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
         return NULL;
     }
 
-    if (!pn532_release_target(pn532)) {
+    /* A release the chip answered with an error status has freed the target
+     * all the same (UM0701-02 §7.3.11) and cleared inListedTag: the poll goes
+     * on. Without an answer the link is in question and the poll stops. */
+    if (!pn532_release_target(pn532) && pn532->inListedTag != 0) {
         if (status != NULL) {
             *status = pn532_poll_command_error(pn532);
         }
@@ -573,7 +585,7 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid)
      * does a card that was listed in the other RATS mode than it needs, and a
      * Tg that a later poll gave to another card. */
     bool plain_mifare = pn532_uid_is_classic_emulation(uid);
-    if (pn532_tg_holds_uid(pn532, uid) && pn532->is_rf_on && !pn532->tg_stale &&
+    if (pn532_tg_holds_uid(pn532, uid) && pn532->is_rf_on && !pn532->tg_stale && !pn532->auto_rats_unknown &&
         pn532->auto_rats_off == plain_mifare) {
         if (pn532_in_select(pn532, uid->tg)) {
             return true;
@@ -685,6 +697,13 @@ bool pn532_14443_4_transceive(pn532_t *pn532, const uint8_t *apdu, size_t apdu_l
         return false;
     }
     if (pn532->inListedTag == 0) {
+        return false;
+    }
+    /* After 0x01/0x0B/0x13/0x14 only a new listing re-activates the card
+     * (pn532_14443_select_by_uid()); a bare InSelect would wait out the
+     * exchange timeout first. */
+    if (pn532->tg_stale) {
+        ESP_LOGD(TAG_T4, "transceive: target %u needs a new listing", (unsigned)pn532->inListedTag);
         return false;
     }
 

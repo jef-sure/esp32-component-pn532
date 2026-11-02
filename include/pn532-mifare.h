@@ -52,8 +52,9 @@ int16_t pn532_mifare_authenticate(pn532_t *pn532, uint8_t blockno, const uint8_t
  * prefer pn532_14443_block_read().
  *
  * For Classic, blockno addresses one 16-byte block. For Type 2 tags, READ from
- * one page returns 16 bytes covering four consecutive pages, so callers should
- * typically provide a 16-byte buffer there as well.
+ * one page returns 16 bytes covering four consecutive pages. Either way the
+ * card answers 16 bytes, so buffer_len must be at least 16; a shorter buffer
+ * fails the call.
  */
 bool pn532_mifare_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_t buffer_len);
 

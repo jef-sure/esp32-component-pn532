@@ -191,21 +191,29 @@ bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_
  *
  * @param start_block First page to write; 4 for a tag whose data area holds
  *                    only the NDEF message. Pages 0..3 (UID, lock bytes,
- *                    capability container) are refused.
+ *                    capability container) are refused. Readers take the
+ *                    first NDEF TLV, so a later page must be reached through
+ *                    NULL TLVs or other TLVs that end at it; an NDEF or
+ *                    Terminator TLV in front of it, as on a factory tag, is
+ *                    refused before anything is written.
  * @param block_size Page size in bytes; only 4 is supported.
  * @param max_blocks Number of pages the message may take, counted from
  *                   start_block (not a page number and not the size of the
  *                   tag). Must be positive.
  * @return PN532_NDEF_OK on success;
- *         PN532_NDEF_ERR_INVALID_PARAM for start_block below 4, a non-positive
- *         max_blocks, or a message that cannot be encoded;
+ *         PN532_NDEF_ERR_INVALID_PARAM for start_block below 4, a start_block
+ *         that readers would not reach, a non-positive max_blocks, or a
+ *         message that cannot be encoded;
  *         PN532_NDEF_ERR_UNSUPPORTED for a block_size other than 4, for lock
- *         or reserved bytes inside the pages to write, or for more than six
- *         control TLVs;
+ *         or reserved bytes inside the pages to write, for more than six
+ *         control TLVs, or for a message that reaches beyond page 255 (the
+ *         second sector of an NTAG I2C 2K needs SECTOR_SELECT, which this
+ *         driver does not send);
  *         PN532_NDEF_ERR_CARD_FULL when the message needs more than max_blocks
  *         pages, does not fit the data area, or is longer than 65534 bytes;
- *         PN532_NDEF_ERR_READ_FAILED when the capability container or the
- *         start of the data area cannot be read; PN532_NDEF_ERR_NO_NDEF when
+ *         PN532_NDEF_ERR_READ_FAILED when the capability container, the
+ *         start of the data area or the pages in front of start_block cannot
+ *         be read; PN532_NDEF_ERR_NO_NDEF when
  *         the tag has no capability container; PN532_NDEF_ERR_READ_ONLY when
  *         it does not grant write access; PN532_NDEF_ERR_PARSE_FAILED for a
  *         malformed control TLV;
@@ -223,11 +231,16 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
  * an empty data area returns PN532_NDEF_ERR_NO_NDEF without scanning the memory.
  * Lock and reserved bytes that Lock Control and Memory Control TLVs place
  * inside the data area are left out of the TLV stream, as the NFC Forum Type
- * 2 Tag specification asks, so a message continues behind them.
+ * 2 Tag specification asks, so a message continues behind them. A Type 2
+ * message that continues beyond page 255 is PN532_NDEF_ERR_UNSUPPORTED: that
+ * sector needs SECTOR_SELECT, which this driver does not send.
  * For MIFARE Classic Mini / 1K it uses MAD1 to locate NDEF sectors, and for
  * 4K it also reads MAD2 when advertised, so non-NDEF cards return
  * PN532_NDEF_ERR_NO_NDEF quickly instead of falling back to a flat scan. A
- * directory with a wrong CRC is treated as absent. For Type 4 tags a
+ * directory with a wrong CRC is treated as absent. For Type 4 tags the
+ * NDEF application of mapping 2.0 and later (AID D2 76 00 00 85 01 01) is
+ * selected, as NxpNfcRdLib does; a mapping 1.0 tag, which has another AID,
+ * is PN532_NDEF_ERR_NO_NDEF. A
  * read-protected NDEF file is PN532_NDEF_ERR_ACCESS_DENIED; an unknown
  * mapping version or an extended NDEF file (Extended NDEF File Control TLV,
  * files above 32 KB) is PN532_NDEF_ERR_UNSUPPORTED; a capability container
@@ -251,8 +264,9 @@ void pn532_ndef_free_parsed_message(pn532_ndef_message_parsed_t *msg);
  * @brief Extract the payload metadata of a Well-known Text ("T") record.
  *
  * The returned text pointer aliases rec->payload. lang_buf and is_utf16 are
- * optional outputs. lang_buf always receives a NUL-terminated string when
- * lang_buf_len > 0; a longer language code is truncated. The card sets the
+ * optional outputs. On success lang_buf receives a NUL-terminated string when
+ * lang_buf_len > 0; a longer language code is truncated. On failure it is
+ * left as it was. The card sets the
  * length of the code, up to 63 bytes, so 64 bytes hold any code.
  */
 bool pn532_ndef_extract_text(const pn532_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out,
@@ -261,8 +275,9 @@ bool pn532_ndef_extract_text(const pn532_ndef_record_t *rec, const uint8_t **tex
 /**
  * @brief Expand a Well-known URI ("U") record into a full URI string.
  *
- * uri_buf always receives a NUL-terminated string when uri_buf_len > 0; pass
- * NULL to query the length only.
+ * For a URI record uri_buf receives a NUL-terminated string when
+ * uri_buf_len > 0; on an error it is left as it was. Pass NULL to query the
+ * length only.
  *
  * @return total expanded URI length without the terminating NUL (it may
  *         exceed uri_buf_len - 1, in which case the string is truncated),

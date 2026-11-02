@@ -14,11 +14,12 @@ UNITY_DIR := $(IDF_PATH)/components/unity/unity/src
 endif
 BUILD_DIR ?= build
 
-# The SPI and UART transports need the real drivers and are not built here; the I2C one runs
-# against the stand-in of the ESP-IDF master driver in host_i2c_test.c.
+# The UART transport needs the real driver and is not built here; the I2C and SPI ones run
+# against stand-ins of the ESP-IDF master drivers in host_i2c_test.c and host_spi_test.c.
 DRIVER_SRCS := ../src/pn532.c ../src/pn532-14443.c ../src/pn532-mifare.c ../src/pn532-apdu.c ../src/pn532-ndef.c \
-               ../src/pn532-bus-i2c.c
-TEST_SRCS   := ../test_apps/polling/main/test_pn532_polling.c host_main.c host_i2c_test.c $(UNITY_DIR)/unity.c
+               ../src/pn532-bus-i2c.c ../src/pn532-bus-spi.c
+TEST_SRCS   := ../test_apps/polling/main/test_pn532_polling.c host_main.c host_i2c_test.c host_spi_test.c \
+               $(UNITY_DIR)/unity.c
 
 CFLAGS += -std=gnu11 -g -O1 -Wall -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=undefined
 CFLAGS += -Istubs -I../include -I../src -I. -I$(UNITY_DIR) -include host_test_case.h -DPN532_HOST_TEST

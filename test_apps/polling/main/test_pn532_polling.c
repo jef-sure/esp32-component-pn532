@@ -1422,22 +1422,35 @@ TEST_CASE("READ BINARY reports required size instead of truncating", "[pn532][t4
     TEST_ASSERT_EQUAL(3, got);
 }
 
-TEST_CASE("protocol-level poll failure maps to PN532_POLL_PROTOCOL_ERROR", "[pn532][polling][protocol]")
+TEST_CASE("an InRelease error status frees the target and the poll goes on", "[pn532][polling][protocol]")
 {
     mock_bus_t mock;
     pn532_t    pn532;
     uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
     uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
     mock_init(&mock, &pn532, MOCK_RELEASE_PROTOCOL_ERROR, send_buf, recv_buf);
-    pn532.inListedTag = 1;
+    pn532.inListedTag    = 1;
+    pn532.session_opened = true;
 
-    /* Release fails with a well-formed 0x29 frame while the transport is
-     * healthy: the poll must surface a protocol error, not a transport
-     * error that would trigger needless pn532_recover() calls. */
+    /* InRelease answers 0x29: the call reports it, but UM0701-02 §7.3.11
+     * frees the target in all cases, so the local state goes with it. */
+    TEST_ASSERT_FALSE(pn532_release_target(&pn532));
+    TEST_ASSERT_EQUAL(0, pn532.inListedTag);
+    TEST_ASSERT_FALSE(pn532.session_opened);
+
+    /* A poll behind such a release goes on instead of failing on the same
+     * target every time. */
+    pn532.inListedTag  = 1;
+    mock.command_count = 0;
     pn532_poll_status_t status;
     pn532_uids_array_t *uids = pn532_14443_get_all_uids_ex(&pn532, &status);
-    TEST_ASSERT_EQUAL(PN532_POLL_PROTOCOL_ERROR, status);
-    TEST_ASSERT_NULL(uids);
+    TEST_ASSERT_EQUAL(PN532_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(1, uids->uids_count);
+    const uint8_t expected[] = {PN532_COMMAND_INRELEASE, PN532_COMMAND_RFCONFIGURATION,
+                                PN532_COMMAND_INLISTPASSIVETARGET};
+    assert_commands(&mock, expected, ARRAY_SIZE(expected));
+    free(uids);
 }
 
 TEST_CASE("ATS follows every SAK with the ISO14443-4 bit, ATQA keeps the reported byte order",
@@ -1466,6 +1479,83 @@ TEST_CASE("ATS follows every SAK with the ISO14443-4 bit, ATQA keeps the reporte
     /* SENS_RES bytes 0x44 0x03 as reported by the PN532. */
     TEST_ASSERT_EQUAL_HEX16(0x4403, uids->uids[0].atqa);
     free(uids);
+}
+
+TEST_CASE("SetParameters without an answer is sent again whatever comes next", "[pn532][polling][rats]")
+{
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE];
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE];
+    mock_bus_t mock;
+    pn532_t    pn532;
+
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    TEST_ASSERT_TRUE(pn532_set_auto_rats(&pn532, false));
+    TEST_ASSERT_EQUAL_HEX8(0x04, mock.tama_params);
+
+    /* The chip takes the flags, but no ACK comes back. */
+    mock.mode = MOCK_ACK_TIMEOUT;
+    TEST_ASSERT_FALSE(pn532_set_auto_rats(&pn532, true));
+    TEST_ASSERT_EQUAL_HEX8(0x14, mock.tama_params);
+
+    /* The driver cannot know which flags the chip holds now, so the next
+     * request is sent even though it asks for the state recorded before. */
+    mock.mode          = MOCK_CARD;
+    mock.command_count = 0;
+    TEST_ASSERT_TRUE(pn532_set_auto_rats(&pn532, false));
+    const uint8_t sent[] = {PN532_COMMAND_SETPARAMETERS};
+    assert_commands(&mock, sent, ARRAY_SIZE(sent));
+    TEST_ASSERT_EQUAL_HEX8(0x04, mock.tama_params);
+
+    /* Known again: the same request is not repeated. */
+    mock.command_count = 0;
+    TEST_ASSERT_TRUE(pn532_set_auto_rats(&pn532, false));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+}
+
+TEST_CASE("Ultralight probes run only on the card that is selected", "[pn532][polling][ultralight]")
+{
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE];
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE];
+    mock_bus_t mock;
+    pn532_t    pn532;
+
+    /* A session is open on another card. */
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    static const uint8_t other[] = {0x01, 0x02, 0x03, 0x04};
+    pn532.inListedTag            = 1;
+    pn532.session_opened         = true;
+    pn532.listed_uid_len[0]      = sizeof(other);
+    memcpy(pn532.listed_uid[0], other, sizeof(other));
+
+    pn532_uid_t uid = {
+        .uid = {0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66}, .uid_length = 7, .tg = 2, .sak = 0x00};
+    uint16_t blocks         = 0;
+    uint16_t block_size     = 0;
+    bool     needs_reselect = true;
+    TEST_ASSERT_TRUE(
+        pn532_14443_detect_selected_card_type_and_capacity(&pn532, &uid, &blocks, &block_size, &needs_reselect));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
+    TEST_ASSERT_FALSE(needs_reselect);
+    TEST_ASSERT_EQUAL(PN532_MIFARE_ULTRALIGHT, uid.subtype);
+}
+
+TEST_CASE("ISO-DEP exchange with a stale target fails without a command", "[pn532][polling][t4]")
+{
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE];
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE];
+    mock_bus_t mock;
+    pn532_t    pn532;
+
+    mock_init(&mock, &pn532, MOCK_CARD, send_buf, recv_buf);
+    pn532.inListedTag = 1;
+    pn532.is_rf_on    = true;
+    pn532.tg_stale    = true;
+
+    static const uint8_t apdu[] = {0x00, 0xA4, 0x04, 0x00};
+    uint8_t              rx[16];
+    size_t               rx_len = sizeof(rx);
+    TEST_ASSERT_FALSE(pn532_14443_4_transceive(&pn532, apdu, sizeof(apdu), rx, &rx_len));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
 }
 
 TEST_CASE("Classic emulation on an ISO-DEP card is re-listed without automatic RATS", "[pn532][polling][rats]")
@@ -2021,6 +2111,8 @@ TEST_CASE("Ultralight family members are told apart on the selected card", "[pn5
     static const uint8_t ntag215[]  = {0x00, 0x04, 0x04, 0x02, 0x01, 0x00, 0x11, 0x03};
     static const uint8_t ntag210[]  = {0x00, 0x04, 0x04, 0x01, 0x01, 0x00, 0x0B, 0x03};
     static const uint8_t ul_ev1[]   = {0x00, 0x04, 0x03, 0x01, 0x01, 0x00, 0x0B, 0x03};
+    /* Product type 03h (Ultralight) with the storage size of an NTAG213. */
+    static const uint8_t ul_0f[]    = {0x00, 0x04, 0x03, 0x01, 0x04, 0x00, 0x0F, 0x03};
     const pn532_uid_t    polled_uid = {
            .uid = {0xDE, 0xAD, 0xBE, 0xEF},
              .uid_length = 4, .tg = 1, .sak = 0x00
@@ -2036,6 +2128,7 @@ TEST_CASE("Ultralight family members are told apart on the selected card", "[pn5
         {ntag215, PN532_MIFARE_NTAG215,        135},
         {ntag210, PN532_MIFARE_NTAG210,        20 },
         {ul_ev1,  PN532_MIFARE_ULTRALIGHT_EV1, 20 },
+        {ul_0f,   PN532_MIFARE_ULTRALIGHT,     16 },
     };
     for (size_t i = 0; i < ARRAY_SIZE(versions); i++) {
         sim_init(&mock, &pn532, sim_type2_card, send_buf, recv_buf);
@@ -2202,6 +2295,21 @@ TEST_CASE("MIFARE Classic NDEF is read through a MAD with a valid CRC only", "[p
     TEST_ASSERT_NOT_NULL(msg);
     pn532_ndef_free_parsed_message(msg);
     TEST_ASSERT_EQUAL(7, mock.sim_reads);
+
+    /* So is a READ of the directory that fails after the authentication: the
+     * first READ is the sector trailer with the general purpose byte, the
+     * second the first MAD block. Neither is taken for a card without NDEF. */
+    for (size_t fail = 1; fail <= 2; fail++) {
+        sim_init(&mock, &pn532, sim_classic_card, send_buf, recv_buf);
+        mock.sim_memory    = memory;
+        mock.sim_units     = 64;
+        mock.sim_fail_read = fail;
+        msg                = NULL;
+        TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+        TEST_ASSERT_NOT_NULL(msg);
+        pn532_ndef_free_parsed_message(msg);
+        TEST_ASSERT_EQUAL(3 + fail, mock.sim_reads);
+    }
 
     /* A directory whose CRC does not match its content is treated as absent:
      * only the trailer and the two MAD blocks are read. */
@@ -2479,6 +2587,29 @@ TEST_CASE("Type 2 NDEF write stays inside the data area of the capability contai
     sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
     TEST_ASSERT_EQUAL(PN532_NDEF_ERR_CARD_FULL, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, INT_MAX));
     TEST_ASSERT_EQUAL(0, mock.command_count);
+
+    /* A data area of 1872 bytes, as an NTAG I2C 2K announces: pages from 256
+     * on need SECTOR_SELECT. A message that reaches them is refused before
+     * the old one is hidden, and one stored there is not read. */
+    static uint8_t      mid[1100];
+    pn532_ndef_record_t mid_record;
+    pn532_ndef_record_init(&mid_record, PN532_NDEF_TNF_MEDIA_TYPE, (const uint8_t *)"a/b", 3, NULL, 0, mid, sizeof(mid));
+    pn532_ndef_message_init(&message, &mid_record, 1);
+    message.record_count = 1;
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memory[14] = 0xEA;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_UNSUPPORTED, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, INT_MAX));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+
+    /* Sector 0 of that tag in full: every page a READ addresses answers. */
+    static uint8_t       sector0[256 * 4];
+    static const uint8_t long_tlv[] = {0x03, 0xFF, 0x04, 0x00}; /* 1024 bytes from page 5 on */
+    memcpy(sector0, memory, 16);
+    memcpy(&sector0[16], long_tlv, sizeof(long_tlv));
+    mock.sim_memory = sector0;
+    mock.sim_units  = 256;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_UNSUPPORTED, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NULL(msg);
 }
 
 TEST_CASE("the encoder refuses records its own parser rejects", "[pn532][ndef][encode]")
@@ -2674,9 +2805,19 @@ TEST_CASE("Type 2 NDEF write keeps control TLVs and honours the write access byt
     memcpy(&memory[16], factory, sizeof(factory));
     TEST_ASSERT_EQUAL(PN532_NDEF_ERR_CARD_FULL, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 5));
     TEST_ASSERT_EQUAL(0, mock.sim_writes);
-    /* Behind the control TLV the message starts where the caller says. */
+    /* Behind the control TLV the factory tag holds an empty NDEF TLV: a
+     * message from page 6 on would stay hidden behind it, so nothing is
+     * written. */
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_INVALID_PARAM, pn532_ndef_write_to_selected_card(&pn532, &message, 6, 4, 5));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+    /* NULL TLVs up to page 6 lead a reader there: the message starts where
+     * the caller says and reads back. */
+    memset(&memory[21], 0x00, 3);
     TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 6, 4, 5));
     TEST_ASSERT_EQUAL_UINT8_ARRAY(((const uint8_t[]){6, 7, 8, 9, 10, 6}), mock.sim_written, 6);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_EQUAL(23, pn532_ndef_extract_uri(&msg->records[0], uri, sizeof(uri)));
+    pn532_ndef_free_parsed_message(msg);
 
     /* A NDEF TLV header split over two pages: Null TLVs do not count, three
      * control TLV bytes are left in the first written page. */
@@ -2699,8 +2840,11 @@ TEST_CASE("Type 2 NDEF write keeps control TLVs and honours the write access byt
     memcpy(&memory[16], reserved, sizeof(reserved));
     TEST_ASSERT_EQUAL(PN532_NDEF_ERR_UNSUPPORTED, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
     TEST_ASSERT_EQUAL(0, mock.sim_writes);
-    /* A write that ends in front of the reserved bytes is fine. */
+    /* A write behind the reserved bytes is fine: the NULL TLVs around them
+     * lead a reader there, and the reserved bytes are left out of the walk. */
     TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_write_to_selected_card(&pn532, &message, 10, 4, 36));
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
 
     /* A control TLV with a wrong length field. */
     sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);

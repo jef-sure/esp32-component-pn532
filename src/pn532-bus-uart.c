@@ -60,7 +60,12 @@ static bool pn532_uart_bus_write_command(pn532_bus_t *bus, const uint8_t *buffer
         return false;
     }
 
-    err = uart_wait_tx_done(uart_bus->uart_num, pdMS_TO_TICKS(PN532_UART_IO_TIMEOUT_MS));
+    /* Up to a FIFO of bytes can still be on its way when uart_write_bytes()
+     * returns: at 9600 baud 128 bytes take 133 ms, so the wait grows with the
+     * frame at the current baud, as the read budget does. */
+    uint32_t baud      = uart_bus->baud_rate > 0 ? uart_bus->baud_rate : PN532_UART_DEFAULT_BAUD_RATE;
+    uint32_t budget_ms = PN532_UART_IO_TIMEOUT_MS + (uint32_t)((len * 10ULL * 1000ULL) / baud);
+    err                = uart_wait_tx_done(uart_bus->uart_num, pdMS_TO_TICKS(budget_ms));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "pn532_uart_bus_write_command: uart_wait_tx_done failed (%s)", esp_err_to_name(err));
         return false;

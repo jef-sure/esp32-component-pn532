@@ -1,5 +1,41 @@
 # Changelog
 
+## v 0.8.1 - 2026-11-02
+
+Fixes from an audit of 0.8.0, checked against NxpNfcRdLib phalTop (Type 2 NDEF position and sectors, Type 4 application and status words, MIFARE Classic directory), UM0701-02 §7.3.11 and the NXP FRI InRelease path, and the ESP-IDF 5.5.4 and 6.1 sources. Host tests only; nothing here was run on hardware.
+
+Fixes:
+
+- **SPI: a PN532 joins a host the application has just initialised** (`pn532-bus-spi.c`). ESP-IDF answers `spi_bus_get_max_transaction_len()` only after the first `spi_bus_add_device()` on a host, so `spi_bus_initialize()` followed by `pn532_spi_attach()`, the setup the README documents, returned NULL since `pn532_spi_attach()` appeared in 0.5.0, and `pn532_spi_init()` on such a host tried to initialise it a second time. The transaction size is now checked once the PN532 is on the host; a host that cannot carry a frame is refused as before and keeps no device.
+- **Type 2: a write that readers would not find is refused** (`pn532-ndef.c`). Readers take the first NDEF TLV behind the control TLVs, where NxpNfcRdLib also writes it. A `start_block` beyond them on a factory NTAG left the empty NDEF TLV `03 00 FE` in front of the message: the call returned OK and every reader saw an empty tag. The bytes in between must now be NULL TLVs or other TLVs that end at `start_block` (lock and reserved bytes left out, as readers do); otherwise the call is `PN532_NDEF_ERR_INVALID_PARAM` before a page is written.
+- **An InRelease answered with an error status frees the target all the same** (`pn532.c`, `pn532-14443.c`). UM0701-02 §7.3.11 frees the logical number "in all the cases", and the NXP FRI ignores the status. A status other than `0x00` and `0x27`, which a card that left the field can cause, kept the target and stopped the poll, so every later poll stopped on it again until `pn532_recover()`. `pn532_release_target()` still returns false for it, but clears the state, and the poll goes on.
+- **Type 2: nothing beyond page 255 is written or read** (`pn532-ndef.c`). Those pages, the second sector of an NTAG I2C 2K, need SECTOR_SELECT, which NxpNfcRdLib phalTop sends and this driver does not. A long write hid the old message and then failed at page 256, leaving an empty tag; it is now `PN532_NDEF_ERR_UNSUPPORTED` before anything is written. A message that continues there reads as `PN532_NDEF_ERR_UNSUPPORTED` instead of a read error with a retry.
+- **MIFARE Classic: a failed READ of the directory is a read error** (`pn532-ndef.c`), as in NxpNfcRdLib: after the MAD key was accepted it means that the card left or fell back to IDLE, so `pn532_ndef_read_card_auto()` now repeats the read from a new listing instead of reporting no NDEF. The fallback that assumed MAD v1 when the general purpose byte could not be read is gone: it read on from a card in IDLE and could not succeed. A MAD2 sector no key opens is still no NDEF.
+- The Ultralight/NTAG variant probes run only when the card passed in is the selected one (`pn532-14443.c`); with a session open on another card they asked that card and could drop its session and MIFARE authentication.
+- GET_VERSION: the storage sizes of the NTAG213/215/216 name an NTAG only with product type 04h (`pn532-14443.c`), as the sizes of the NTAG210/212 already did; another Ultralight family member of that size stays an Ultralight.
+- A SetParameters without an answer leaves the automatic RATS state unknown (`pn532.c`), so the next request sends it whatever it asks for; the chip may have applied the flags. Until then `pn532_14443_select_by_uid()` lists the card again instead of reusing its handle. New field `pn532_t.auto_rats_unknown`.
+- UART: the wait for a frame to leave grows with its length at the current baud (`pn532-bus-uart.c`), as the read budget does. At 9600 baud the fixed 100 ms ran out for about 96 bytes or more while the frame still went out, and the caller got a transport error for a command the chip ran.
+- `pn532_14443_4_transceive()` fails at once for a target that needs a new listing (`pn532-14443.c`), instead of sending an InSelect that does not wake it and waiting out up to 1.5 s.
+- I2C: the status byte is read into the transport's buffer in internal RAM (`pn532-bus-i2c.c`). With `CONFIG_I2C_ISR_IRAM_SAFE` ESP-IDF refuses a read buffer outside internal RAM, which a task stack in PSRAM would be, and the reader looked dead.
+
+Documentation:
+
+- `pn532_ndef_extract_text()` and `pn532_ndef_extract_uri()` leave the buffer as it was on an error; `pn532_set_passive_activation_retries()` sets the ATR and PSL retries to the chip defaults; `pn532_mifare_block_read()` needs a 16-byte buffer.
+- `timeout_ms` is the one `pn532_t` field the application sets; the driver has no locking, one `pn532_t` belongs to one task at a time.
+- Type 4: only the NDEF application of mapping 2.0 and later is selected, as in NxpNfcRdLib; a mapping 1.0 tag is no NDEF. The header did not say so.
+- The README said a deselect or release refused with a status leaves the state untouched; a deselect closes the session, a release frees the target.
+- README and headers follow the fixes above: the Type 2 write rules and page limit, the Classic read retry, the Type 4 AID, `pn532_spi_attach()` right after `spi_bus_initialize()`, the stale target of `pn532_14443_4_transceive()`. With an IRQ pin the bus status is still read every 10 ms as a fallback; the card type comes from the SAK, not from ATQA and SAK; `pn532_in_select()` is internal and no longer named in `pn532.h`.
+
+Checked and kept:
+
+- ISO 7816 warnings `62xx` / `63xx` fail an APDU and drop its data, as NxpNfcRdLib phalTop does: it takes only `9000` and `9100` for success, `6282` (end of file) included among the errors.
+- UART at 9600 baud: a wait for readiness needs 6 buffered bytes (6 ms), and the reads that follow have a budget that grows with the frame at the current baud, so the 50 ms ACK budget covers a resent response and an ACK read after the IRQ line.
+
+Tests:
+
+- `host_test` builds the SPI transport against a stand-in for the ESP-IDF master driver in which, as in ESP-IDF, the transaction size is known only after the first device.
+- New cases for each fix above but the UART and I2C ones; ten of them fail on the 0.8.0 sources. 81 host tests under ASan/UBSan. Compiled with the example on ESP-IDF 5.5.4 and 6.1 for esp32, and for esp32s3 on 6.1.
+
 ## v 0.8.0 - 2026-11-02
 
 Breaking changes:

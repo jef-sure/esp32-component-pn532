@@ -52,7 +52,7 @@ extern "C" {
 /** @brief Opaque transport handle created by one of the pn532_*_init() bus constructors. */
 typedef struct pn532_bus_t pn532_bus_t;
 
-/** @brief Card subtype inferred from ATQA/SAK and, where applicable, card layout probing. */
+/** @brief Card subtype inferred from the SAK and, where applicable, card layout probing. */
 typedef enum _pn532_nfc_subtype_t
 {
     PN532_MIFARE_UNKNOWN = 0,
@@ -127,9 +127,14 @@ typedef enum
  * @brief PN532 device context.
  *
  * Applications should treat this as a driver-owned handle and avoid mutating
- * fields directly. The members remain visible because the driver is split
+ * fields directly; timeout_ms is the one field meant to be set by the
+ * application. The members remain visible because the driver is split
  * across multiple translation units rather than exposing a separate private
  * wrapper type.
+ *
+ * The driver has no locking: one pn532_t is used from one task at a time.
+ * Two readers, each with its own pn532_t, may run in separate tasks; create
+ * and destroy their buses from one task.
  */
 typedef struct _pn532_t
 {
@@ -138,7 +143,7 @@ typedef struct _pn532_t
     pn532_bus_t  *bus;
     gpio_num_t    irq;
     gpio_num_t    rst;
-    uint16_t      timeout_ms;
+    uint16_t      timeout_ms;         /**< Response-phase budget per command; set by the application, 0 waits forever. */
     uint16_t      ack_timeout_ms;     /**< ACK wait budget per command; 0 waits forever. */
     uint16_t      rf_settle_delay_ms; /**< Pause applied after RF off before the next poll. */
     uint8_t       rf_config;
@@ -150,6 +155,7 @@ typedef struct _pn532_t
     bool          isr_installed; /**< True when this device owns a GPIO ISR handler on irq. */
     bool          tg_stale;      /**< Listed Tg needs a fresh InListPassiveTarget (card dropped to IDLE). */
     bool          auto_rats_off; /**< Automatic RATS is switched off (MIFARE Classic emulation card in use). */
+    bool          auto_rats_unknown; /**< A SetParameters failed: auto_rats_off may not match the chip. */
     uint8_t       listed_uid[2][10]; /**< UIDs behind Tg 1 and 2 of the latest InListPassiveTarget. */
     uint8_t       listed_uid_len[2]; /**< UID lengths for listed_uid; 0 when that Tg is not listed. */
 } pn532_t;
@@ -387,12 +393,14 @@ bool pn532_set_rf_off(pn532_t *pn532);
 /**
  * @brief Release the currently listed PN532 target with InRelease.
  *
- * The function is a no-op that returns true when no target is listed. On a
- * successful command, the active target and session state are cleared.
- * Call this before turning the RF field off when ending an active session.
+ * The function is a no-op that returns true when no target is listed. Once the
+ * chip answers, the active target and session state are cleared whatever the
+ * status: UM0701-02 §7.3.11 frees the target in all cases. Call this before
+ * turning the RF field off when ending an active session.
  *
- * @return true when no target was active or InRelease was accepted; false on
- *         command or transport failure.
+ * @return true when no target was active or InRelease returned 0x00 or 0x27;
+ *         false for another status (the target is freed all the same) or when
+ *         the command got no answer (the state is kept).
  */
 bool pn532_release_target(pn532_t *pn532);
 
@@ -400,7 +408,7 @@ bool pn532_release_target(pn532_t *pn532);
  * @brief Soft-deselect the currently selected target with InDeselect.
  *
  * Unlike pn532_release_target(), this keeps the target listed by the PN532 so
- * a later pn532_in_select()/pn532_14443_select_by_uid() can reactivate it
+ * a later pn532_14443_select_by_uid() can reactivate it
  * without a field restart. Sending InDeselect puts an ISO14443-4 target into
  * HALT. When no target is listed the function is a no-op returning true.
  *
@@ -447,8 +455,9 @@ bool pn532_set_max_retries(pn532_t *pn532, uint8_t max_rty_atr, uint8_t max_rty_
  * @brief Set the passive-activation retry count (RFConfiguration item 5, third byte).
  *
  * 0x00 means "try once" (fastest probe), 0xFF means "retry forever", and any
- * value in between sets a finite retry count. ATR and PSL retries are left at
- * their defaults (0xFF and 0x01).
+ * value in between sets a finite retry count. ATR and PSL retries are set to
+ * their chip defaults (0xFF and 0x01), replacing values given to
+ * pn532_set_max_retries().
  */
 bool pn532_set_passive_activation_retries(pn532_t *pn532, uint8_t max_retries);
 
@@ -609,7 +618,7 @@ bool pn532_14443_block_read(pn532_t *pn532, int blockno, uint8_t *buffer, size_t
 int pn532_14443_block_write(pn532_t *pn532, int blockno, const uint8_t *buffer, size_t buffer_len);
 
 /**
- * @brief Infer card subtype, block count, and block size from ATQA/SAK.
+ * @brief Infer card subtype, block count, and block size from the SAK.
  *
  * The helper updates uid->subtype, uid->blocks_count, and uid->block_size in
  * place and also returns the same values through the out parameters. For
@@ -624,14 +633,14 @@ bool pn532_14443_detect_card_type_and_capacity(pn532_uid_t *uid, uint16_t *block
 /**
  * @brief Detect the subtype of the selected card, probing the Ultralight family.
  *
- * Starts from the same ATQA/SAK detection as
+ * Starts from the same SAK detection as
  * pn532_14443_detect_card_type_and_capacity(). For a SAK 0x00 card that is
  * selected (pn532_14443_select_by_uid()) it then asks the card itself:
  * GET_VERSION tells Ultralight EV1 and NTAG210/212/213/215/216 apart and
  * gives the page count; a card without GET_VERSION that answers AUTHENTICATE
  * (1Ah) with a challenge is an Ultralight C (44 readable pages), any other is
- * an original Ultralight. Without a selected card (no open target session)
- * only the SAK result is returned.
+ * an original Ultralight. When @p uid is not the selected card (no open
+ * session, or a session on another card) only the SAK result is returned.
  *
  * A refused probe resets the card to IDLE. *needs_reselect is then true and
  * the card has to be selected again with pn532_14443_select_by_uid() before
@@ -651,7 +660,10 @@ bool pn532_14443_detect_selected_card_type_and_capacity( //
  * The PN532 firmware handles RATS, PCB toggling, WTX, and chaining internally;
  * callers provide only raw APDU bytes. Select a target first with
  * pn532_14443_select_by_uid(). If a listed target remains but its session was
- * deselected, this function issues InSelect before exchanging the APDU.
+ * deselected, this function issues InSelect before exchanging the APDU. A
+ * target that needs a new listing (after an RF timeout or a protocol or
+ * MIFARE error) fails at once: select it again with
+ * pn532_14443_select_by_uid().
  *
  * @param apdu Command APDU payload.
  * @param apdu_len Command length in bytes. The driver rejects commands whose

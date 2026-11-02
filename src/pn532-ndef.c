@@ -28,6 +28,8 @@ const uint8_t PN532_NDEF_RTD_SMARTPOSTER[] = {'S', 'p'};
 #define TYPE2_CC_PAGE         3
 #define TYPE2_CC_MAGIC        0xE1
 #define TYPE2_FIRST_DATA_PAGE 4
+/* Last page a READ or WRITE addresses without SECTOR_SELECT. */
+#define TYPE2_LAST_SECTOR0_PAGE 255
 
 /* Returns false when page 3 does not hold a capability container. */
 static bool pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t *uid)
@@ -895,9 +897,17 @@ static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int m
     size_t ndef_len    = 0;
     bool   found       = false;
     bool   read_ok     = true;
+    bool   beyond_255  = false;
 
     for (int page = start_page; (page - start_page) < max_pages; page += 4) {
         uint8_t window[16];
+
+        /* Pages from 256 on need SECTOR_SELECT (NTAG I2C 2K), which
+         * NxpNfcRdLib phalTop sends and this driver does not. */
+        if (page > TYPE2_LAST_SECTOR0_PAGE) {
+            beyond_255 = true;
+            break;
+        }
 
         if (len + sizeof(window) > capacity) {
             size_t   new_cap = capacity * 2;
@@ -937,6 +947,9 @@ static pn532_ndef_result_t type2_read_ndef(pn532_t *pn532, int start_page, int m
 
     if (!found || ndef_len == 0) {
         free(buf);
+        if (beyond_255) {
+            return PN532_NDEF_ERR_UNSUPPORTED;
+        }
         return read_ok ? PN532_NDEF_ERR_NO_NDEF : PN532_NDEF_ERR_READ_FAILED;
     }
 
@@ -1026,6 +1039,66 @@ static pn532_ndef_result_t type2_read_control_tlvs(pn532_t *pn532, size_t data_a
         *ctrl_len = i;
     }
     return PN532_NDEF_OK;
+}
+
+/* Whether a reader walking the TLVs from from_byte reaches to_byte without
+ * meeting an NDEF or Terminator TLV first. Readers take the first NDEF TLV
+ * behind the control TLVs (and NxpNfcRdLib phalTop writes it there), so a
+ * message written further on is found only behind NULL TLVs or other TLVs
+ * that end exactly at it. Lock and reserved bytes are left out of the walk,
+ * as readers leave them out. */
+static pn532_ndef_result_t type2_check_gap(pn532_t *pn532, size_t from_byte, size_t to_byte,
+                                           const type2_reserved_area_t *areas, size_t area_count)
+{
+    size_t   first_page = from_byte / 4u;
+    size_t   gap_len    = to_byte - first_page * 4u;
+    uint8_t *gap        = malloc(gap_len + 16u); /* a READ returns 16 bytes */
+    if (gap == NULL) {
+        return PN532_NDEF_ERR_NO_MEMORY;
+    }
+    for (size_t got = 0; got < gap_len; got += 16u) {
+        if (!pn532_14443_block_read(pn532, (int)(first_page + got / 4u), gap + got, 16)) {
+            free(gap);
+            return PN532_NDEF_ERR_READ_FAILED;
+        }
+    }
+
+    /* Compacted in place: the stream never runs ahead of the raw bytes. */
+    size_t stream_len = 0;
+    for (size_t pos = from_byte; pos < to_byte; pos++) {
+        bool reserved = false;
+        for (size_t a = 0; a < area_count && !reserved; a++) {
+            reserved = pos >= areas[a].addr && pos < areas[a].addr + areas[a].len;
+        }
+        if (!reserved) {
+            gap[stream_len++] = gap[pos - first_page * 4u];
+        }
+    }
+    gap_len = stream_len;
+
+    size_t i = 0;
+    while (i < gap_len) {
+        uint8_t type = gap[i];
+        if (type == TLV_NULL) {
+            i++;
+            continue;
+        }
+        if (type == TLV_NDEF || type == TLV_TERMINATOR || i + 2u > gap_len) {
+            break;
+        }
+        size_t value_len = gap[i + 1];
+        size_t header    = 2;
+        if (value_len == 0xFF) {
+            if (i + 4u > gap_len) {
+                break;
+            }
+            value_len = ((size_t)gap[i + 2] << 8) | gap[i + 3];
+            header    = 4;
+        }
+        i += header + value_len;
+    }
+    free(gap);
+    return (i == gap_len) ? PN532_NDEF_OK : PN532_NDEF_ERR_INVALID_PARAM;
 }
 
 /* NDEF read of the data area the capability container describes, with the
@@ -1125,6 +1198,20 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
     }
     if ((size_t)(start_block - TYPE2_FIRST_DATA_PAGE) + blocks_needed > data_area_pages) {
         return PN532_NDEF_ERR_CARD_FULL;
+    }
+    /* Pages from 256 on need SECTOR_SELECT (NTAG I2C 2K), which NxpNfcRdLib
+     * phalTop sends and this driver does not. Refused here, before the old
+     * message is hidden: a write failing at page 256 left an empty tag. */
+    if ((size_t)start_block + blocks_needed - 1u > TYPE2_LAST_SECTOR0_PAGE) {
+        return PN532_NDEF_ERR_UNSUPPORTED;
+    }
+    /* A factory tag holds an empty NDEF TLV right behind the control TLVs:
+     * left in front of start_block it would hide the message. */
+    if (start_byte > ctrl_end) {
+        pn532_ndef_result_t gap_res = type2_check_gap(pn532, ctrl_end, start_byte, areas, area_count);
+        if (gap_res != PN532_NDEF_OK) {
+            return gap_res;
+        }
     }
 
     /* Lock or reserved bytes inside the pages to write would have to be
@@ -1302,28 +1389,30 @@ static bool classic_read_mad1_gpb(pn532_t *pn532, uint8_t *gpb_out)
     return true;
 }
 
-static bool classic_read_mad2(pn532_t *pn532, const pn532_uid_t *uid, uint8_t mad[48])
+/* PN532_NDEF_ERR_NO_NDEF when no key opens the MAD2 sector,
+ * PN532_NDEF_ERR_READ_FAILED when a READ fails after the authentication. */
+static pn532_ndef_result_t classic_read_mad2(pn532_t *pn532, const pn532_uid_t *uid, uint8_t mad[48])
 {
     static const uint8_t key_mad[6]     = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
     static const uint8_t key_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
     if (pn532 == NULL || uid == NULL || mad == NULL) {
-        return false;
+        return PN532_NDEF_ERR_INVALID_PARAM;
     }
 
     if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_mad, PN532_MIFARE_CMD_AUTH_A)) {
         if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_default, PN532_MIFARE_CMD_AUTH_A)) {
-            return false;
+            return PN532_NDEF_ERR_NO_NDEF;
         }
     }
 
     for (int i = 0; i < 3; i++) {
         if (!pn532_14443_block_read(pn532, CLASSIC_MAD2_FIRST_DATA_BLOCK + i, mad + (size_t)i * 16u, 16)) {
-            return false;
+            return PN532_NDEF_ERR_READ_FAILED;
         }
     }
 
-    return true;
+    return PN532_NDEF_OK;
 }
 
 /* CRC of a MIFARE Application Directory: CRC-8 with polynomial
@@ -1555,20 +1644,22 @@ static pn532_ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn53
         return PN532_NDEF_ERR_INVALID_PARAM;
     }
 
+    /* As in NxpNfcRdLib phalTop: a refused MAD key means no NDEF, but a READ
+     * that fails after the authentication means the card left the field or
+     * fell back to IDLE. Nothing more can be read from it without a new
+     * selection, which the retry of pn532_ndef_read_card_auto() makes. */
     if (!classic_auth_mad1(pn532, uid)) {
         return PN532_NDEF_ERR_NO_NDEF;
     }
-    int mad_version = 1;
-    if (classic_read_mad1_gpb(pn532, &gpb)) {
-        mad_version = classic_mad_version_from_gpb(gpb);
-        if (mad_version == 0) {
-            return PN532_NDEF_ERR_NO_NDEF;
-        }
-    } else {
-        ESP_LOGD(TAG, "classic_read_ndef_from_mad: MAD1 GPB unreadable, assuming MAD v1");
+    if (!classic_read_mad1_gpb(pn532, &gpb)) {
+        return PN532_NDEF_ERR_READ_FAILED;
+    }
+    int mad_version = classic_mad_version_from_gpb(gpb);
+    if (mad_version == 0) {
+        return PN532_NDEF_ERR_NO_NDEF;
     }
     if (!classic_read_mad1(pn532, mad1)) {
-        return PN532_NDEF_ERR_NO_NDEF;
+        return PN532_NDEF_ERR_READ_FAILED;
     }
     /* A directory with a wrong CRC is treated as absent. */
     if (!classic_mad_crc_ok(mad1, sizeof(mad1))) {
@@ -1596,8 +1687,9 @@ static pn532_ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn53
         if (mad_version == 2) {
             uint8_t mad2[48];
 
-            if (!classic_read_mad2(pn532, uid, mad2)) {
-                return PN532_NDEF_ERR_NO_NDEF;
+            pn532_ndef_result_t mad2_res = classic_read_mad2(pn532, uid, mad2);
+            if (mad2_res != PN532_NDEF_OK) {
+                return mad2_res;
             }
             if (!classic_mad_crc_ok(mad2, sizeof(mad2))) {
                 ESP_LOGD(TAG, "classic_read_ndef_from_mad: MAD2 CRC mismatch");

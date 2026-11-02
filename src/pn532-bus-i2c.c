@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -84,9 +85,8 @@ static bool pn532_i2c_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t le
     for (int attempt = 0; attempt < PN532_I2C_READY_RETRY_COUNT; attempt++) {
         if (attempt > 0) {
             pn532_delay_ms(PN532_I2C_READY_RETRY_DELAY_MS);
-            uint8_t status = 0;
-            err            = i2c_master_receive(i2c_bus->dev_handle, &status, 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
-            if (err != ESP_OK || (status & PN532_I2C_READY) == 0) {
+            err = i2c_master_receive(i2c_bus->dev_handle, i2c_bus->buffer, 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
+            if (err != ESP_OK || (i2c_bus->buffer[0] & PN532_I2C_READY) == 0) {
                 continue;
             }
         }
@@ -106,9 +106,8 @@ static bool pn532_i2c_bus_read_data(pn532_bus_t *bus, uint8_t *buffer, size_t le
 static bool pn532_i2c_bus_is_ready(pn532_bus_t *bus)
 {
     pn532_i2c_bus_t *i2c_bus = pn532_i2c_bus(bus);
-    uint8_t          status  = 0;
 
-    if (i2c_bus == NULL) {
+    if (i2c_bus == NULL || i2c_bus->buffer == NULL) {
         return false;
     }
 
@@ -119,14 +118,14 @@ static bool pn532_i2c_bus_is_ready(pn532_bus_t *bus)
      * reports from real chips say a STOP right after the status byte keeps the
      * frame. A STOP inside a frame does lose the rest, so that is read whole.
      */
-    esp_err_t err = i2c_master_receive(i2c_bus->dev_handle, &status, 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
+    esp_err_t err = i2c_master_receive(i2c_bus->dev_handle, i2c_bus->buffer, 1, PN532_I2C_TRANSFER_TIMEOUT_MS);
     if (err != ESP_OK) {
         /* A busy PN532 may NACK instead of returning status 0x00. */
         ESP_LOGD(TAG, "pn532_i2c_bus_is_ready: i2c_master_receive failed (%s)", esp_err_to_name(err));
         return false;
     }
 
-    return (status & PN532_I2C_READY) != 0;
+    return (i2c_bus->buffer[0] & PN532_I2C_READY) != 0;
 }
 
 static void pn532_i2c_bus_wake(pn532_bus_t *bus)
@@ -183,7 +182,10 @@ static pn532_bus_t *pn532_i2c_add_device(i2c_master_bus_handle_t bus_handle, boo
         return NULL;
     }
 
-    i2c_bus->buffer = calloc(PN532_MAX_BUF_SIZE + 1, sizeof(uint8_t));
+    /* Every read lands here, the status byte included. With
+     * CONFIG_I2C_ISR_IRAM_SAFE ESP-IDF refuses a read buffer outside internal
+     * RAM, which a task stack in PSRAM would be. */
+    i2c_bus->buffer = heap_caps_calloc(PN532_MAX_BUF_SIZE + 1, sizeof(uint8_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (i2c_bus->buffer == NULL) {
         free(i2c_bus);
         return NULL;
