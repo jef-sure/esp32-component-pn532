@@ -397,7 +397,7 @@ static void pn532_log_record(int index, const pn532_ndef_record_t *rec)
         size_t         tx_len   = 0;
         char           lang[64] = {0};
         bool           utf16    = false;
-        if (pn532_ndef_extract_text(rec, &txt, &tx_len, lang, &utf16)) {
+        if (pn532_ndef_extract_text(rec, &txt, &tx_len, lang, sizeof(lang), &utf16)) {
             char   preview[128];
             size_t copy = (tx_len < sizeof(preview) - 1) ? tx_len : sizeof(preview) - 1;
             memcpy(preview, txt, copy);

@@ -1861,7 +1861,7 @@ void pn532_ndef_free_parsed_message(pn532_ndef_message_parsed_t *msg)
 /* ---- Record helpers ---- */
 
 bool pn532_ndef_extract_text(const pn532_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out,
-                             char *lang_buf, bool *is_utf16)
+                             char *lang_buf, size_t lang_buf_len, bool *is_utf16)
 {
     if (rec == NULL || text_out == NULL || text_len_out == NULL) {
         return false;
@@ -1880,11 +1880,12 @@ bool pn532_ndef_extract_text(const pn532_ndef_record_t *rec, const uint8_t **tex
         return false;
     }
 
-    if (lang_buf != NULL) {
-        if (lang_len > 0) {
-            memcpy(lang_buf, rec->payload + 1, lang_len);
+    if (lang_buf != NULL && lang_buf_len > 0) {
+        size_t copy_lang = (lang_len < lang_buf_len - 1) ? lang_len : lang_buf_len - 1;
+        if (copy_lang > 0) {
+            memcpy(lang_buf, rec->payload + 1, copy_lang);
         }
-        lang_buf[lang_len] = '\0';
+        lang_buf[copy_lang] = '\0';
     }
     if (is_utf16 != NULL) {
         *is_utf16 = utf16;

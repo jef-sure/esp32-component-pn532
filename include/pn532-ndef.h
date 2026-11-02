@@ -251,12 +251,12 @@ void pn532_ndef_free_parsed_message(pn532_ndef_message_parsed_t *msg);
  * @brief Extract the payload metadata of a Well-known Text ("T") record.
  *
  * The returned text pointer aliases rec->payload. lang_buf and is_utf16 are
- * optional outputs. When lang_buf is provided, it must have room for the full
- * language code plus a trailing NUL byte; 64 bytes is sufficient for all valid
- * NDEF Text records.
+ * optional outputs. lang_buf always receives a NUL-terminated string when
+ * lang_buf_len > 0; a longer language code is truncated. The card sets the
+ * length of the code, up to 63 bytes, so 64 bytes hold any code.
  */
 bool pn532_ndef_extract_text(const pn532_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out,
-                             char *lang_buf, bool *is_utf16);
+                             char *lang_buf, size_t lang_buf_len, bool *is_utf16);
 
 /**
  * @brief Expand a Well-known URI ("U") record into a full URI string.

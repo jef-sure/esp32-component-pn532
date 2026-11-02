@@ -1,5 +1,19 @@
 # Changelog
 
+## v 0.8.0 - 2026-11-02
+
+Breaking changes:
+
+- **`pn532_ndef_extract_text()` takes the size of `lang_buf`** (`pn532-ndef.c`): the new argument `lang_buf_len` follows `lang_buf`. The card sets the length of the language code, up to 63 bytes, and every earlier version copied it into a buffer of unknown size. The README example passed `char lang[8]`, so a Text record with a language code of 8 bytes or more overflowed the caller's stack; reproduced under ASan, and code that copied the example has this bug until it moves to this version. The code is now truncated to fit and always NUL-terminated, as in `pn532_ndef_extract_uri()`; the text pointer and length do not depend on it. A call in the old form no longer compiles: add `sizeof(lang)` after the buffer, or `0` after `NULL`.
+
+Documentation:
+
+- The README example uses `char lang[64]` and says that the host tests build the I2C transport.
+
+Tests:
+
+- A Text record with a 63-byte language code against a short buffer, a buffer of 64 bytes, a zero size and no buffer.
+
 ## v 0.7.7 - 2026-11-01
 
 I2C fixes. Not run on a PN532 over I2C: the test boards have their readers on SPI. The ESP-IDF behaviour below was read in the sources of 5.5.4, 5.5.5, 6.0.3 and 6.1, and measured on a JC4827 board with a GT911 touch controller on 6.1; the PN532 transport was run on the host against a stand-in for the I2C master driver.

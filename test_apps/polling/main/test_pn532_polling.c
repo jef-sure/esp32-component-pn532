@@ -1546,6 +1546,46 @@ TEST_CASE("unknown TNF record with a type is rejected", "[pn532][ndef][tnf]")
     pn532_ndef_free_parsed_message(message);
 }
 
+TEST_CASE("NDEF Text language code stays inside the caller's buffer", "[pn532][ndef][bounds]")
+{
+    /* The status byte comes from the card and announces a code of up to 63 bytes. */
+    static const uint8_t type = 'T';
+    uint8_t              payload[1 + 63 + 2];
+    payload[0] = 0x80 | 63; /* UTF-16 */
+    memset(payload + 1, 'a', 63);
+    payload[64] = 'h';
+    payload[65] = 'i';
+
+    pn532_ndef_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.tnf         = PN532_NDEF_TNF_WELL_KNOWN;
+    rec.type        = &type;
+    rec.type_len    = 1;
+    rec.payload     = payload;
+    rec.payload_len = sizeof(payload);
+
+    const uint8_t *text     = NULL;
+    size_t         text_len = 0;
+    bool           utf16    = false;
+    char           lang[8];
+    TEST_ASSERT_TRUE(pn532_ndef_extract_text(&rec, &text, &text_len, lang, sizeof(lang), &utf16));
+    TEST_ASSERT_EQUAL_STRING("aaaaaaa", lang);
+    TEST_ASSERT_EQUAL_PTR(payload + 64, text);
+    TEST_ASSERT_EQUAL(2, text_len);
+    TEST_ASSERT_TRUE(utf16);
+
+    char full[64];
+    TEST_ASSERT_TRUE(pn532_ndef_extract_text(&rec, &text, &text_len, full, sizeof(full), NULL));
+    TEST_ASSERT_EQUAL(63, strlen(full));
+
+    lang[0] = 'x';
+    TEST_ASSERT_TRUE(pn532_ndef_extract_text(&rec, &text, &text_len, lang, 0, NULL));
+    TEST_ASSERT_EQUAL('x', lang[0]);
+
+    TEST_ASSERT_TRUE(pn532_ndef_extract_text(&rec, &text, &text_len, NULL, 0, NULL));
+    TEST_ASSERT_EQUAL_PTR(payload + 64, text);
+}
+
 TEST_CASE("NDEF record length that wraps the offset is rejected", "[pn532][ndef][bounds]")
 {
     /* Long record whose payload length 0xFFFFFFFF wraps a 32-bit offset back
@@ -2875,7 +2915,7 @@ TEST_CASE("Type 2 NDEF read leaves out the reserved bytes of a Memory Control TL
 
         const uint8_t *got     = NULL;
         size_t         got_len = 0;
-        TEST_ASSERT_TRUE(pn532_ndef_extract_text(&msg->records[0], &got, &got_len, NULL, NULL));
+        TEST_ASSERT_TRUE(pn532_ndef_extract_text(&msg->records[0], &got, &got_len, NULL, 0, NULL));
         TEST_ASSERT_EQUAL(sizeof(text) - 1, got_len);
         TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)text, got, got_len);
         pn532_ndef_free_parsed_message(msg);
@@ -2902,7 +2942,7 @@ TEST_CASE("Type 2 NDEF read leaves out the reserved bytes of a Memory Control TL
     if (pn532_ndef_read_card_auto(&pn532, &plain, &msg) == PN532_NDEF_OK) {
         const uint8_t *got     = NULL;
         size_t         got_len = 0;
-        TEST_ASSERT_TRUE(pn532_ndef_extract_text(&msg->records[0], &got, &got_len, NULL, NULL));
+        TEST_ASSERT_TRUE(pn532_ndef_extract_text(&msg->records[0], &got, &got_len, NULL, 0, NULL));
         TEST_ASSERT_TRUE(got_len != sizeof(text) - 1 || memcmp(got, text, got_len) != 0);
         pn532_ndef_free_parsed_message(msg);
     }

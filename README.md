@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.7.7"
+idf.py add-dependency "jef-sure/pn532^0.8.0"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -155,9 +155,9 @@ if (res == PN532_NDEF_OK) {
         if (pn532_ndef_record_is_text(rec)) {
             const uint8_t *text = NULL;
             size_t text_len = 0;
-            char lang[8] = {0};
+            char lang[64] = {0};
             bool utf16 = false;
-            if (pn532_ndef_extract_text(rec, &text, &text_len, lang, &utf16)) {
+            if (pn532_ndef_extract_text(rec, &text, &text_len, lang, sizeof(lang), &utf16)) {
                 /* text remains valid until msg is freed */
             }
         }
@@ -546,7 +546,7 @@ The tests live in the [GitHub repository](https://github.com/jef-sure/esp32-comp
 make -C host_test test IDF_PATH=<path to esp-idf>
 ```
 
-The host run takes the Unity sources from the ESP-IDF checkout, or from a plain Unity checkout with `UNITY_DIR=<path to Unity/src>`, and leaves out the bus transports (`src/pn532-bus-*.c`). The GitHub workflow in [`.github/workflows/host-test.yml`](.github/workflows/host-test.yml) runs it on every push and pull request.
+The host run takes the Unity sources from the ESP-IDF checkout, or from a plain Unity checkout with `UNITY_DIR=<path to Unity/src>`, and leaves out the SPI and UART transports (`src/pn532-bus-spi.c`, `src/pn532-bus-uart.c`); the I2C transport runs against a stand-in for the ESP-IDF driver. The GitHub workflow in [`.github/workflows/host-test.yml`](.github/workflows/host-test.yml) runs it on every push and pull request.
 
 ### Low-level MIFARE access
 
