@@ -477,8 +477,9 @@ pn532_uids_array_t *pn532_14443_get_all_uids_ex(pn532_t *pn532, pn532_poll_statu
     }
 
     /* A release the chip answered with an error status has freed the target
-     * all the same (UM0701-02 §7.3.11) and cleared inListedTag: the poll goes
-     * on. Without an answer the link is in question and the poll stops. */
+     * all the same (UM0701-02 §7.3.11) and cleared inListedTag, and so has
+     * the abort after a timeout: the poll goes on. Only a transport error
+     * keeps the target, and the poll stops. */
     if (!pn532_release_target(pn532) && pn532->inListedTag != 0) {
         if (status != NULL) {
             *status = pn532_poll_command_error(pn532);
@@ -688,7 +689,20 @@ bool pn532_14443_authenticate(pn532_t *pn532, const uint8_t *key, uint8_t key_ty
         uid_for_auth = &uid->uid[6];
     }
 
-    return pn532_mifare_authenticate(pn532, (uint8_t)blockno, key, key_type, uid_for_auth) == 0;
+    if (pn532_mifare_authenticate(pn532, (uint8_t)blockno, key, key_type, uid_for_auth) == 0) {
+        return true;
+    }
+    /* A failed authentication leaves the card out of the active state: in
+     * HALT after a refused key (14h, which already marks the target; libnfc:
+     * "When a MIFARE Classic AUTH fails, the tag is automatically in HALT
+     * state"), or back in IDLE after an RF error half way. A bare InSelect
+     * does not wake it, so the target is marked for a new listing, as
+     * libnfc's nfc-mfclassic re-selects after every failed key. */
+    if (pn532->inListedTag != 0) {
+        pn532->tg_stale       = true;
+        pn532->session_opened = false;
+    }
+    return false;
 }
 
 bool pn532_14443_4_transceive(pn532_t *pn532, const uint8_t *apdu, size_t apdu_len, uint8_t *rx, size_t *rx_len)
@@ -765,25 +779,34 @@ static bool pn532_14443_4_select(pn532_t *pn532, uint8_t p1, uint8_t p2, const u
     return false;
 }
 
-bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len)
+bool pn532_14443_4_select_file_ex(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len, bool *card_refused)
 {
+    bool refused = false;
+    if (card_refused == NULL) {
+        card_refused = &refused;
+    }
+    *card_refused = false;
     if (pn532 == NULL || file_id == NULL || file_id_len == 0 || file_id_len > 16) {
         return false;
     }
 
-    bool card_refused = false;
     if (file_id_len > 2) {
         /* By AID: first or only occurrence, FCI optional. */
-        return pn532_14443_4_select(pn532, 0x04, 0x00, file_id, file_id_len, &card_refused);
+        return pn532_14443_4_select(pn532, 0x04, 0x00, file_id, file_id_len, card_refused);
     }
 
     /* By file identifier. NFC Forum Type 4 Tag mapping 2.0 mandates P2=0x0C
      * (no response data); mapping 1.0 cards expect P2=0x00, so that is tried
      * once when the card itself refuses the first form. */
-    if (pn532_14443_4_select(pn532, 0x00, 0x0C, file_id, file_id_len, &card_refused)) {
+    if (pn532_14443_4_select(pn532, 0x00, 0x0C, file_id, file_id_len, card_refused)) {
         return true;
     }
-    return card_refused && pn532_14443_4_select(pn532, 0x00, 0x00, file_id, file_id_len, &card_refused);
+    return *card_refused && pn532_14443_4_select(pn532, 0x00, 0x00, file_id, file_id_len, card_refused);
+}
+
+bool pn532_14443_4_select_file(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len)
+{
+    return pn532_14443_4_select_file_ex(pn532, file_id, file_id_len, NULL);
 }
 
 bool pn532_14443_4_read_binary(pn532_t *pn532, uint16_t offset, uint8_t le, uint8_t *buffer, size_t *got)

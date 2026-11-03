@@ -73,10 +73,46 @@ static bool pn532_type2_refine_uid_from_cc_read(const uint8_t *data, pn532_uid_t
  * without a READ of its own. */
 #define TYPE2_DATA_HEAD_LEN 12
 
+/* NFC Forum Type 2 Tag capability container: byte 1 is the mapping version
+ * (major in the high nibble), byte 3 the access byte, read access in the high
+ * nibble and write access in the low one; 0h grants access. NxpNfcRdLib
+ * phalTop reads only major version 1. */
+#define TYPE2_CC_MAJOR_VERSION     0x1
+#define TYPE2_CC_VERSION_MAJOR(cc) ((uint8_t)((cc)[1] >> 4))
+#define TYPE2_CC_READ_ACCESS(cc)   ((uint8_t)((cc)[3] >> 4))
+
+/* The NDEF read result a capability container allows before the data area
+ * is read: PN532_NDEF_OK, or the reason the tag is not read. */
+static pn532_ndef_result_t type2_cc_read_check(bool has_cc, const uint8_t cc[4], const pn532_uid_t *uid)
+{
+    /* A tag without the container is not NDEF formatted. */
+    if (!has_cc) {
+        return PN532_NDEF_ERR_NO_NDEF;
+    }
+    /* A reader stops at a major version it does not know: the layout may
+     * have changed. */
+    if (TYPE2_CC_VERSION_MAJOR(cc) != TYPE2_CC_MAJOR_VERSION) {
+        ESP_LOGD(TAG, "T2: unsupported mapping version %02X", cc[1]);
+        return PN532_NDEF_ERR_UNSUPPORTED;
+    }
+    /* An empty data area holds no message. */
+    if (uid->blocks_count <= TYPE2_FIRST_DATA_PAGE) {
+        return PN532_NDEF_ERR_NO_NDEF;
+    }
+    /* Read access 0h is free; the other values are RFU or proprietary. */
+    if (TYPE2_CC_READ_ACCESS(cc) != 0) {
+        ESP_LOGD(TAG, "T2: NDEF is read protected (access byte %02X)", cc[3]);
+        return PN532_NDEF_ERR_ACCESS_DENIED;
+    }
+    return PN532_NDEF_OK;
+}
+
 /* *has_cc reports whether the tag carries a capability container; without
  * one it is not NDEF formatted and uid is left as detected from the SAK.
- * data_head receives the first TYPE2_DATA_HEAD_LEN bytes of the data area. */
-static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid, bool *has_cc, uint8_t *data_head)
+ * cc receives the four container bytes, data_head the first
+ * TYPE2_DATA_HEAD_LEN bytes of the data area. */
+static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid, bool *has_cc, uint8_t cc[4],
+                                       uint8_t *data_head)
 {
     uint8_t cc_read[16];
 
@@ -106,6 +142,7 @@ static bool pn532_type2_prepare_layout(pn532_t *pn532, pn532_uid_t *uid, bool *h
     }
 
     *has_cc = pn532_type2_refine_uid_from_cc_read(cc_read, uid);
+    memcpy(cc, cc_read, 4);
     memcpy(data_head, cc_read + 4, TYPE2_DATA_HEAD_LEN);
     return true;
 }
@@ -1166,6 +1203,11 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
     if (cc_read[0] != TYPE2_CC_MAGIC) {
         return PN532_NDEF_ERR_NO_NDEF;
     }
+    /* A layout of another major version may differ from the one written
+     * here, and readers of version 1 would not read it. */
+    if (TYPE2_CC_VERSION_MAJOR(cc_read) != TYPE2_CC_MAJOR_VERSION) {
+        return PN532_NDEF_ERR_UNSUPPORTED;
+    }
     /* CC byte 3: 00h is read and write access without security; NxpNfcRdLib
      * phalTop takes any other value for a tag that must not be written. */
     if (cc_read[3] != 0x00) {
@@ -1313,49 +1355,82 @@ typedef struct
 #define CLASSIC_MAD2_ENTRY_COUNT       23
 #define CLASSIC_MAX_NDEF_SECTORS       (CLASSIC_MAD1_ENTRY_COUNT + CLASSIC_MAD2_ENTRY_COUNT)
 
-static bool classic_try_auth_with_key( //
-    pn532_t           *pn532,          //
-    const pn532_uid_t *uid,            //
-    int                blockno,        //
-    const uint8_t     *key,            //
-    uint8_t            key_type        //
+static const uint8_t classic_key_mad[6]     = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
+static const uint8_t classic_key_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+typedef enum
+{
+    CLASSIC_AUTH_OK,
+    CLASSIC_AUTH_REFUSED, /* the card answered and turned the key down */
+    CLASSIC_AUTH_LOST,    /* the card could not be selected or did not answer */
+} classic_auth_t;
+
+static classic_auth_t classic_try_auth_with_key( //
+    pn532_t           *pn532,                    //
+    const pn532_uid_t *uid,                      //
+    int                blockno,                  //
+    const uint8_t     *key,                      //
+    uint8_t            key_type                  //
 )
 {
     if (pn532 == NULL || uid == NULL || key == NULL) {
-        return false;
+        return CLASSIC_AUTH_LOST;
     }
 
     if (pn532->inListedTag == 0) {
         if (!pn532_14443_select_by_uid(pn532, uid)) {
-            return false;
+            return CLASSIC_AUTH_LOST;
         }
     } else if (!pn532->session_opened) {
         if ((pn532->tg_stale || !pn532_in_select(pn532, pn532->inListedTag)) &&
             !pn532_14443_select_by_uid(pn532, uid)) {
-            return false;
+            return CLASSIC_AUTH_LOST;
         }
     }
 
-    return pn532_14443_authenticate(pn532, key, key_type, uid, blockno);
+    pn532->last_target_status = PN532_TARGET_STATUS_NONE;
+    if (pn532_14443_authenticate(pn532, key, key_type, uid, blockno)) {
+        return CLASSIC_AUTH_OK;
+    }
+    /* A refused key is the MIFARE authentication error 14h (UM0701-02 table
+     * 13); the card is then in HALT, and the next key needs a new listing,
+     * which the stale target asks for. Anything else, a timeout (01h), an RF
+     * error such as a CRC, parity, framing or protocol error (0Bh, 13h) or
+     * no answer from the chip, says nothing about the key. libnfc keeps the
+     * same split (EMFAUTH against its RF transmission errors), and mfoc,
+     * which tries keys on PN53x readers, accepts only 14h for a wrong key. */
+    if (pn532->last_target_status == PN532_TARGET_STATUS_MIFARE_AUTH_ERROR && pn532->inListedTag != 0) {
+        return CLASSIC_AUTH_REFUSED;
+    }
+    return CLASSIC_AUTH_LOST;
 }
 
-static bool classic_auth_mad1(pn532_t *pn532, const pn532_uid_t *uid)
+/* Tries key_first and, when the card refuses it, key_second (if any). Stops at
+ * a card that is lost: another key would not reach it either. */
+static classic_auth_t classic_auth_two_keys(pn532_t *pn532, const pn532_uid_t *uid, int blockno,
+                                            const uint8_t *key_first, const uint8_t *key_second, uint8_t key_type)
 {
-    static const uint8_t key_mad[6]     = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
-    static const uint8_t key_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-    if (pn532 == NULL || uid == NULL) {
-        return false;
+    classic_auth_t res = classic_try_auth_with_key(pn532, uid, blockno, key_first, key_type);
+    if (res == CLASSIC_AUTH_REFUSED && key_second != NULL) {
+        res = classic_try_auth_with_key(pn532, uid, blockno, key_second, key_type);
     }
+    return res;
+}
 
-    if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, key_mad, PN532_MIFARE_CMD_AUTH_A)) {
-        if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, key_default,
-                                       PN532_MIFARE_CMD_AUTH_A)) {
-            return false;
-        }
+/* NO_NDEF when the card refuses both directory keys (as in NxpNfcRdLib
+ * phalTop, a card without a public MAD is no NDEF card), READ_FAILED when it
+ * could not be selected or did not answer: pn532_ndef_read_card_auto()
+ * repeats the read from a new listing. */
+static pn532_ndef_result_t classic_auth_mad_sector(pn532_t *pn532, const pn532_uid_t *uid, int blockno)
+{
+    switch (classic_auth_two_keys(pn532, uid, blockno, classic_key_mad, classic_key_default, PN532_MIFARE_CMD_AUTH_A)) {
+    case CLASSIC_AUTH_OK:
+        return PN532_NDEF_OK;
+    case CLASSIC_AUTH_REFUSED:
+        return PN532_NDEF_ERR_NO_NDEF;
+    default:
+        return PN532_NDEF_ERR_READ_FAILED;
     }
-
-    return true;
 }
 
 static bool classic_read_mad1(pn532_t *pn532, uint8_t mad[32])
@@ -1389,21 +1464,18 @@ static bool classic_read_mad1_gpb(pn532_t *pn532, uint8_t *gpb_out)
     return true;
 }
 
-/* PN532_NDEF_ERR_NO_NDEF when no key opens the MAD2 sector,
- * PN532_NDEF_ERR_READ_FAILED when a READ fails after the authentication. */
+/* PN532_NDEF_ERR_NO_NDEF when the card refuses every key for the MAD2
+ * sector, PN532_NDEF_ERR_READ_FAILED when it is lost on the way or a READ
+ * fails after the authentication. */
 static pn532_ndef_result_t classic_read_mad2(pn532_t *pn532, const pn532_uid_t *uid, uint8_t mad[48])
 {
-    static const uint8_t key_mad[6]     = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
-    static const uint8_t key_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
     if (pn532 == NULL || uid == NULL || mad == NULL) {
         return PN532_NDEF_ERR_INVALID_PARAM;
     }
 
-    if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_mad, PN532_MIFARE_CMD_AUTH_A)) {
-        if (!classic_try_auth_with_key(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK, key_default, PN532_MIFARE_CMD_AUTH_A)) {
-            return PN532_NDEF_ERR_NO_NDEF;
-        }
+    pn532_ndef_result_t auth_res = classic_auth_mad_sector(pn532, uid, CLASSIC_MAD2_TRAILER_BLOCK);
+    if (auth_res != PN532_NDEF_OK) {
+        return auth_res;
     }
 
     for (int i = 0; i < 3; i++) {
@@ -1506,34 +1578,31 @@ static int classic_sector_block_count(int sector)
     return 0;
 }
 
-static bool classic_auth_cb(pn532_t *pn532, int blockno, void *user_ctx)
+static classic_auth_t classic_auth_cb(pn532_t *pn532, int blockno, const default_auth_ctx_t *ctx)
 {
-    default_auth_ctx_t *ctx = (default_auth_ctx_t *)user_ctx;
-    if ((pn532->inListedTag == 0 || pn532->tg_stale) && !pn532_14443_select_by_uid(pn532, ctx->uid)) {
-        ESP_LOGD(TAG, "reselect failed at blk %d", blockno);
-        return false;
+    classic_auth_t res =
+        classic_auth_two_keys(pn532, ctx->uid, blockno, ctx->primary_key, ctx->secondary_key, ctx->key_type);
+    if (res != CLASSIC_AUTH_OK) {
+        ESP_LOGD(TAG, "auth at blk %d: %s", blockno, (res == CLASSIC_AUTH_REFUSED) ? "keys refused" : "card lost");
     }
+    return res;
+}
 
-    if (pn532_14443_authenticate(pn532, ctx->primary_key, ctx->key_type, ctx->uid, blockno)) {
-        return true;
+/* General purpose byte of an NFC sector (AN1304): major version in bits 7..6,
+ * minor version in 5..4, read access in 3..2, write access in 1..0; access
+ * 00b is granted. NxpNfcRdLib phalTop refuses a major version above 1 and
+ * takes a read access other than 00b for a misconfigured tag. */
+static pn532_ndef_result_t classic_ndef_gpb_check(uint8_t gpb)
+{
+    if ((gpb >> 6) > 1u) {
+        ESP_LOGD(TAG, "classic: unsupported mapping version (GPB %02X)", gpb);
+        return PN532_NDEF_ERR_UNSUPPORTED;
     }
-
-    if (ctx->secondary_key == NULL) {
-        ESP_LOGD(TAG, "auth failed at blk %d", blockno);
-        return false;
+    if (((gpb >> 2) & 0x03u) != 0) {
+        ESP_LOGD(TAG, "classic: NDEF is read protected (GPB %02X)", gpb);
+        return PN532_NDEF_ERR_ACCESS_DENIED;
     }
-
-    if (!pn532_14443_select_by_uid(pn532, ctx->uid)) {
-        ESP_LOGD(TAG, "reselect failed at blk %d", blockno);
-        return false;
-    }
-
-    if (pn532_14443_authenticate(pn532, ctx->secondary_key, ctx->key_type, ctx->uid, blockno)) {
-        return true;
-    }
-
-    ESP_LOGD(TAG, "auth failed at blk %d", blockno);
-    return false;
+    return PN532_NDEF_OK;
 }
 
 static pn532_ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, const int *sectors, size_t sector_count,
@@ -1558,6 +1627,8 @@ static pn532_ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, co
     bool   found       = false;
     bool   read_ok     = true;
     bool   hit_end     = false;
+    /* A definite answer that ends the read: ACCESS_DENIED or UNSUPPORTED. */
+    pn532_ndef_result_t verdict = PN532_NDEF_OK;
 
     for (size_t sector_index = 0; sector_index < sector_count && !found && !hit_end && read_ok; sector_index++) {
         int sector      = sectors[sector_index];
@@ -1568,9 +1639,33 @@ static pn532_ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, co
             read_ok = false;
             break;
         }
-        if (!classic_auth_cb(pn532, first_block, ctx)) {
+        classic_auth_t auth = classic_auth_cb(pn532, first_block, ctx);
+        if (auth != CLASSIC_AUTH_OK) {
+            /* A sector the directory lists whose card turns down both
+             * public keys is read protected, and a new attempt would be
+             * turned down again (NxpNfcRdLib phalTop takes the tag as
+             * misconfigured, no retry either). A lost card is a read error,
+             * which pn532_ndef_read_card_auto() repeats. */
+            if (auth == CLASSIC_AUTH_REFUSED) {
+                verdict = PN532_NDEF_ERR_ACCESS_DENIED;
+            }
             read_ok = false;
             break;
+        }
+        if (sector_index == 0) {
+            /* As NxpNfcRdLib phalTop: the general purpose byte in the
+             * trailer of the first NFC sector holds the mapping version and
+             * the access conditions (AN1304). */
+            uint8_t trailer[16];
+            if (!pn532_14443_block_read(pn532, first_block + block_count - 1, trailer, sizeof(trailer))) {
+                read_ok = false;
+                break;
+            }
+            verdict = classic_ndef_gpb_check(trailer[9]);
+            if (verdict != PN532_NDEF_OK) {
+                read_ok = false;
+                break;
+            }
         }
 
         for (int block = first_block; block < first_block + block_count - 1; block++) {
@@ -1608,6 +1703,9 @@ static pn532_ndef_result_t classic_read_from_selected_sectors(pn532_t *pn532, co
 
     if (!found || ndef_len == 0) {
         free(buf);
+        if (verdict != PN532_NDEF_OK) {
+            return verdict;
+        }
         return read_ok ? PN532_NDEF_ERR_NO_NDEF : PN532_NDEF_ERR_READ_FAILED;
     }
 
@@ -1644,12 +1742,14 @@ static pn532_ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn53
         return PN532_NDEF_ERR_INVALID_PARAM;
     }
 
-    /* As in NxpNfcRdLib phalTop: a refused MAD key means no NDEF, but a READ
-     * that fails after the authentication means the card left the field or
-     * fell back to IDLE. Nothing more can be read from it without a new
-     * selection, which the retry of pn532_ndef_read_card_auto() makes. */
-    if (!classic_auth_mad1(pn532, uid)) {
-        return PN532_NDEF_ERR_NO_NDEF;
+    /* As in NxpNfcRdLib phalTop: a refused MAD key means no NDEF. A card
+     * that could not be selected or did not answer, or a READ that fails
+     * after the authentication, means the card left the field or fell back
+     * to IDLE. Nothing more can be read from it without a new selection,
+     * which the retry of pn532_ndef_read_card_auto() makes. */
+    pn532_ndef_result_t auth_res = classic_auth_mad_sector(pn532, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK);
+    if (auth_res != PN532_NDEF_OK) {
+        return auth_res;
     }
     if (!classic_read_mad1_gpb(pn532, &gpb)) {
         return PN532_NDEF_ERR_READ_FAILED;
@@ -1713,12 +1813,13 @@ static pn532_ndef_result_t classic_read_ndef_from_mad(pn532_t *pn532, const pn53
 
 /* ---- Type 4 (DESFire / ISO-DEP) NDEF read ---- */
 
-static pn532_ndef_result_t ndef_type4_select_failure_result(const pn532_t *pn532)
+/* A SELECT the card refused with a status word means the application or file
+ * is not there. Any other failure (a PN532 error status such as a CRC,
+ * parity or framing error, a lost card, the transport) says nothing about the
+ * tag: it is a read error, which pn532_ndef_read_card_auto() repeats. */
+static pn532_ndef_result_t ndef_type4_select_failure_result(bool card_refused)
 {
-    if (pn532 == NULL || pn532->inListedTag == 0 || !pn532->session_opened) {
-        return PN532_NDEF_ERR_READ_FAILED;
-    }
-    return PN532_NDEF_ERR_NO_NDEF;
+    return card_refused ? PN532_NDEF_ERR_NO_NDEF : PN532_NDEF_ERR_READ_FAILED;
 }
 
 /*
@@ -1746,13 +1847,14 @@ static pn532_ndef_result_t ndef_read_type4(pn532_t *pn532, pn532_ndef_message_pa
     static const uint8_t ndef_aid[]   = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
     static const uint8_t cc_file_id[] = {0xE1, 0x03};
 
-    if (!pn532_14443_4_select_file(pn532, ndef_aid, sizeof(ndef_aid))) {
+    bool card_refused = false;
+    if (!pn532_14443_4_select_file_ex(pn532, ndef_aid, sizeof(ndef_aid), &card_refused)) {
         ESP_LOGD(TAG, "T4: SELECT NDEF AID failed");
-        return ndef_type4_select_failure_result(pn532);
+        return ndef_type4_select_failure_result(card_refused);
     }
-    if (!pn532_14443_4_select_file(pn532, cc_file_id, sizeof(cc_file_id))) {
+    if (!pn532_14443_4_select_file_ex(pn532, cc_file_id, sizeof(cc_file_id), &card_refused)) {
         ESP_LOGD(TAG, "T4: SELECT CC failed");
-        return ndef_type4_select_failure_result(pn532);
+        return ndef_type4_select_failure_result(card_refused);
     }
 
     uint8_t cc[15];
@@ -1804,9 +1906,9 @@ static pn532_ndef_result_t ndef_read_type4(pn532_t *pn532, pn532_ndef_message_pa
      * bytes is the ceiling. */
     uint16_t chunk_max = (mle > 250) ? 248u : (uint16_t)(mle - 2u);
 
-    if (!pn532_14443_4_select_file(pn532, ndef_fid_be, sizeof(ndef_fid_be))) {
+    if (!pn532_14443_4_select_file_ex(pn532, ndef_fid_be, sizeof(ndef_fid_be), &card_refused)) {
         ESP_LOGD(TAG, "T4: SELECT NDEF file %02X%02X failed", ndef_fid_be[0], ndef_fid_be[1]);
-        return ndef_type4_select_failure_result(pn532);
+        return ndef_type4_select_failure_result(card_refused);
     }
 
     uint8_t nlen_buf[2];
@@ -1873,26 +1975,27 @@ pn532_ndef_result_t pn532_ndef_read_card_auto(pn532_t *pn532, pn532_uid_t *uid, 
     case PN532_MIFARE_NTAG215:
     case PN532_MIFARE_NTAG216: {
         bool    has_cc = false;
+        uint8_t cc[4];
         uint8_t data_head[TYPE2_DATA_HEAD_LEN];
-        if (!pn532_type2_prepare_layout(pn532, uid, &has_cc, data_head)) {
+        if (!pn532_type2_prepare_layout(pn532, uid, &has_cc, cc, data_head)) {
             return PN532_NDEF_ERR_READ_FAILED;
         }
-        /* Capability container at page 3, NDEF data from page 4. A tag
-         * without the container, or with an empty data area, is not NDEF
-         * formatted. */
-        if (!has_cc || uid->blocks_count <= TYPE2_FIRST_DATA_PAGE) {
-            return PN532_NDEF_ERR_NO_NDEF;
+        /* Capability container at page 3, NDEF data from page 4. */
+        pn532_ndef_result_t res = type2_cc_read_check(has_cc, cc, uid);
+        if (res != PN532_NDEF_OK) {
+            return res;
         }
-        pn532_ndef_result_t res = type2_read_ndef_area(pn532, uid, data_head, out_msg);
+        res = type2_read_ndef_area(pn532, uid, data_head, out_msg);
         if (res == PN532_NDEF_ERR_READ_FAILED) {
             if (!pn532_14443_select_by_uid(pn532, uid)) {
                 return res;
             }
-            if (!pn532_type2_prepare_layout(pn532, uid, &has_cc, data_head)) {
+            if (!pn532_type2_prepare_layout(pn532, uid, &has_cc, cc, data_head)) {
                 return res;
             }
-            if (!has_cc || uid->blocks_count <= TYPE2_FIRST_DATA_PAGE) {
-                return PN532_NDEF_ERR_NO_NDEF;
+            pn532_ndef_result_t cc_res = type2_cc_read_check(has_cc, cc, uid);
+            if (cc_res != PN532_NDEF_OK) {
+                return cc_res;
             }
             res = type2_read_ndef_area(pn532, uid, data_head, out_msg);
         }

@@ -389,10 +389,22 @@ static pn532_bus_t *pn532_spi_add_device(spi_host_device_t host_id, gpio_num_t n
     return &spi_bus->base;
 }
 
+/* NSS is driven by the driver as a plain GPIO: GPIO_NUM_NC or an input-only
+ * pad cannot carry it, and a negative number would be shifted into the
+ * gpio_config() mask. */
+static bool pn532_spi_nss_is_valid(gpio_num_t nss, const char *who)
+{
+    if (GPIO_IS_VALID_OUTPUT_GPIO(nss)) {
+        return true;
+    }
+    ESP_LOGE(TAG, "%s: NSS %d is not an output GPIO", who, (int)nss);
+    return false;
+}
+
 pn532_bus_t *pn532_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi, gpio_num_t nss,
                             int clock_speed_hz)
 {
-    if ((unsigned)host_id >= SPI_HOST_MAX) {
+    if ((unsigned)host_id >= SPI_HOST_MAX || !pn532_spi_nss_is_valid(nss, "pn532_spi_init")) {
         return NULL;
     }
     if (!pn532_spi_bus_init(host_id, sck, miso, mosi)) {
@@ -407,7 +419,7 @@ pn532_bus_t *pn532_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_
 
 pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz)
 {
-    if ((unsigned)host_id >= SPI_HOST_MAX) {
+    if ((unsigned)host_id >= SPI_HOST_MAX || !pn532_spi_nss_is_valid(nss, "pn532_spi_attach")) {
         return NULL;
     }
     return pn532_spi_add_device(host_id, nss, clock_speed_hz, "pn532_spi_attach");

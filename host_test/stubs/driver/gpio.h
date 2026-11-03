@@ -7,6 +7,8 @@
 typedef int gpio_num_t;
 #define GPIO_NUM_NC  (-1)
 #define GPIO_NUM_MAX 64
+#define GPIO_IS_VALID_GPIO(gpio_num)        ((gpio_num) >= 0 && (gpio_num) < GPIO_NUM_MAX)
+#define GPIO_IS_VALID_OUTPUT_GPIO(gpio_num) ((gpio_num) >= 0 && (gpio_num) < GPIO_NUM_MAX)
 
 typedef enum { GPIO_MODE_INPUT = 1, GPIO_MODE_OUTPUT = 2 } gpio_mode_t;
 typedef enum { GPIO_PULLUP_DISABLE = 0, GPIO_PULLUP_ENABLE = 1 } gpio_pullup_t;

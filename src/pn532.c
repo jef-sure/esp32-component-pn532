@@ -108,16 +108,21 @@ void pn532_delay_ms(int ms)
     if (ms <= 0) {
         return;
     }
-    /* Whole ticks are slept and the remainder is a busy wait, so a delay
-     * shorter than a tick is not stretched to the next tick boundaries. */
-    int64_t end     = esp_timer_get_time() + (int64_t)ms * 1000;
-    int64_t tick_us = (int64_t)portTICK_PERIOD_MS * 1000;
-    while (end - esp_timer_get_time() > tick_us) {
-        vTaskDelay(1);
+    /* A delay shorter than a tick (the transport pauses of 2 to 5 ms at
+     * CONFIG_FREERTOS_HZ=100) is a busy wait: sleeping would stretch it to
+     * the next tick boundaries. A longer one (the RF settle delay, a poll
+     * pause) sleeps until the first tick at or after its end; none of these
+     * needs more precision than that, and a busy tail would spin for half a
+     * tick on average. */
+    int64_t delay_us = (int64_t)ms * 1000;
+    int64_t tick_us  = (int64_t)portTICK_PERIOD_MS * 1000;
+    if (delay_us < tick_us) {
+        esp_rom_delay_us((uint32_t)delay_us);
+        return;
     }
-    int64_t remaining = end - esp_timer_get_time();
-    if (remaining > 0) {
-        esp_rom_delay_us((uint32_t)remaining);
+    int64_t end = esp_timer_get_time() + delay_us;
+    while (esp_timer_get_time() < end) {
+        vTaskDelay(1);
     }
 }
 
@@ -128,14 +133,18 @@ void pn532_bus_destroy(pn532_bus_t *bus)
     }
 }
 
-static bool pn532_write_frame(pn532_t *pn532, uint8_t command, const uint8_t *params, size_t params_len)
+/* The parameters are head followed by params: InDataExchange puts the target
+ * number in front of the caller's data without a copy of it. */
+static bool pn532_write_frame(pn532_t *pn532, uint8_t command, const uint8_t *head, size_t head_len,
+                              const uint8_t *params, size_t params_len)
 {
     /* Checked before the additions below, which a huge params_len would wrap. */
-    if (params_len > PN532_MAX_BUF_SIZE) {
-        ESP_LOGE(TAG, "pn532_write_frame: frame too large (%u parameter bytes)", (unsigned int)params_len);
+    if (head_len > PN532_MAX_BUF_SIZE || params_len > PN532_MAX_BUF_SIZE - head_len) {
+        ESP_LOGE(TAG, "pn532_write_frame: frame too large (%u + %u parameter bytes)", (unsigned int)head_len,
+                 (unsigned int)params_len);
         return false;
     }
-    size_t payload_len  = params_len + 2;
+    size_t payload_len  = head_len + params_len + 2;
     size_t required_len = payload_len + ((payload_len < 0xFF) ? 7 : 10);
     if (required_len > PN532_MAX_BUF_SIZE) {
         ESP_LOGE(TAG, "pn532_write_frame: frame too large (%u bytes)", (unsigned int)required_len);
@@ -167,6 +176,10 @@ static bool pn532_write_frame(pn532_t *pn532, uint8_t command, const uint8_t *pa
     *cursor++ = command;
     checksum += command;
 
+    for (size_t i = 0; i < head_len; i++) {
+        *cursor++ = head[i];
+        checksum += head[i];
+    }
     for (size_t i = 0; i < params_len; i++) {
         *cursor++ = params[i];
         checksum += params[i];
@@ -402,14 +415,18 @@ static pn532_frame_result_t pn532_read_response_frame(pn532_t *pn532, uint8_t ex
     return PN532_FRAME_OK;
 }
 
-bool pn532_execute_command(      //
-    pn532_t       *pn532,        //
-    uint8_t        command,      //
-    const uint8_t *params,       //
-    size_t         params_len,   //
-    uint8_t       *response,     //
-    size_t        *response_len, //
-    uint16_t       timeout       //
+/* pn532_execute_command() with the parameters in two parts, head then params
+ * (see pn532_write_frame()). */
+static bool pn532_execute_command_parts( //
+    pn532_t       *pn532,                //
+    uint8_t        command,              //
+    const uint8_t *head,                 //
+    size_t         head_len,             //
+    const uint8_t *params,               //
+    size_t         params_len,           //
+    uint8_t       *response,             //
+    size_t        *response_len,         //
+    uint16_t       timeout               //
 )
 {
     if (pn532 == NULL) {
@@ -421,8 +438,8 @@ bool pn532_execute_command(      //
         ESP_LOGE(TAG, "pn532_execute_command: response_len is required when response buffer is provided");
         return false;
     }
-    if (params == NULL && params_len > 0) {
-        ESP_LOGE(TAG, "pn532_execute_command: params is NULL with params_len %u", (unsigned)params_len);
+    if ((params == NULL && params_len > 0) || (head == NULL && head_len > 0)) {
+        ESP_LOGE(TAG, "pn532_execute_command: params is NULL with params_len %u", (unsigned)(head_len + params_len));
         return false;
     }
 
@@ -444,7 +461,7 @@ bool pn532_execute_command(      //
         if (attempt > 0) {
             ESP_LOGW(TAG, "pn532_execute_command: no ACK for command 0x%02X, sending it again", command);
         }
-        if (!pn532_write_frame(pn532, command, params, params_len)) {
+        if (!pn532_write_frame(pn532, command, head, head_len, params, params_len)) {
             return false;
         }
         acked = pn532_wait_ready(pn532, pn532->ack_timeout_ms);
@@ -512,6 +529,19 @@ bool pn532_execute_command(      //
 
     pn532->last_command_status = PN532_COMMAND_STATUS_OK;
     return true;
+}
+
+bool pn532_execute_command(      //
+    pn532_t       *pn532,        //
+    uint8_t        command,      //
+    const uint8_t *params,       //
+    size_t         params_len,   //
+    uint8_t       *response,     //
+    size_t        *response_len, //
+    uint16_t       timeout       //
+)
+{
+    return pn532_execute_command_parts(pn532, command, NULL, 0, params, params_len, response, response_len, timeout);
 }
 
 uint32_t pn532_get_firmware_version(pn532_t *pn532)
@@ -635,6 +665,17 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
     if (bus == NULL) {
         return NULL;
     }
+    /* A negative number leaves the pin unused. Any other must be a GPIO of
+     * the chip, the reset pin one that can drive: it goes into the 64-bit
+     * gpio_config() mask. */
+    if (pn532_gpio_is_valid(irq) && !GPIO_IS_VALID_GPIO(irq)) {
+        ESP_LOGE(TAG, "pn532_init: IRQ %d is not a GPIO", (int)irq);
+        return NULL;
+    }
+    if (pn532_gpio_is_valid(rst) && !GPIO_IS_VALID_OUTPUT_GPIO(rst)) {
+        ESP_LOGE(TAG, "pn532_init: RST %d is not an output GPIO", (int)rst);
+        return NULL;
+    }
 
     pn532_t *pn532 = calloc(1, sizeof(*pn532));
     if (pn532 == NULL) {
@@ -670,7 +711,12 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
             .intr_type    = GPIO_INTR_DISABLE,
         };
         gpio_set_level(rst, 1);
-        gpio_config(&rst_cfg);
+        esp_err_t rst_err = gpio_config(&rst_cfg);
+        if (rst_err != ESP_OK) {
+            ESP_LOGE(TAG, "pn532_init: RST %d: gpio_config failed (%s)", (int)rst, esp_err_to_name(rst_err));
+            pn532_deinit(pn532, false);
+            return NULL;
+        }
         gpio_set_level(rst, 1);
     }
     if (pn532_gpio_is_valid(irq)) {
@@ -681,7 +727,13 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type    = GPIO_INTR_DISABLE,
         };
-        gpio_config(&irq_cfg);
+        esp_err_t irq_err = gpio_config(&irq_cfg);
+        if (irq_err != ESP_OK) {
+            ESP_LOGE(TAG, "pn532_init: IRQ %d: gpio_config failed (%s)", (int)irq, esp_err_to_name(irq_err));
+            pn532_deinit(pn532, false);
+            return NULL;
+        }
+        /* Without the interrupt the driver polls the bus for readiness. */
         pn532->irq_queue = xQueueCreate(PN532_IRQ_QUEUE_DEPTH, sizeof(uint8_t));
         if (pn532->irq_queue == NULL) {
             ESP_LOGE(TAG, "pn532: failed to allocate IRQ queue");
@@ -690,10 +742,12 @@ pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst)
             if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
                 ESP_LOGE(TAG, "pn532: gpio_install_isr_service failed (%s)", esp_err_to_name(isr_err));
             } else {
-                gpio_set_intr_type(irq, GPIO_INTR_NEGEDGE);
-                esp_err_t add_err = gpio_isr_handler_add(irq, pn532_irq_isr_handler, pn532);
+                esp_err_t type_err = gpio_set_intr_type(irq, GPIO_INTR_NEGEDGE);
+                esp_err_t add_err  = (type_err == ESP_OK) ? gpio_isr_handler_add(irq, pn532_irq_isr_handler, pn532)
+                                                          : type_err;
                 if (add_err != ESP_OK) {
-                    ESP_LOGE(TAG, "pn532: gpio_isr_handler_add failed (%s)", esp_err_to_name(add_err));
+                    ESP_LOGE(TAG, "pn532: IRQ %d interrupt not set up (%s), polling the bus", (int)irq,
+                             esp_err_to_name(add_err));
                 } else {
                     pn532->isr_installed = true;
                 }
@@ -830,17 +884,15 @@ void pn532_set_rf_settle_delay(pn532_t *pn532, uint16_t delay_ms)
 
 static bool pn532_rf_configuration(pn532_t *pn532, uint8_t cfg_item, const uint8_t *config_data, size_t config_data_len)
 {
-    if (pn532 == NULL || config_data == NULL || config_data_len == 0 || config_data_len > PN532_MAX_BUF_SIZE - 16) {
+    /* The longest item, the analog settings of 106 kbps type A (0Ah), has
+     * eleven bytes (UM0701-02 §7.3.1). */
+    if (pn532 == NULL || config_data == NULL || config_data_len == 0 || config_data_len > 11) {
         return false;
     }
 
-    uint8_t params[PN532_MAX_BUF_SIZE];
-    params[0] = cfg_item;
-    memcpy(params + 1, config_data, config_data_len);
-
     size_t response_len = 0;
-    return pn532_execute_command(pn532, PN532_COMMAND_RFCONFIGURATION, params, config_data_len + 1, NULL, &response_len,
-                                 (uint16_t)pn532->timeout_ms) &&
+    return pn532_execute_command_parts(pn532, PN532_COMMAND_RFCONFIGURATION, &cfg_item, 1, config_data, config_data_len,
+                                       NULL, &response_len, (uint16_t)pn532->timeout_ms) &&
            response_len == 0;
 }
 
@@ -926,6 +978,21 @@ bool pn532_release_target(pn532_t *pn532)
         ESP_LOGE(TAG, "pn532_release_target: empty response");
         return false;
     }
+    /* The freed number no longer stands for this card, so a later select by
+     * UID lists it again instead of an InSelect that fails with 0x27. With
+     * no target left the chip returns to Standby and the field goes off
+     * (§7.3.11). */
+    uint8_t released = pn532->inListedTag;
+    if (released >= 1 && released <= sizeof(pn532->listed_uid_len)) {
+        pn532->listed_uid_len[released - 1] = 0;
+    }
+    bool any_listed = false;
+    for (size_t i = 0; i < sizeof(pn532->listed_uid_len); i++) {
+        any_listed = any_listed || pn532->listed_uid_len[i] != 0;
+    }
+    if (!any_listed) {
+        pn532->is_rf_on = false;
+    }
     pn532->inListedTag    = 0;
     pn532->session_opened = false;
     if (response[0] == PN532_STATUS_TARGET_NOT_KNOWN) {
@@ -960,7 +1027,11 @@ bool pn532_deselect_target(pn532_t *pn532)
 bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                             size_t *response_len, uint16_t timeout)
 {
-    if (pn532 == NULL || data == NULL || data_len == 0 || data_len >= PN532_MAX_BUF_SIZE) {
+    if (pn532 == NULL) {
+        return false;
+    }
+    pn532->last_target_status = PN532_TARGET_STATUS_NONE;
+    if (data == NULL || data_len == 0 || data_len >= PN532_MAX_BUF_SIZE) {
         return false;
     }
 
@@ -969,9 +1040,7 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
         return false;
     }
 
-    uint8_t params[PN532_MAX_BUF_SIZE];
-    params[0] = pn532->inListedTag;
-    memcpy(params + 1, data, data_len);
+    const uint8_t tg = pn532->inListedTag;
 
     uint8_t  raw_response[PN532_MAX_BUF_SIZE];
     uint8_t *raw_cursor        = response;
@@ -1006,11 +1075,10 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
         }
 
         size_t raw_response_len = sizeof(raw_response);
-        /* Round 0 sends the caller's data; MI continuations send only the
-         * target number. */
-        size_t request_len = (round == 0) ? data_len + 1 : 1;
-        if (!pn532_execute_command(pn532, PN532_COMMAND_INDATAEXCHANGE, params, request_len, raw_response,
-                                   &raw_response_len, timeout)) {
+        /* Round 0 sends the target number and the caller's data; MI
+         * continuations send only the target number. */
+        if (!pn532_execute_command_parts(pn532, PN532_COMMAND_INDATAEXCHANGE, &tg, 1, (round == 0) ? data : NULL,
+                                         (round == 0) ? data_len : 0, raw_response, &raw_response_len, timeout)) {
             exchange_failed = true;
             break;
         }
@@ -1020,7 +1088,8 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
             break;
         }
 
-        uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
+        uint8_t status            = raw_response[0] & PN532_STATUS_ERROR_MASK;
+        pn532->last_target_status = status;
         if (status != PN532_STATUS_OK) {
             /*
              * NXP's TAMA stack reports 0x01/0x13/0x14 as RF timeout style errors
@@ -1115,7 +1184,11 @@ bool pn532_in_data_exchange(pn532_t *pn532, const uint8_t *data, size_t data_len
 bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_len, uint8_t *response,
                                size_t *response_len, uint16_t timeout)
 {
-    if (pn532 == NULL || data == NULL || data_len == 0 || data_len >= PN532_MAX_BUF_SIZE) {
+    if (pn532 == NULL) {
+        return false;
+    }
+    pn532->last_target_status = PN532_TARGET_STATUS_NONE;
+    if (data == NULL || data_len == 0 || data_len >= PN532_MAX_BUF_SIZE) {
         return false;
     }
 
@@ -1148,7 +1221,8 @@ bool pn532_in_communicate_thru(pn532_t *pn532, const uint8_t *data, size_t data_
         return false;
     }
 
-    uint8_t status = raw_response[0] & PN532_STATUS_ERROR_MASK;
+    uint8_t status            = raw_response[0] & PN532_STATUS_ERROR_MASK;
+    pn532->last_target_status = status;
     if (status != PN532_STATUS_OK) {
         ESP_LOGD(TAG, "pn532_in_communicate_thru: PN532 status 0x%02X", status);
         /* As after the same statuses from InDataExchange: the card that did

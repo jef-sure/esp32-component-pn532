@@ -214,7 +214,8 @@ bool pn532_ndef_make_external_record(pn532_ndef_record_t *rec, const char *type_
  *         PN532_NDEF_ERR_READ_FAILED when the capability container, the
  *         start of the data area or the pages in front of start_block cannot
  *         be read; PN532_NDEF_ERR_NO_NDEF when
- *         the tag has no capability container; PN532_NDEF_ERR_READ_ONLY when
+ *         the tag has no capability container; PN532_NDEF_ERR_UNSUPPORTED
+ *         when its major version is not 1; PN532_NDEF_ERR_READ_ONLY when
  *         it does not grant write access; PN532_NDEF_ERR_PARSE_FAILED for a
  *         malformed control TLV;
  *         PN532_NDEF_ERR_WRITE_FAILED when a page write fails.
@@ -228,7 +229,10 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
  *
  * For Type 2 tags the helper reads the capability container to refine subtype
  * and capacity; a tag without the capability container magic (E1h) or with
- * an empty data area returns PN532_NDEF_ERR_NO_NDEF without scanning the memory.
+ * an empty data area returns PN532_NDEF_ERR_NO_NDEF without scanning the memory,
+ * a container of a major version other than 1 PN532_NDEF_ERR_UNSUPPORTED, and
+ * one whose read access (high nibble of byte 3) is not 0h
+ * PN532_NDEF_ERR_ACCESS_DENIED.
  * Lock and reserved bytes that Lock Control and Memory Control TLVs place
  * inside the data area are left out of the TLV stream, as the NFC Forum Type
  * 2 Tag specification asks, so a message continues behind them. A Type 2
@@ -237,17 +241,28 @@ pn532_ndef_result_t pn532_ndef_write_to_selected_card(pn532_t *pn532, const pn53
  * For MIFARE Classic Mini / 1K it uses MAD1 to locate NDEF sectors, and for
  * 4K it also reads MAD2 when advertised, so non-NDEF cards return
  * PN532_NDEF_ERR_NO_NDEF quickly instead of falling back to a flat scan. A
- * directory with a wrong CRC is treated as absent. For Type 4 tags the
+ * directory with a wrong CRC is treated as absent, and so is one whose sector
+ * turns down both the MAD key and the default key. NDEF sectors that turn
+ * down both the public NFC key and the default key are
+ * PN532_NDEF_ERR_ACCESS_DENIED, and so is a first NDEF sector whose general
+ * purpose byte denies reading; one whose mapping major version is above 1 is
+ * PN532_NDEF_ERR_UNSUPPORTED. For Type 4 tags the
  * NDEF application of mapping 2.0 and later (AID D2 76 00 00 85 01 01) is
  * selected, as NxpNfcRdLib does; a mapping 1.0 tag, which has another AID,
- * is PN532_NDEF_ERR_NO_NDEF. A
- * read-protected NDEF file is PN532_NDEF_ERR_ACCESS_DENIED; an unknown
+ * is PN532_NDEF_ERR_NO_NDEF, as is any SELECT the card refuses with a status
+ * word. A read-protected NDEF file is PN532_NDEF_ERR_ACCESS_DENIED; an unknown
  * mapping version or an extended NDEF file (Extended NDEF File Control TLV,
  * files above 32 KB) is PN532_NDEF_ERR_UNSUPPORTED; a capability container
  * with CCLEN below 15 or MLe below 000Fh is PN532_NDEF_ERR_PARSE_FAILED.
  *
  * A session that is open on another card is switched to @p uid first, so with
  * two cards in the field the helper never reads the card selected before.
+ *
+ * A card that cannot be selected or does not answer, a PN532 error status
+ * (a CRC, parity or framing error, for instance) or a READ that fails is
+ * PN532_NDEF_ERR_READ_FAILED: nothing is known about the tag then. The helper
+ * has already made a second attempt, from a new listing where the card needs
+ * one.
  *
  * @param pn532 Active PN532 device.
  * @param uid Target returned by pn532_14443_get_all_uids().

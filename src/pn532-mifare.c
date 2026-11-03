@@ -139,6 +139,9 @@ static bool pn532_mifare_value_op(pn532_t *pn532, uint8_t cmd, uint8_t blockno, 
      * This helper performs only the first stage. Call pn532_mifare_transfer()
      * separately to commit the result.
      */
+    if (pn532 == NULL) {
+        return false;
+    }
     uint8_t op[6];
     size_t  op_len;
 
@@ -182,6 +185,9 @@ bool pn532_mifare_restore(pn532_t *pn532, uint8_t blockno)
 
 bool pn532_mifare_transfer(pn532_t *pn532, uint8_t blockno)
 {
+    if (pn532 == NULL) {
+        return false;
+    }
     uint8_t op[2]        = {PN532_MIFARE_CMD_TRANSFER, blockno};
     size_t  response_len = 0;
     return pn532_in_data_exchange(pn532, op, sizeof(op), NULL, &response_len, (uint16_t)pn532->timeout_ms);

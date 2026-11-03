@@ -48,7 +48,7 @@ If you wire the PN532 IRQ line, set `PN532_PIN_IRQ` to a valid GPIO so the drive
 - attempts an NDEF read first
 - falls back to raw dumps by card family when NDEF is unavailable
 
-The sample always runs the NDEF read path first and falls back to a raw dump when that read reports no NDEF data.
+The sample always runs the NDEF read path first and falls back to a raw dump when that read finds no message it can return (no NDEF, read protected, unsupported). After a read error (`PN532_NDEF_ERR_READ_FAILED`) it skips the dump. For a MIFARE Classic dump it tries a list of common keys, one authentication per key and key type; after a refused key the card is listed again before the next one.
 Because it reads cards, each loop follows `poll -> select/read -> release -> RF off`. UID-only polling needs only `poll -> RF off`. The driver applies the RF settle delay after every RF off itself, and repeated transport failures trigger `pn532_recover()`. See the root README for a two-PN532 shared-SPI example using distinct NSS pins.
 
 ## Build And Run

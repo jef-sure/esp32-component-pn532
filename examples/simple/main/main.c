@@ -46,13 +46,6 @@ static const uint8_t mifare_keys[][6] = {
 };
 static const uint8_t mifare_key_types[] = {PN532_MIFARE_CMD_AUTH_A, PN532_MIFARE_CMD_AUTH_B};
 
-typedef enum
-{
-    AUTH_RESULT_OK,
-    AUTH_RESULT_FAIL,
-    AUTH_RESULT_NO_CARD,
-} auth_result_t;
-
 static void pn532_format_uid(const pn532_uid_t *uid, char *buffer, size_t buffer_len)
 {
     size_t offset = 0;
@@ -175,45 +168,25 @@ static int pn532_classic_sector_from_block(const pn532_uid_t *uid, int block)
     return block / 4;
 }
 
-static auth_result_t pn532_authenticate_sector_with_key( //
-    pn532_t           *pn532,                            //
-    const pn532_uid_t *uid,                              //
-    int                sector_block,                     //
-    const uint8_t     *key,                              //
-    uint8_t            key_type                          //
-)
-{
-    if (pn532 == NULL || uid == NULL || key == NULL) {
-        return AUTH_RESULT_FAIL;
-    }
-
-    if (pn532_14443_authenticate(pn532, key, key_type, uid, sector_block)) {
-        return AUTH_RESULT_OK;
-    }
-
-    if (!pn532_14443_select_by_uid(pn532, uid)) {
-        return AUTH_RESULT_NO_CARD;
-    }
-
-    return pn532_14443_authenticate(pn532, key, key_type, uid, sector_block) ? AUTH_RESULT_OK : AUTH_RESULT_FAIL;
-}
-
+/* A refused key leaves the card in IDLE: it is listed again before the next
+ * key is tried, not asked the same key a second time. */
 static bool pn532_authenticate_sector(pn532_t *pn532, const pn532_uid_t *uid, int sector_block)
 {
-    int sector = pn532_classic_sector_from_block(uid, sector_block);
+    int  sector       = pn532_classic_sector_from_block(uid, sector_block);
+    bool needs_select = false;
 
     for (size_t key_index = 0; key_index < ARRAY_SIZE(mifare_keys); key_index++) {
         for (size_t type_index = 0; type_index < ARRAY_SIZE(mifare_key_types); type_index++) {
-            auth_result_t result = pn532_authenticate_sector_with_key(pn532, uid, sector_block, mifare_keys[key_index],
-                                                                      mifare_key_types[type_index]);
-            if (result == AUTH_RESULT_OK) {
+            if (needs_select && !pn532_14443_select_by_uid(pn532, uid)) {
+                return false; /* the card is gone */
+            }
+            if (pn532_14443_authenticate(pn532, mifare_keys[key_index], mifare_key_types[type_index], uid,
+                                         sector_block)) {
                 ESP_LOGI(TAG, "  sector %2d authenticated with key %zu (%s)", sector, key_index,
                          (mifare_key_types[type_index] == PN532_MIFARE_CMD_AUTH_A) ? "KeyA" : "KeyB");
                 return true;
             }
-            if (result == AUTH_RESULT_NO_CARD) {
-                return false;
-            }
+            needs_select = true;
         }
     }
 

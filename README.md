@@ -4,6 +4,8 @@
 
 ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read card UIDs, read NDEF (NTAG / Ultralight, MIFARE Classic, Type 4), write NDEF to NTAG / Ultralight, and exchange APDUs with ISO14443A cards in reader mode.
 
+**Two cards at once.** One poll lists up to two ISO14443A cards, the most the PN532 activates together, and `pn532_14443_get_all_uids()` returns both. `pn532_ndef_read_card_auto()` and `pn532_14443_select_by_uid()` take the card by its UID and move the session to it, so both cards are read in the same cycle, as the example below does.
+
 - [Quick Start](#quick-start)
 - [Choosing A Transport](#choosing-a-transport)
 - [Common Tasks](#common-tasks)
@@ -19,7 +21,7 @@ ESP-IDF driver for the NXP PN532 NFC reader over SPI, I2C, or UART (HSU): read c
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn532^0.8.1"
+idf.py add-dependency "jef-sure/pn532^0.8.2"
 ```
 
 Or copy this repository to `components/pn532` in your project and add `REQUIRES pn532` to the component that uses it. ESP-IDF 5.2 or newer is required.
@@ -120,8 +122,8 @@ pn532_bus_t *bus = pn532_uart_init(UART_NUM_1, GPIO_NUM_17, GPIO_NUM_16, 115200)
 
 Every transport is then used the same way: `pn532_init(bus, irq, rst)`, and finally `pn532_deinit(pn532, true)` to free both the device and the bus.
 
-- **IRQ pin (optional).** Pass the GPIO wired to the PN532 IRQ line to `pn532_init()`. The driver then waits on the interrupt and reads the bus status only every 10 ms as a fallback (the line is driven only once SAMConfiguration enables it), so readiness comes mostly from the chip's own signal — most useful on UART. Pass `GPIO_NUM_NC` otherwise.
-- **RST pin (optional).** When passed, `pn532_reset()` and `pn532_recover()` pulse it for a hardware reset; without it the reset is logical only.
+- **IRQ pin (optional).** Pass the GPIO wired to the PN532 IRQ line to `pn532_init()`. The driver then waits on the interrupt and reads the bus status only every 10 ms as a fallback (the line is driven only once SAMConfiguration enables it), so readiness comes mostly from the chip's own signal — most useful on UART. Pass `GPIO_NUM_NC` otherwise. If the interrupt cannot be set up, the driver logs it and polls the bus; a number that is not a GPIO makes `pn532_init()` return NULL.
+- **RST pin (optional).** When passed, `pn532_reset()` and `pn532_recover()` pulse it for a hardware reset; without it the reset is logical only. It must be an output GPIO (not an input-only pad such as GPIO 34–39 of the ESP32), or `pn532_init()` returns NULL.
 - **SPI clock.** The PN532 accepts up to 5 MHz, but long wires and cheap modules often are not reliable above 1–2 MHz. A higher request is lowered to 5 MHz (`PN532_SPI_MAX_CLOCK_HZ`), and an I2C clock above 400 kHz to 400 kHz (`PN532_I2C_MAX_CLOCK_HZ`).
 - **UART baud rate.** If the module does not answer at the configured rate, `pn532_init()` probes all nine HSU rates (9600 to 1288000, UM0701-02 §7.2.8) and logs a warning with the rate it found. To run faster, switch both sides at once; the setting is volatile and the module returns to its power-on rate after a power cycle, which `pn532_recover()` detects and follows:
 
@@ -170,9 +172,9 @@ if (res == PN532_NDEF_OK) {
 
 Behavior by card family:
 
-- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed. A tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after that one read; the scan never leaves the data area the container describes. Lock and reserved bytes that Lock Control and Memory Control TLVs place inside the data area are left out of the TLV stream, so a message continues behind them. A message that continues beyond page 255 returns `PN532_NDEF_ERR_UNSUPPORTED` (that sector needs SECTOR_SELECT).
-- MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `PN532_NDEF_ERR_NO_NDEF`, and so does a directory whose CRC does not match its content. Sector trailers are skipped during reads, and re-authentication is performed at every sector boundary, automatically retrying with the secondary key. A READ that fails after a key was accepted means the card left or fell back to IDLE: the helper repeats the read once from a new listing, as for the other card types.
-- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application of mapping 2.0 and later (AID `D2 76 00 00 85 01 01`, as NxpNfcRdLib does; a mapping 1.0 tag has another AID and returns `PN532_NDEF_ERR_NO_NDEF`), reads the capability container, then reads NLEN plus the NDEF file contents in chunks of MLe − 2 bytes (at most 248). A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x or an extended NDEF file (above 32 KB) `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file, a CCLEN below 15 or an MLe below 000Fh `PN532_NDEF_ERR_PARSE_FAILED`.
+- Type 2 and NTAG: the helper reads the capability container to refine subtype and capacity, then retries after a fresh reselect if needed. A tag without the capability container magic (`E1`) or with an empty data area returns `PN532_NDEF_ERR_NO_NDEF` after that one read, a container of a major version other than 1 `PN532_NDEF_ERR_UNSUPPORTED` (as in NxpNfcRdLib), and one whose read access (high nibble of byte 3) is not `0` `PN532_NDEF_ERR_ACCESS_DENIED`; the scan never leaves the data area the container describes. Lock and reserved bytes that Lock Control and Memory Control TLVs place inside the data area are left out of the TLV stream, so a message continues behind them. A message that continues beyond page 255 returns `PN532_NDEF_ERR_UNSUPPORTED` (that sector needs SECTOR_SELECT).
+- MIFARE Classic Mini, 1K, and 4K: the helper authenticates sector 0 with the standard MAD key A `A0 A1 A2 A3 A4 A5` (falling back to the factory default key `FF FF FF FF FF FF`), reads MAD1, and uses the application directory to locate the contiguous range of NDEF-tagged sectors. On 4K cards whose MAD1 GPB advertises version 2, MAD2 is also read and its 23 entries (sectors 17..39) are appended. NDEF sectors must be contiguous; gaps cause `PN532_NDEF_ERR_NO_NDEF`, and so does a directory whose CRC does not match its content. Sector trailers are skipped during reads, and each NDEF sector is authenticated with the public NFC key A `D3 F7 D3 F7 D3 F7`, then with the factory default key. A card that turns both directory keys down returns `PN532_NDEF_ERR_NO_NDEF`; NDEF sectors that turn both of their keys down return `PN532_NDEF_ERR_ACCESS_DENIED`, without a second attempt. As in NxpNfcRdLib, the general purpose byte in the trailer of the first NDEF sector is checked: a mapping major version above 1 returns `PN532_NDEF_ERR_UNSUPPORTED`, a read access other than `00b` `PN532_NDEF_ERR_ACCESS_DENIED`. A card that cannot be selected or does not answer, or a READ that fails after a key was accepted, means the card left or fell back to IDLE: the helper repeats the read once from a new listing, as for the other card types, and returns `PN532_NDEF_ERR_READ_FAILED` if that fails too.
+- Type 4 and DESFire-like cards: the helper selects the NFC Forum Type 4 application of mapping 2.0 and later (AID `D2 76 00 00 85 01 01`, as NxpNfcRdLib does; a mapping 1.0 tag has another AID and returns `PN532_NDEF_ERR_NO_NDEF`), reads the capability container, then reads NLEN plus the NDEF file contents in chunks of MLe − 2 bytes (at most 248). A SELECT the card refuses with a status word means no NDEF; one that fails otherwise (a PN532 error status such as a CRC or framing error, a lost card) is a read error, repeated once. A read-protected NDEF file returns `PN532_NDEF_ERR_ACCESS_DENIED`, a mapping version other than 1.x to 3.x or an extended NDEF file (above 32 KB) `PN532_NDEF_ERR_UNSUPPORTED`, and an NLEN that does not fit the file, a CCLEN below 15 or an MLe below 000Fh `PN532_NDEF_ERR_PARSE_FAILED`.
 
 The parser reassembles NDEF chunked records (`CF`) into one logical record with a contiguous payload. It validates the `MB`, `ME`, `CF`, and `TNF_UNCHANGED` sequence and rejects malformed messages. Raw NDEF bytes can be parsed directly with `pn532_ndef_parse_message()`; the returned record storage remains valid until `pn532_ndef_free_parsed_message()`.
 
@@ -211,7 +213,7 @@ The arguments after the message are `start_block`, `block_size`, and `max_blocks
 
 - `start_block` below 4 (UID, lock bytes, and the one-time programmable capability container) and a non-positive `max_blocks` return `PN532_NDEF_ERR_INVALID_PARAM`.
 - It reads the capability container and keeps the write inside the data area it describes (pages 4 to 3 + CC[2] × 2; 4 to 39 on an NTAG213), whatever `max_blocks` says, so the dynamic lock and configuration pages behind it are never written. A message that does not fit returns `PN532_NDEF_ERR_CARD_FULL`.
-- A tag without a capability container returns `PN532_NDEF_ERR_NO_NDEF`.
+- A tag without a capability container returns `PN532_NDEF_ERR_NO_NDEF`, and one of a major version other than 1 `PN532_NDEF_ERR_UNSUPPORTED`.
 - Readers take the first NDEF TLV behind the control TLVs. A later `start_block` is reached only through NULL TLVs or other TLVs that end at it; a factory tag holds an empty NDEF TLV there, so such a call returns `PN532_NDEF_ERR_INVALID_PARAM` before anything is written.
 - A tag whose capability container does not grant write access (byte 3 other than `00`) returns `PN532_NDEF_ERR_READ_ONLY`.
 - Lock Control and Memory Control TLVs at the start of the data area are kept and the NDEF TLV is written behind them. A factory NTAG213/215/216 has a 5-byte Lock Control TLV in page 4, so the message has 5 bytes less there. Lock or reserved bytes that such a TLV places inside the pages to write are not skipped: the layout returns `PN532_NDEF_ERR_UNSUPPORTED`.
@@ -308,7 +310,7 @@ pn532_set_rf_off(pn532);
 Notes:
 
 - `0x60` selects key A (`0x61` for key B).
-- After a failed auth or read, the card must be re-selected before retrying; `pn532_14443_select_by_uid()` handles the re-acquisition.
+- After a failed auth or read, the card must be re-selected before retrying; `pn532_14443_select_by_uid()` handles the re-acquisition. A failed authentication marks the target, so that call lists the card again. `pn532->last_target_status` is `0x14` when the card turned the key down, another code after an RF error, `0xFF` when the chip gave no answer.
 - For NDEF content prefer `pn532_ndef_read_card_auto()` (see below) — it resolves MAD sectors and keys automatically.
 
 ### Exchange APDUs with a Type 4 card
@@ -419,8 +421,8 @@ For SPI, initialise the host with `spi_bus_initialize()` and call `pn532_spi_att
 - **`PN532 returned an error frame for command ...`** — the chip understood the frame but refused the command (wrong parameters, or a command it does not accept in its current state). The link works: a poll reports `PN532_POLL_PROTOCOL_ERROR`, and `pn532_recover()` is not needed.
 - **Alternating `PN532_POLL_FOUND` / `PN532_POLL_NO_TARGET` with a static card** — the card sits in HALT and does not power down before the next poll. Increase the RF settle delay (`pn532_set_rf_settle_delay()`); the 20 ms default fits a 250 ms two-reader cycle.
 - **Frequent `PN532_POLL_TIMEOUT` with a present card** — the response phase is too short for the card. Raise `pn532->timeout_ms` (default 500 ms). For Type 4 APDU exchanges the driver already applies a 1500 ms floor.
-- **`PN532_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the card uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
-- **Two readers on one SPI bus interfere** — poll sequentially and finish each cycle with `pn532_set_rf_off()`; the settle delay is applied by the driver itself. Never poll both readers concurrently from different tasks.
+- **`PN532_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the MAD sector uses a key other than `A0 A1 A2 A3 A4 A5` and `FF FF FF FF FF FF`, or its NDEF sectors are not contiguous. `PN532_NDEF_ERR_ACCESS_DENIED` means the MAD lists NDEF sectors that neither `D3 F7 D3 F7 D3 F7` nor `FF FF FF FF FF FF` opens. Read raw blocks with your own keys instead.
+- **Two readers with close antennas interfere** — their fields disturb each other's cards. Poll them in turns (from one task, or from two tasks that take turns) and finish each cycle with `pn532_set_rf_off()`; the settle delay is applied by the driver itself. The transports allow one task per reader; the turns are for the RF fields.
 - **A card shows a different UID starting with `08` on every poll** — a random UID, typically a phone. See [Targets with a random UID](#targets-with-a-random-uid).
 - **`pn532_in_select: status 0x27`** — the PN532 rejects the command in its current context, typically because the target number is no longer known (for example after an unexpected chip reset). Select fails so the caller re-polls. Deselect/release close the local session successfully on `0x27`; the log line `target already lost (0x27)` at debug level is informational.
 
@@ -474,7 +476,7 @@ The PN532 enters low-power after power-up and after PowerDown. Each transport im
 
 ### RF settle delay
 
-`pn532_set_rf_off()` waits `pn532->rf_settle_delay_ms` (default `PN532_RF_SETTLE_DELAY_MS` = 20 ms) before returning, so a card sitting in HALT powers down and the next `InListPassiveTarget` re-activates it cleanly. With a static card and a 250 ms two-reader poll cycle this keeps every iteration at `PN532_POLL_FOUND` without alternating `FOUND`/`NO_TARGET`. Applications no longer need their own post-RF-off delay; tune or disable it with `pn532_set_rf_settle_delay()` (pass 0 to disable).
+`pn532_set_rf_off()` waits `pn532->rf_settle_delay_ms` (default `PN532_RF_SETTLE_DELAY_MS` = 20 ms; with `pn532_delay_ms()` it may end up to one RTOS tick later, never earlier) before returning, so a card sitting in HALT powers down and the next `InListPassiveTarget` re-activates it cleanly. With a static card and a 250 ms two-reader poll cycle this keeps every iteration at `PN532_POLL_FOUND` without alternating `FOUND`/`NO_TARGET`. Applications no longer need their own post-RF-off delay; tune or disable it with `pn532_set_rf_settle_delay()` (pass 0 to disable).
 
 ## Reference
 
@@ -602,7 +604,7 @@ The target must be selected first (see `pn532_14443_select_by_uid()`). One call 
 
 ### Task stack
 
-The driver keeps its frame buffers in `pn532_t`, but the exchange helpers use stack buffers of the PN532 frame size (280 bytes). Counted by buffer sizes, the deepest path — a Type 4 NDEF read — holds about 850 bytes of driver locals at once (the READ BINARY buffer plus the request and response buffers of `InDataExchange`), and selecting a card about 300. Logging and the bus drivers add their own share. Size the stack of the task that calls the driver with that in mind; the figures are not measured high-water marks.
+The driver keeps its frame buffers in `pn532_t`, but the exchange helpers use stack buffers of up to the PN532 frame size (280 bytes). Measured with `-fstack-usage` on ESP-IDF 5.5.4 for the esp32 at the default optimisation (`-Og`), the deepest path, a Type 4 NDEF read from `pn532_ndef_read_card_auto()` down to the SPI transport, takes about 1.15 KB of driver stack frames, most of it the SELECT response buffer (258 bytes) and the `InDataExchange` response buffer (280 bytes). Selecting a card takes about 600 bytes. The ESP-IDF bus driver, logging and the interrupt frame come on top. The example runs in `app_main` on the default 3584-byte stack; size the stack of a task of your own with these figures in mind. They are sums of frame sizes, not measured high-water marks.
 
 ### Ownership and lifetime
 
@@ -615,7 +617,7 @@ The driver keeps its frame buffers in `pn532_t`, but the exchange helpers use st
 - `pn532_ndef_read_card_auto()` returns a heap-allocated `pn532_ndef_message_parsed_t *`. Release it with `pn532_ndef_free_parsed_message()`.
 - `pn532_ndef_parse_message()` follows the same ownership contract and copies the encoded input into the parsed message.
 
-`pn532_t` is a public struct because the driver is split across multiple source files, but application code should treat it as an owned handle and not modify its fields directly; `timeout_ms` is the one field meant to be set by the application (see the timeout section). The driver has no locking: one `pn532_t` is used from one task at a time. Two readers, each with its own `pn532_t`, may run in separate tasks; create and destroy their buses from one task.
+`pn532_t` is a public struct because the driver is split across multiple source files, but application code should treat it as an owned handle and not modify its fields directly; `timeout_ms` is the one field meant to be set by the application (see the timeout section). The driver has no locking: one `pn532_t` is used from one task at a time. Two readers, each with its own `pn532_t`, may run in separate tasks; create and destroy their buses from one task. Readers whose fields overlap still have to take turns (see Troubleshooting).
 
 ### API map
 

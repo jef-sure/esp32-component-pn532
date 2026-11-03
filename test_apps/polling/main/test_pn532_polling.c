@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "pn532-internal.h"
 #include "pn532-mifare.h"
 #include "pn532-ndef.h"
@@ -83,6 +85,10 @@ struct mock_bus_t
     size_t          sim_writes;
     size_t          sim_fail_exchange; /* this exchange (1-based) answers sim_fail_status; 0 for none */
     uint8_t         sim_fail_status;
+    size_t          sim_leave_exchange; /* the card leaves at this exchange (1-based): it and every later one
+                                           time out, listings find nothing; 0 for never */
+    bool            sim_check_keys;     /* Classic: keys are checked against the sector trailers in sim_memory */
+    bool            sim_no_ndef_app;    /* Type 4: the card refuses the SELECT of the NDEF application */
     uint8_t         ack_drops;      /* next N command frames are lost: no ACK follows */
     bool            ack_dropped;    /* the current command frame was lost */
     uint8_t         error_frames;   /* next N responses are the syntax error frame */
@@ -235,6 +241,13 @@ static void mock_response_frame(uint8_t command, const uint8_t *payload, size_t 
     buffer[8 + payload_len] = 0x00;
 }
 
+/* MOCK_SIM_CARD: the simulated card has left the field. */
+static bool mock_sim_card_gone(const mock_bus_t *mock)
+{
+    return mock->mode == MOCK_SIM_CARD && mock->sim_leave_exchange != 0 &&
+           mock->exchange_rounds >= mock->sim_leave_exchange;
+}
+
 static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
 {
     mock_bus_t *mock = (mock_bus_t *)bus;
@@ -274,8 +287,8 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
         break;
     }
     case PN532_COMMAND_INLISTPASSIVETARGET:
-        payload     = mock->mode == MOCK_NO_CARD ? no_card : card;
-        payload_len = mock->mode == MOCK_NO_CARD ? sizeof(no_card) : sizeof(card);
+        payload     = (mock->mode == MOCK_NO_CARD || mock_sim_card_gone(mock)) ? no_card : card;
+        payload_len = (mock->mode == MOCK_NO_CARD || mock_sim_card_gone(mock)) ? sizeof(no_card) : sizeof(card);
         if (mock->mode == MOCK_CARD && mock->card_sak != 0) {
             /* Same card with another SAK. Like the chip, append an ATS only
              * for an ISO14443-4 SAK while automatic RATS (0x10) is on. */
@@ -350,7 +363,10 @@ static bool mock_read(pn532_bus_t *bus, uint8_t *buffer, size_t len)
                                         mock->current_command == PN532_COMMAND_INCOMMUNICATETHRU)) {
         uint8_t sim_response[1 + 256];
         size_t  sim_len;
-        if (mock->sim_fail_exchange != 0 && mock->exchange_rounds == mock->sim_fail_exchange) {
+        if (mock_sim_card_gone(mock)) {
+            sim_response[0] = 0x01; /* UM0701-02 table 13: the target has not answered */
+            sim_len         = 1;
+        } else if (mock->sim_fail_exchange != 0 && mock->exchange_rounds == mock->sim_fail_exchange) {
             sim_response[0] = mock->sim_fail_status;
             sim_len         = 1;
         } else {
@@ -1611,6 +1627,17 @@ TEST_CASE("Classic emulation on an ISO-DEP card is re-listed without automatic R
     TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &listed));
     TEST_ASSERT_TRUE(pn532.auto_rats_off);
 
+    /* A release frees the number (UM0701-02 §7.3.11): selecting the card
+     * again lists it anew instead of an InSelect the chip answers with 0x27.
+     * With no target left the chip has switched the field off. */
+    TEST_ASSERT_TRUE(pn532_release_target(&pn532));
+    TEST_ASSERT_FALSE(pn532.is_rf_on);
+    mock.command_count = 0;
+    TEST_ASSERT_TRUE(pn532_14443_select_by_uid(&pn532, &listed));
+    const uint8_t relist[] = {PN532_COMMAND_RFCONFIGURATION, PN532_COMMAND_INLISTPASSIVETARGET,
+                              PN532_COMMAND_INSELECT};
+    assert_commands(&mock, relist, ARRAY_SIZE(relist));
+
     /* The next poll restores automatic RATS before listing. */
     mock.command_count = 0;
     uids               = pn532_14443_get_all_uids(&pn532);
@@ -1903,13 +1930,25 @@ static size_t sim_type2_card(mock_bus_t *mock, uint8_t command, const uint8_t *r
     return 1;
 }
 
-/* MIFARE Classic: every authentication succeeds, READ returns one block. */
+/* MIFARE Classic: READ returns one block. Every authentication succeeds, or
+ * with sim_check_keys the key must match the one in the sector trailer. */
 static size_t sim_classic_card(mock_bus_t *mock, uint8_t command, const uint8_t *request, size_t request_len,
                                uint8_t *response)
 {
     (void)command;
     response[0] = SIM_STATUS_TIMEOUT;
     if (request_len >= 3 && (request[1] == PN532_MIFARE_CMD_AUTH_A || request[1] == PN532_MIFARE_CMD_AUTH_B)) {
+        if (mock->sim_check_keys) {
+            /* Request: Tg, command, block, key (6), UID (4). Key A is
+             * bytes 0..5 of the trailer, key B bytes 10..15. */
+            size_t trailer = (request[2] < 128) ? (request[2] | 0x03u) : (request[2] | 0x0Fu);
+            size_t offset  = (request[1] == PN532_MIFARE_CMD_AUTH_A) ? 0 : 10;
+            if (request_len < 9 || trailer >= mock->sim_units ||
+                memcmp(&request[3], &mock->sim_memory[trailer * 16 + offset], 6) != 0) {
+                response[0] = 0x14; /* UM0701-02 table 13: MIFARE authentication error */
+                return 1;
+            }
+        }
         response[0] = 0x00;
         return 1;
     }
@@ -1939,7 +1978,7 @@ static size_t sim_type4_card(mock_bus_t *mock, uint8_t command, const uint8_t *r
     if (apdu_len >= 5 && apdu[1] == 0xA4) {
         bool ok = false;
         if (apdu[2] == 0x04) {
-            ok = true; /* by AID */
+            ok = !mock->sim_no_ndef_app; /* by AID */
         } else if (apdu_len >= 7 && apdu[5] == 0xE1 && apdu[6] == 0x03) {
             mock->sim_file     = mock->sim_cc_file;
             mock->sim_file_len = 15;
@@ -2284,22 +2323,12 @@ TEST_CASE("MIFARE Classic NDEF is read through a MAD with a valid CRC only", "[p
     TEST_ASSERT_EQUAL(1, msg->record_count);
     pn532_ndef_free_parsed_message(msg);
 
-    /* A read that fails once is repeated from a freshly listed card. The
-     * fourth READ is the first data block of the NDEF sector. */
-    sim_init(&mock, &pn532, sim_classic_card, send_buf, recv_buf);
-    mock.sim_memory    = memory;
-    mock.sim_units     = 64;
-    mock.sim_fail_read = 4;
-    msg                = NULL;
-    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
-    TEST_ASSERT_NOT_NULL(msg);
-    pn532_ndef_free_parsed_message(msg);
-    TEST_ASSERT_EQUAL(7, mock.sim_reads);
-
-    /* So is a READ of the directory that fails after the authentication: the
-     * first READ is the sector trailer with the general purpose byte, the
-     * second the first MAD block. Neither is taken for a card without NDEF. */
-    for (size_t fail = 1; fail <= 2; fail++) {
+    /* A READ that fails after the authentication is repeated from a freshly
+     * listed card, and none is taken for a card without NDEF. The READs:
+     * trailer 3 (general purpose byte of the MAD), MAD blocks 1 and 2,
+     * trailer 7 (general purpose byte of the NDEF sector), data block 4. A
+     * read takes five READs, the failed attempt fail - 1 of them. */
+    for (size_t fail = 1; fail <= 5; fail++) {
         sim_init(&mock, &pn532, sim_classic_card, send_buf, recv_buf);
         mock.sim_memory    = memory;
         mock.sim_units     = 64;
@@ -2308,7 +2337,7 @@ TEST_CASE("MIFARE Classic NDEF is read through a MAD with a valid CRC only", "[p
         TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
         TEST_ASSERT_NOT_NULL(msg);
         pn532_ndef_free_parsed_message(msg);
-        TEST_ASSERT_EQUAL(3 + fail, mock.sim_reads);
+        TEST_ASSERT_EQUAL(4 + fail, mock.sim_reads);
     }
 
     /* A directory whose CRC does not match its content is treated as absent:
@@ -3139,4 +3168,439 @@ TEST_CASE("MIFARE Plus SAKs tell the 2K from the 4K", "[pn532][polling][sak]")
     TEST_ASSERT_EQUAL(PN532_MIFARE_PLUS_4K, plus_4k.subtype);
     TEST_ASSERT_EQUAL_UINT16(256, blocks);
     TEST_ASSERT_EQUAL_UINT16(16, block_size);
+}
+
+static size_t count_command(const mock_bus_t *mock, uint8_t command)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < mock->command_count; i++) {
+        count += (mock->commands[i] == command) ? 1u : 0u;
+    }
+    return count;
+}
+
+static const uint8_t sim_key_mad[6]     = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
+static const uint8_t sim_key_ndef[6]    = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
+static const uint8_t sim_key_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static const uint8_t sim_key_private[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+
+/* MIFARE Classic with an NFC Forum MAD in sector 0 (general purpose byte gpb)
+ * that lists sector 1, and the Text message in sector 1. Key A of the two
+ * sector trailers as given. */
+static void sim_classic_lay_out(uint8_t *memory, size_t blocks, uint8_t gpb, const uint8_t key_mad_sector[6],
+                                const uint8_t key_ndef_sector[6])
+{
+    memset(memory, 0, blocks * 16);
+    uint8_t *mad = &memory[16];
+    mad[1]       = 0x01;
+    mad[2]       = 0x03;
+    mad[3]       = 0xE1;
+    mad[0]       = test_mad_crc(&mad[1], 31);
+    memcpy(&memory[3 * 16], key_mad_sector, 6);
+    memory[3 * 16 + 9] = gpb;
+    memcpy(&memory[7 * 16], key_ndef_sector, 6);
+    memory[7 * 16 + 9] = 0x40; /* NFC sector, mapping version 1.0, read and write granted */
+    memory[4 * 16]     = 0x03;
+    memory[4 * 16 + 1] = sizeof(sim_ndef_text);
+    memcpy(&memory[4 * 16 + 2], sim_ndef_text, sizeof(sim_ndef_text));
+    memory[4 * 16 + 2 + sizeof(sim_ndef_text)] = 0xFE;
+}
+
+static void sim_classic_init(mock_bus_t *mock, pn532_t *pn532, uint8_t *memory, size_t blocks, uint8_t *send_buf,
+                             uint8_t *recv_buf)
+{
+    sim_init(mock, pn532, sim_classic_card, send_buf, recv_buf);
+    mock->sim_memory     = memory;
+    mock->sim_units      = blocks;
+    mock->sim_check_keys = true;
+}
+
+TEST_CASE("MIFARE Classic: a card lost at a directory key is a read error, refused keys are no NDEF",
+          "[pn532][ndef][classic][mad]")
+{
+    mock_bus_t                   mock;
+    pn532_t                      pn532;
+    uint8_t                      send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t                      recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t                      memory[68 * 16];
+    pn532_ndef_message_parsed_t *msg = NULL;
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x08,
+        .subtype      = PN532_MIFARE_CLASSIC_1K,
+        .block_size   = 16,
+        .blocks_count = 64
+    };
+
+    /* The keys of an NFC Forum formatted card: the message is read. */
+    sim_classic_lay_out(memory, 64, 0xC1, sim_key_mad, sim_key_ndef);
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
+    msg = NULL;
+
+    /* The card leaves at the first authentication: nothing says whether it
+     * carries NDEF. The second key is not tried on a card that is gone. */
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    mock.sim_leave_exchange = 1;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_READ_FAILED, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NULL(msg);
+    TEST_ASSERT_EQUAL(1, mock.exchange_rounds);
+
+    /* It turns the MAD key down and leaves before the default key. */
+    sim_classic_lay_out(memory, 64, 0xC1, sim_key_private, sim_key_ndef);
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    mock.sim_leave_exchange = 2;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_READ_FAILED, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+
+    /* Both keys turned down: a definite answer, with no second attempt. The
+     * card is listed again once, in front of the default key. */
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+    TEST_ASSERT_EQUAL(0, mock.sim_reads);
+    TEST_ASSERT_EQUAL(1, count_command(&mock, PN532_COMMAND_INLISTPASSIVETARGET));
+
+    /* A MAD sector that opens with the default key is read. */
+    sim_classic_lay_out(memory, 64, 0xC1, sim_key_default, sim_key_ndef);
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
+    msg = NULL;
+
+    /* MIFARE Classic 4K with a MAD2 in sector 16 (blocks 64..67), which
+     * lists no further sector. */
+    uid.subtype      = PN532_MIFARE_CLASSIC_4K;
+    uid.sak          = 0x18;
+    uid.blocks_count = 256;
+    sim_classic_lay_out(memory, 68, 0xC2, sim_key_mad, sim_key_ndef);
+    uint8_t *mad2 = &memory[64 * 16];
+    mad2[1]       = 0x01;
+    mad2[0]       = test_mad_crc(&mad2[1], 47);
+    memcpy(&memory[67 * 16], sim_key_mad, 6);
+    sim_classic_init(&mock, &pn532, memory, 68, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
+    msg = NULL;
+
+    /* Exchanges: MAD1 key, trailer 3, blocks 1 and 2, then the MAD2 key. */
+    sim_classic_init(&mock, &pn532, memory, 68, send_buf, recv_buf);
+    mock.sim_leave_exchange = 5;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_READ_FAILED, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_EQUAL(5, mock.exchange_rounds);
+
+    memcpy(&memory[67 * 16], sim_key_private, 6);
+    sim_classic_init(&mock, &pn532, memory, 68, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_EQUAL(3, mock.sim_reads);
+    TEST_ASSERT_NULL(msg);
+}
+
+TEST_CASE("MIFARE Classic NDEF sectors that turn the public keys down are read protected",
+          "[pn532][ndef][classic][mad]")
+{
+    mock_bus_t                   mock;
+    pn532_t                      pn532;
+    uint8_t                      send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t                      recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t                      memory[64 * 16];
+    pn532_ndef_message_parsed_t *msg = NULL;
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x08,
+        .subtype      = PN532_MIFARE_CLASSIC_1K,
+        .block_size   = 16,
+        .blocks_count = 64
+    };
+
+    /* The directory lists sector 1, whose key is neither public one. A new
+     * attempt would be turned down the same way: no retry. */
+    sim_classic_lay_out(memory, 64, 0xC1, sim_key_mad, sim_key_private);
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_ACCESS_DENIED, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NULL(msg);
+    TEST_ASSERT_EQUAL(3, mock.sim_reads);
+    TEST_ASSERT_EQUAL(1, count_command(&mock, PN532_COMMAND_INLISTPASSIVETARGET));
+
+    /* A sector that opens with the default key is read. */
+    sim_classic_lay_out(memory, 64, 0xC1, sim_key_mad, sim_key_default);
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    TEST_ASSERT_EQUAL(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    pn532_ndef_free_parsed_message(msg);
+    msg = NULL;
+
+    /* The card leaves at the key of the NDEF sector (exchange 5, after the
+     * MAD key and three READs): a read error, repeated once. */
+    sim_classic_lay_out(memory, 64, 0xC1, sim_key_mad, sim_key_ndef);
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    mock.sim_leave_exchange = 5;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_READ_FAILED, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NULL(msg);
+    TEST_ASSERT_EQUAL(5, mock.exchange_rounds);
+}
+
+TEST_CASE("Type 4 SELECT without a status word is a read error, a refused SELECT no NDEF", "[pn532][ndef][t4]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+
+    static const uint8_t cc[15]        = {0x00, 0x0F, 0x20, 0x00, 0x3B, 0x00, 0x34, 0x04,
+                                          0x06, 0xE1, 0x04, 0x00, 0x20, 0x00, 0x00};
+    uint8_t              ndef_file[32] = {0x00, sizeof(sim_ndef_text)};
+    memcpy(&ndef_file[2], sim_ndef_text, sizeof(sim_ndef_text));
+
+    pn532_uid_t uid = {
+        .uid        = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length = 4,
+        .tg         = 1,
+        .sak        = 0x20,
+        .subtype    = PN532_MIFARE_DESFIRE,
+        .block_size = 1
+    };
+
+    /* UM0701-02 table 13: CRC, parity and framing errors, and a command the
+     * chip does not accept in its context. The card has not refused
+     * anything, and the second attempt reads the message. */
+    static const uint8_t statuses[] = {0x02, 0x03, 0x05, 0x27};
+    for (size_t i = 0; i < ARRAY_SIZE(statuses); i++) {
+        sim_init(&mock, &pn532, sim_type4_card, send_buf, recv_buf);
+        mock.sim_cc_file       = cc;
+        mock.sim_ndef_file     = ndef_file;
+        mock.sim_ndef_file_len = sizeof(ndef_file);
+        mock.sim_fail_exchange = 1;
+        mock.sim_fail_status   = statuses[i];
+
+        pn532_ndef_message_parsed_t *msg = NULL;
+        TEST_ASSERT_EQUAL_MESSAGE(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg), "result");
+        TEST_ASSERT_NOT_NULL(msg);
+        pn532_ndef_free_parsed_message(msg);
+        TEST_ASSERT_EQUAL(3, mock.sim_reads);
+    }
+
+    /* The card answers the SELECT of the NDEF application with 6A82: it has
+     * none, and asking again would not change that. */
+    sim_init(&mock, &pn532, sim_type4_card, send_buf, recv_buf);
+    mock.sim_cc_file       = cc;
+    mock.sim_ndef_file     = ndef_file;
+    mock.sim_ndef_file_len = sizeof(ndef_file);
+    mock.sim_no_ndef_app   = true;
+    pn532_ndef_message_parsed_t *msg = NULL;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_NULL(msg);
+    TEST_ASSERT_EQUAL(1, mock.exchange_rounds);
+}
+
+TEST_CASE("Type 2 capability container: major version and read access are checked", "[pn532][ndef][t2]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[SIM_NTAG213_PAGES * 4];
+
+    static const struct
+    {
+        uint8_t             version; /* CC byte 1 */
+        uint8_t             access;  /* CC byte 3 */
+        pn532_ndef_result_t expected;
+    } cases[] = {
+        {0x10, 0x00, PN532_NDEF_OK},
+        {0x11, 0x00, PN532_NDEF_OK},                /* a newer minor version reads the same */
+        {0x10, 0x0F, PN532_NDEF_OK},                /* read only */
+        {0x20, 0x00, PN532_NDEF_ERR_UNSUPPORTED},   /* unknown major version */
+        {0x00, 0x00, PN532_NDEF_ERR_UNSUPPORTED},
+        {0x10, 0x80, PN532_NDEF_ERR_ACCESS_DENIED}, /* proprietary read access */
+        {0x10, 0xFF, PN532_NDEF_ERR_ACCESS_DENIED},
+    };
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x00,
+        .subtype      = PN532_MIFARE_NTAG213,
+        .block_size   = 4,
+        .blocks_count = SIM_NTAG213_PAGES
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+        memory[13] = cases[i].version;
+        memory[15] = cases[i].access;
+        memory[16] = 0x03;
+        memory[17] = sizeof(sim_ndef_text);
+        memcpy(&memory[18], sim_ndef_text, sizeof(sim_ndef_text));
+        memory[18 + sizeof(sim_ndef_text)] = 0xFE;
+
+        pn532_ndef_message_parsed_t *msg = NULL;
+        TEST_ASSERT_EQUAL_MESSAGE(cases[i].expected, pn532_ndef_read_card_auto(&pn532, &uid, &msg), "result");
+        if (cases[i].expected == PN532_NDEF_OK) {
+            TEST_ASSERT_NOT_NULL(msg);
+            pn532_ndef_free_parsed_message(msg);
+        } else {
+            /* Decided by the READ of the capability container alone. */
+            TEST_ASSERT_NULL(msg);
+            TEST_ASSERT_EQUAL(1, mock.sim_reads);
+        }
+    }
+
+    /* A container of another major version is not written. */
+    uint8_t              payload[32];
+    pn532_ndef_record_t  records[1];
+    pn532_ndef_message_t message;
+    pn532_ndef_message_init(&message, records, 1);
+    TEST_ASSERT_TRUE(pn532_ndef_make_uri_record(&records[0], "https://www.example.com", true, payload, sizeof(payload)));
+    TEST_ASSERT_TRUE(pn532_ndef_message_add(&message, &records[0]));
+    sim_ntag213_init(&mock, &pn532, memory, send_buf, recv_buf);
+    memory[13] = 0x20;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_UNSUPPORTED, pn532_ndef_write_to_selected_card(&pn532, &message, 4, 4, 36));
+    TEST_ASSERT_EQUAL(0, mock.sim_writes);
+}
+
+TEST_CASE("pn532_delay_ms never ends early and is precise below a tick", "[pn532][delay]")
+{
+    static const int delays[] = {1, 2, 5, 9, 10, 20, 25};
+    const int        tick_us  = portTICK_PERIOD_MS * 1000;
+
+    for (size_t i = 0; i < ARRAY_SIZE(delays); i++) {
+        int64_t start = esp_timer_get_time();
+        pn532_delay_ms(delays[i]);
+        int elapsed = (int)(esp_timer_get_time() - start);
+        TEST_ASSERT_GREATER_OR_EQUAL(delays[i] * 1000, elapsed);
+#ifdef PN532_HOST_TEST
+        /* Simulated time, no other task: a delay below a tick is a busy wait
+         * to the microsecond, a longer one ends at the next tick at most. */
+        int late = (delays[i] * 1000 < tick_us) ? 100 : tick_us + 100;
+        TEST_ASSERT_LESS_THAN(delays[i] * 1000 + late, elapsed);
+#else
+        (void)tick_us;
+#endif
+    }
+}
+
+TEST_CASE("MIFARE Classic: only the authentication error 14h counts as a refused key", "[pn532][ndef][classic][mad]")
+{
+    mock_bus_t                   mock;
+    pn532_t                      pn532;
+    uint8_t                      send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t                      recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t                      memory[64 * 16];
+    pn532_ndef_message_parsed_t *msg = NULL;
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x08,
+        .subtype      = PN532_MIFARE_CLASSIC_1K,
+        .block_size   = 16,
+        .blocks_count = 64
+    };
+    sim_classic_lay_out(memory, 64, 0xC1, sim_key_mad, sim_key_ndef);
+
+    /* CRC error, RF protocol error, invalid frame (libnfc: RF transmission
+     * errors) at the MAD key: nothing is known about the key, so the read is
+     * repeated from a new listing with the same key, and succeeds. */
+    static const uint8_t rf_errors[] = {0x02, 0x0B, 0x13};
+    for (size_t i = 0; i < ARRAY_SIZE(rf_errors); i++) {
+        sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+        mock.sim_fail_exchange = 1;
+        mock.sim_fail_status   = rf_errors[i];
+        TEST_ASSERT_EQUAL_MESSAGE(PN532_NDEF_OK, pn532_ndef_read_card_auto(&pn532, &uid, &msg), "result");
+        pn532_ndef_free_parsed_message(msg);
+        msg = NULL;
+        /* Exchange parameters: Tg, command, block, key. */
+        TEST_ASSERT_EQUAL_UINT8_ARRAY(sim_key_mad, &mock.exchange_params[1][3], 6);
+        TEST_ASSERT_EQUAL(1, count_command(&mock, PN532_COMMAND_INLISTPASSIVETARGET));
+    }
+
+    /* 14h: the card turned the MAD key down, the default key comes next. */
+    sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+    mock.sim_fail_exchange = 1;
+    mock.sim_fail_status   = 0x14;
+    TEST_ASSERT_EQUAL(PN532_NDEF_ERR_NO_NDEF, pn532_ndef_read_card_auto(&pn532, &uid, &msg));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(sim_key_default, &mock.exchange_params[1][3], 6);
+    TEST_ASSERT_EQUAL(2, mock.exchange_rounds);
+    TEST_ASSERT_EQUAL_HEX8(0x14, pn532.last_target_status);
+}
+
+TEST_CASE("MIFARE Classic: the general purpose byte of the first NDEF sector is checked", "[pn532][ndef][classic]")
+{
+    mock_bus_t mock;
+    pn532_t    pn532;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    memory[64 * 16];
+
+    pn532_uid_t uid = {
+        .uid          = {0xDE, 0xAD, 0xBE, 0xEF},
+        .uid_length   = 4,
+        .tg           = 1,
+        .sak          = 0x08,
+        .subtype      = PN532_MIFARE_CLASSIC_1K,
+        .block_size   = 16,
+        .blocks_count = 64
+    };
+
+    static const struct
+    {
+        uint8_t             gpb;
+        pn532_ndef_result_t expected;
+    } cases[] = {
+        {0x40, PN532_NDEF_OK},                /* version 1.0, read and write granted */
+        {0x43, PN532_NDEF_OK},                /* read only */
+        {0x50, PN532_NDEF_OK},                /* version 1.1 */
+        {0x00, PN532_NDEF_OK},                /* version 0.0: NxpNfcRdLib refuses only above 1 */
+        {0x80, PN532_NDEF_ERR_UNSUPPORTED},   /* version 2.0 */
+        {0x4C, PN532_NDEF_ERR_ACCESS_DENIED}, /* read access 11b */
+        {0x44, PN532_NDEF_ERR_ACCESS_DENIED}, /* read access 01b, RFU */
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+        sim_classic_lay_out(memory, 64, 0xC1, sim_key_mad, sim_key_ndef);
+        memory[7 * 16 + 9] = cases[i].gpb;
+        sim_classic_init(&mock, &pn532, memory, 64, send_buf, recv_buf);
+
+        pn532_ndef_message_parsed_t *msg = NULL;
+        TEST_ASSERT_EQUAL_MESSAGE(cases[i].expected, pn532_ndef_read_card_auto(&pn532, &uid, &msg), "result");
+        if (cases[i].expected == PN532_NDEF_OK) {
+            TEST_ASSERT_NOT_NULL(msg);
+            pn532_ndef_free_parsed_message(msg);
+        } else {
+            /* Directory and trailer only, and no second attempt. */
+            TEST_ASSERT_NULL(msg);
+            TEST_ASSERT_EQUAL(4, mock.sim_reads);
+            TEST_ASSERT_EQUAL(0, count_command(&mock, PN532_COMMAND_INLISTPASSIVETARGET));
+        }
+    }
+}
+
+TEST_CASE("MIFARE value operations refuse a NULL device", "[pn532][mifare]")
+{
+    TEST_ASSERT_FALSE(pn532_mifare_increment(NULL, 4, 1));
+    TEST_ASSERT_FALSE(pn532_mifare_decrement(NULL, 4, 1));
+    TEST_ASSERT_FALSE(pn532_mifare_restore(NULL, 4));
+    TEST_ASSERT_FALSE(pn532_mifare_transfer(NULL, 4));
+}
+
+TEST_CASE("pn532_init refuses IRQ and RST numbers that are not GPIOs before the bus is used", "[pn532][init]")
+{
+    mock_bus_t mock;
+    pn532_t    unused;
+    uint8_t    send_buf[PN532_MAX_BUF_SIZE] = {0};
+    uint8_t    recv_buf[PN532_MAX_BUF_SIZE] = {0};
+
+    mock_init(&mock, &unused, MOCK_CARD, send_buf, recv_buf);
+    TEST_ASSERT_NULL(pn532_init(&mock.base, GPIO_NUM_MAX, GPIO_NUM_NC));
+    TEST_ASSERT_NULL(pn532_init(&mock.base, GPIO_NUM_NC, GPIO_NUM_MAX));
+    TEST_ASSERT_EQUAL(0, mock.command_count);
 }

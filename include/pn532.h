@@ -134,7 +134,8 @@ typedef enum
  *
  * The driver has no locking: one pn532_t is used from one task at a time.
  * Two readers, each with its own pn532_t, may run in separate tasks; create
- * and destroy their buses from one task.
+ * and destroy their buses from one task. Readers whose RF fields overlap
+ * still have to take turns.
  */
 typedef struct _pn532_t
 {
@@ -156,6 +157,8 @@ typedef struct _pn532_t
     bool          tg_stale;      /**< Listed Tg needs a fresh InListPassiveTarget (card dropped to IDLE). */
     bool          auto_rats_off; /**< Automatic RATS is switched off (MIFARE Classic emulation card in use). */
     bool          auto_rats_unknown; /**< A SetParameters failed: auto_rats_off may not match the chip. */
+    uint8_t       last_target_status; /**< Error code (UM0701-02 table 13) of the last InDataExchange or
+                                           InCommunicateThru the chip answered, 0 for success; 0xFF when it gave none. */
     uint8_t       listed_uid[2][10]; /**< UIDs behind Tg 1 and 2 of the latest InListPassiveTarget. */
     uint8_t       listed_uid_len[2]; /**< UID lengths for listed_uid; 0 when that Tg is not listed. */
 } pn532_t;
@@ -163,8 +166,9 @@ typedef struct _pn532_t
 /**
  * @brief Sleep helper used by the driver and available to callers building retry loops.
  *
- * Whole RTOS ticks are slept; the remainder (less than one tick) is a busy
- * wait, so short delays are precise at any tick rate.
+ * A delay shorter than one RTOS tick is a busy wait, so it is precise at any
+ * tick rate. A longer one sleeps and may end up to one tick late; it never
+ * ends early.
  */
 void pn532_delay_ms(int ms);
 
@@ -182,10 +186,11 @@ void pn532_delay_ms(int ms);
  * @param sck SPI clock GPIO used when initialising the host bus.
  * @param miso SPI MISO GPIO used when initialising the host bus.
  * @param mosi SPI MOSI GPIO used when initialising the host bus.
- * @param nss SPI chip-select GPIO for the PN532 device.
+ * @param nss SPI chip-select GPIO for the PN532 device; must be an output GPIO.
  * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ,
  *                       more than PN532_SPI_MAX_CLOCK_HZ is lowered to it.
- * @return Newly allocated transport handle, or NULL on failure.
+ * @return Newly allocated transport handle, or NULL on failure, also for an nss that is not
+ *         an output GPIO (checked before the host is touched).
  */
 pn532_bus_t *pn532_spi_init(         //
     spi_host_device_t host_id,       //
@@ -205,11 +210,11 @@ pn532_bus_t *pn532_spi_init(         //
  * least PN532_MAX_BUF_SIZE (a bus without DMA is limited to 64 bytes).
  *
  * @param host_id Initialised SPI host.
- * @param nss SPI chip-select GPIO for the PN532 device.
+ * @param nss SPI chip-select GPIO for the PN532 device; must be an output GPIO.
  * @param clock_speed_hz SPI device clock; non-positive selects PN532_SPI_DEFAULT_CLOCK_HZ,
  *                       more than PN532_SPI_MAX_CLOCK_HZ is lowered to it.
- * @return Newly allocated transport handle, or NULL when the host is not initialised, its
- *         transactions are too short, or on failure.
+ * @return Newly allocated transport handle, or NULL when nss is not an output GPIO, the host
+ *         is not initialised, its transactions are too short, or on failure.
  */
 pn532_bus_t *pn532_spi_attach(spi_host_device_t host_id, gpio_num_t nss, int clock_speed_hz);
 
@@ -292,9 +297,13 @@ void pn532_bus_destroy(pn532_bus_t *bus);
  * configuration.
  *
  * @param bus Transport created by one of the pn532_*_init() functions.
- * @param irq Optional IRQ pin; pass GPIO_NUM_NC when unused.
+ * @param irq Optional IRQ pin; pass GPIO_NUM_NC when unused. When its
+ *            interrupt cannot be set up, the driver logs it and polls the bus
+ *            for readiness instead.
  * @param rst Optional reset pin; pass GPIO_NUM_NC when unused.
- * @return Newly allocated device context, or NULL on failure.
+ * @return Newly allocated device context, or NULL on failure, also for an irq
+ *         that is not a GPIO, an rst that is not an output GPIO, or a pin
+ *         gpio_config() refuses.
  */
 pn532_t *pn532_init(pn532_bus_t *bus, gpio_num_t irq, gpio_num_t rst);
 
@@ -395,12 +404,15 @@ bool pn532_set_rf_off(pn532_t *pn532);
  *
  * The function is a no-op that returns true when no target is listed. Once the
  * chip answers, the active target and session state are cleared whatever the
- * status: UM0701-02 §7.3.11 frees the target in all cases. Call this before
- * turning the RF field off when ending an active session.
+ * status: UM0701-02 §7.3.11 frees the target in all cases. Selecting the same
+ * card later lists it again; with no other target left the chip has switched
+ * the field off, and is_rf_on follows. Call this before turning the RF field
+ * off when ending an active session.
  *
  * @return true when no target was active or InRelease returned 0x00 or 0x27;
  *         false for another status (the target is freed all the same) or when
- *         the command got no answer (the state is kept).
+ *         the command fails: after an ACK or response timeout the abort that
+ *         follows clears the state as well, after a transport error it is kept.
  */
 bool pn532_release_target(pn532_t *pn532);
 
@@ -589,6 +601,12 @@ bool pn532_14443_select_by_uid(pn532_t *pn532, const pn532_uid_t *uid);
  * For a Classic card it returns false without an exchange when blockno is
  * outside 0..255, key_type is neither PN532_MIFARE_CMD_AUTH_A nor
  * PN532_MIFARE_CMD_AUTH_B, or the UID length is not 4, 7 or 10.
+ *
+ * After a failed authentication the card is in HALT or IDLE: the target is
+ * marked so that the next pn532_14443_select_by_uid() lists the card again.
+ * Call it before the next key. pn532_t.last_target_status tells a refused key
+ * (14h, MIFARE authentication error) from an RF error or a card that did not
+ * answer.
  */
 bool pn532_14443_authenticate(   //
     pn532_t           *pn532,    //

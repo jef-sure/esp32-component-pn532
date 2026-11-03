@@ -48,6 +48,12 @@ struct pn532_bus_t
 
 #define PN532_MIFARE_ISO14443A (0x00)
 
+/* pn532_t.last_target_status: the chip gave no status byte. */
+#define PN532_TARGET_STATUS_NONE 0xFF
+/* UM0701-02 table 13: MIFARE authentication error, the answer to a refused
+ * key (libnfc EMFAUTH). */
+#define PN532_TARGET_STATUS_MIFARE_AUTH_ERROR 0x14
+
 typedef enum
 {
     PN532_COMMAND_STATUS_OK = 0,
@@ -72,3 +78,8 @@ bool pn532_set_auto_rats(pn532_t *pn532, bool enabled);
 /* True when the target the driver holds selected (inListedTag) was listed with
  * this UID; false when no target is held or it is another card. */
 bool pn532_14443_selected_target_is(const pn532_t *pn532, const pn532_uid_t *uid);
+/* pn532_14443_4_select_file() that also reports why it failed: *card_refused
+ * is true when the card answered the SELECT with an error status word, false
+ * when no well-formed answer came back (PN532 error status, lost card,
+ * transport). May be NULL. */
+bool pn532_14443_4_select_file_ex(pn532_t *pn532, const uint8_t *file_id, size_t file_id_len, bool *card_refused);

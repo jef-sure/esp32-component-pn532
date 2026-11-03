@@ -172,3 +172,16 @@ TEST_CASE("spi: attach to a host nobody initialised fails", "[pn532][spi]")
     TEST_ASSERT_NULL(pn532_spi_attach(SPI2_HOST, 5, 1000000));
     TEST_ASSERT_EQUAL(0, fake_spi.devices[SPI2_HOST]);
 }
+
+TEST_CASE("spi: an NSS that is not an output GPIO is refused before the host is touched", "[pn532][spi]")
+{
+    memset(&fake_spi, 0, sizeof(fake_spi));
+
+    TEST_ASSERT_NULL(pn532_spi_init(SPI3_HOST, 18, 19, 23, GPIO_NUM_NC, 1000000));
+    TEST_ASSERT_FALSE(fake_spi.initialised[SPI3_HOST]);
+
+    fake_spi_app_bus(PN532_MAX_BUF_SIZE + 2);
+    TEST_ASSERT_NULL(pn532_spi_attach(SPI2_HOST, GPIO_NUM_NC, 1000000));
+    TEST_ASSERT_NULL(pn532_spi_attach(SPI2_HOST, GPIO_NUM_MAX, 1000000));
+    TEST_ASSERT_EQUAL(0, fake_spi.devices[SPI2_HOST]);
+}
